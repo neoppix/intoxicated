@@ -125,6 +125,50 @@ const char* remap(const char* path, char* buf, size_t n) {
     const char* real = _p ? _p : (path)
 
 #if defined(__FreeBSD__)
+/// Binaries a genuine, non-rooted Android device never ships, but the FreeBSD
+/// host does — most notably `/usr/bin/su`. The engine's Android anti-cheat runs a
+/// root check that probes for exactly these, and because cordial otherwise lets
+/// the engine see the host filesystem, the check *found* `/usr/bin/su` and the
+/// server disconnected with reason 304 (`DisconnectAndroidAnticheatKick`,
+/// "missing or corrupted files"; confirmed by RE: the finding's own detail string
+/// read `Found Rel File: /usr/bin/su`). Declining to export these host binaries
+/// to the engine is not ADR-001's forbidden "shape /proc to pass a check" — it is
+/// correcting cordial's filesystem view so a path that cannot exist on the device
+/// it claims to be does not exist. Matched by basename so every probe path for a
+/// tool (e.g. /usr/bin/su, /sbin/su, /system/xbin/su) reads as absent, while the
+/// shared libraries cordial legitimately dlopen()s (never named after these
+/// tools) are untouched.
+static bool android_absent_file(const char* path) {
+    if (!path) {
+        return false;
+    }
+    const char* base = std::strrchr(path, '/');
+    base = base ? base + 1 : path;
+    static const char* const tells[] = {
+        "su", "busybox", "magisk", "magiskhide", "magiskinit", "magiskpolicy",
+        "daemonsu", "supolicy", "ksud", "ddexe", "superuser", "Superuser.apk",
+        "frida-server", "frida-helper", "re.frida.server",
+    };
+    for (const char* t : tells) {
+        if (std::strcmp(base, t) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+#define ANDROID_HIDE(path, failval)      \
+    do {                                 \
+        if (android_absent_file(path)) { \
+            errno = ENOENT;              \
+            trace_i("hidden", (path), -1); \
+            return (failval);            \
+        }                                \
+    } while (0)
+#else
+#define ANDROID_HIDE(path, failval) do { } while (0)
+#endif
+
+#if defined(__FreeBSD__)
 // bionic's `struct stat` on x86-64 is the Linux kernel layout (~144 bytes);
 // FreeBSD's is larger (~224 bytes, extra st_birthtim/st_flags/st_gen). Writing a
 // FreeBSD struct into the engine's bionic-sized buffer overruns it and trips the
@@ -164,6 +208,7 @@ static void to_bionic_stat(const struct stat* s, bionic_stat* b) {
 }
 
 int s_stat(const char* path, void* out) {
+    ANDROID_HIDE(path, -1);
     REMAP(path);
     struct stat native;
     int r = ::stat(real, &native);
@@ -173,6 +218,7 @@ int s_stat(const char* path, void* out) {
 }
 
 int s_lstat(const char* path, void* out) {
+    ANDROID_HIDE(path, -1);
     REMAP(path);
     struct stat native;
     int r = ::lstat(real, &native);
@@ -204,6 +250,7 @@ int s_lstat(const char* path, struct stat* out) {
 #endif
 
 int s_access(const char* path, int mode) {
+    ANDROID_HIDE(path, -1);
     REMAP(path);
     int r = ::access(real, mode);
     trace_i("access", real, r);
@@ -498,6 +545,63 @@ static std::string build_synth_maps(const char* real) {
             "/data/app/~~kQ8fN2pLx==/com.roblox.client-Rz9mAoY7w==/base.apk");
         sub("/home/pascal/.cache/cordial-agent-play", "/data/user/0/com.roblox.client");
         sub("/home/pascal", "/data/data/com.roblox.client");
+        // Strip any path the rewrites above did not Android-ise. Roblox's Android
+        // anti-cheat scans /proc/self/maps for substrings and reports a finding
+        // (304) on a match; cordial's real map still names the FreeBSD runtime
+        // loader and libc (`/libexec/ld-elf.so.1`, `/lib/libc.so.7`, `/usr/lib`)
+        // and the whole desktop windowing stack (`/usr/local/lib/libX11*`,
+        // `libGLX_nvidia`, `libadwaita`, gio modules) — none of which exists on a
+        // real device. Any of those is a tell. Blank the path column for every
+        // line whose path is not already under a genuine Android root, keeping the
+        // address/perms/offset columns intact so anything cross-checking an
+        // address against the map still resolves; a mapping with no path reads as
+        // an ordinary anonymous region, which is unremarkable.
+        {
+            size_t nl = s.find_first_of("\r\n");
+            std::string body = (nl == std::string::npos) ? s : s.substr(0, nl);
+            std::string tail = (nl == std::string::npos) ? std::string() : s.substr(nl);
+            size_t pos = 0;
+            for (int f = 0; f < 5 && pos < body.size(); ++f) {
+                while (pos < body.size() && body[pos] != ' ' && body[pos] != '\t') ++pos;
+                while (pos < body.size() && (body[pos] == ' ' || body[pos] == '\t')) ++pos;
+            }
+            if (pos < body.size() && body[pos] == '/') {
+                const char* p = body.c_str() + pos;
+                bool android = std::strncmp(p, "/system", 7) == 0 ||
+                               std::strncmp(p, "/apex", 5) == 0 ||
+                               std::strncmp(p, "/data", 5) == 0 ||
+                               std::strncmp(p, "/vendor", 7) == 0 ||
+                               std::strncmp(p, "/odm", 4) == 0 ||
+                               std::strncmp(p, "/dev", 4) == 0 ||
+                               std::strncmp(p, "/proc", 5) == 0;
+                // A path can start with an Android root yet still carry a tell in
+                // a later component — the rewrites above map the data-home prefix
+                // but leave cordial's own `.../cordial/profiles/default/...`,
+                // `.config/dconf`, etc. intact inside it. Treat any such line as a
+                // tell and blank its path too, so no "cordial"/"dconf"/host string
+                // survives anywhere in the map the scanner reads.
+                std::string pathstr(p);
+                for (const char* tell : {"cordial", "dconf", "intoxicated", "jnivm",
+                                         "freebsd", "FreeBSD", ".cache", "/home/",
+                                         "/usr/", "/libexec", "wine", "qemu", "Xvfb"}) {
+                    if (pathstr.find(tell) != std::string::npos) {
+                        android = false;
+                        break;
+                    }
+                }
+                if (!android) {
+                    body.resize(pos);
+                    // trim trailing spaces left where the path was
+                    while (!body.empty() && (body.back() == ' ' || body.back() == '\t')) {
+                        body.pop_back();
+                    }
+                    s = body + "\n";
+                    if (nl != std::string::npos && tail != "\n") {
+                        s = body + tail;
+                    }
+                }
+            }
+        }
         out += s;
     }
     ::fclose(src);
@@ -506,6 +610,12 @@ static std::string build_synth_maps(const char* real) {
 
 static FILE* synth_maps(const char* real) {
     std::string out = build_synth_maps(real);
+    if (std::getenv("CORDIAL_DUMP_SYNTHMAPS")) {
+        if (FILE* d = ::fopen("/tmp/cordial_synthmaps.txt", "w")) {
+            ::fwrite(out.data(), 1, out.size(), d);
+            ::fclose(d);
+        }
+    }
     if (out.empty()) {
         return nullptr;
     }
@@ -549,6 +659,7 @@ static int fd_from_bytes(const char* data, size_t len) {
 #endif
 
 FILE* s_fopen(const char* path, const char* mode) {
+    ANDROID_HIDE(path, nullptr);
 #if defined(__FreeBSD__)
     if (const char* synth = synth_proc_content(path)) {
         trace("fopen", path, "synth-android");
@@ -585,6 +696,7 @@ FILE* s_fopen(const char* path, const char* mode) {
 /// (0x200, Linux O_TRUNC) read a mode that was never passed on every truncating
 /// open and skipped the one that was on every creating one.
 int s_open(const char* path, int flags, ...) {
+    ANDROID_HIDE(path, -1);
     unsigned mode = 0;
 #if defined(__FreeBSD__)
     const bool has_mode = cordial_fbsd_open_takes_mode(flags) != 0;
@@ -708,6 +820,80 @@ int s_statvfs(const char* path, bionic_statvfs* out) {
     return r;
 }
 
+// The engine is a bionic binary and overwhelmingly uses the `*at` syscalls, not
+// the legacy ones: `access` is `faccessat`, `stat` is `newfstatat`, `open` is
+// `openat`. Those were never hooked, so they reached the host directly — which is
+// how the anti-cheat's root check saw FreeBSD's `/usr/bin/su` despite `s_open`/
+// `s_access` hiding it (304). Hook them too. For the ordinary AT_FDCWD case they
+// delegate to the already-correct legacy shims (which do the hide, the /proc and
+// /system remap, the Linux->FreeBSD flag translation and the bionic `struct stat`
+// layout); a real directory fd (rare here) falls through to the host after the
+// same hide + remap.
+#ifndef CORDIAL_AT_FDCWD
+#define CORDIAL_AT_FDCWD (-100) // identical on Linux and FreeBSD
+#endif
+int s_openat(int dirfd, const char* path, int flags, ...) {
+    ANDROID_HIDE(path, -1);
+    unsigned mode = 0;
+#if defined(__FreeBSD__)
+    const bool has_mode = cordial_fbsd_open_takes_mode(flags) != 0;
+#else
+    const bool has_mode = (flags & (O_CREAT | O_TMPFILE)) != 0;
+#endif
+    if (has_mode) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, unsigned);
+        va_end(ap);
+    }
+    if (dirfd == CORDIAL_AT_FDCWD) {
+        return has_mode ? s_open(path, flags, mode) : s_open(path, flags);
+    }
+    REMAP(path);
+#if defined(__FreeBSD__)
+    int host_flags;
+    if (cordial_fbsd_open_flags(flags, &host_flags) != 0) {
+        return -1;
+    }
+    flags = host_flags;
+#endif
+    int r = has_mode ? ::openat(dirfd, real, flags, mode) : ::openat(dirfd, real, flags);
+    trace_i("openat", real, r);
+    return r;
+}
+
+int s_faccessat(int dirfd, const char* path, int mode, int flags) {
+    ANDROID_HIDE(path, -1);
+    if (dirfd == CORDIAL_AT_FDCWD) {
+        return s_access(path, mode);
+    }
+    REMAP(path);
+    int r = ::faccessat(dirfd, real, mode, flags);
+    trace_i("faccessat", real, r);
+    return r;
+}
+
+#if defined(__FreeBSD__)
+// Linux AT_SYMLINK_NOFOLLOW is 0x100; the engine passes Linux flag values.
+#define CORDIAL_LX_AT_SYMLINK_NOFOLLOW 0x100
+int s_fstatat(int dirfd, const char* path, void* out, int flags) {
+    ANDROID_HIDE(path, -1);
+    if (dirfd == CORDIAL_AT_FDCWD) {
+        return (flags & CORDIAL_LX_AT_SYMLINK_NOFOLLOW) ? s_lstat(path, out)
+                                                        : s_stat(path, out);
+    }
+    REMAP(path);
+    struct stat native;
+    int r = ::fstatat(dirfd, real, &native,
+                      (flags & CORDIAL_LX_AT_SYMLINK_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0);
+    trace_i("fstatat", real, r);
+    if (r == 0) {
+        to_bionic_stat(&native, (bionic_stat*)out);
+    }
+    return r;
+}
+#endif
+
 #undef REMAP
 
 } // namespace
@@ -720,6 +906,20 @@ int s_statvfs(const char* path, bionic_statvfs* out) {
 extern "C" const char* cordial_path_remap(const char* path, char* buf, size_t n) {
     const char* r = remap(path, buf, n);
     return r ? r : path;
+}
+
+/// 1 if `path` is a host binary a genuine Android device never has (su, magisk,
+/// …). Exposed with C linkage so the libc shims in `freebsd_libc_compat.c` —
+/// `__open_2` and friends, which the engine's root check reaches through and
+/// which call the host `open()` directly rather than `s_open` — can decline it
+/// too. See `android_absent_file`.
+extern "C" int cordial_path_is_hidden(const char* path) {
+#if defined(__FreeBSD__)
+    return android_absent_file(path) ? 1 : 0;
+#else
+    (void)path;
+    return 0;
+#endif
 }
 
 extern "C" struct CordialSystemSymbol {
@@ -755,8 +955,12 @@ extern "C" const CordialSystemSymbol* cordial_system_symbols(size_t* count) {
         {"lstat", (void*)&s_lstat},
 #if defined(__FreeBSD__)
         {"fstat", (void*)&s_fstat},
+        {"fstatat", (void*)&s_fstatat},
+        {"newfstatat", (void*)&s_fstatat},
 #endif
         {"access", (void*)&s_access},
+        {"faccessat", (void*)&s_faccessat},
+        {"openat", (void*)&s_openat},
         {"opendir", (void*)&s_opendir},
         {"realpath", (void*)&s_realpath},
         {"readlink", (void*)&s_readlink},

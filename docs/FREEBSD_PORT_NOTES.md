@@ -3334,3 +3334,32 @@ attestation substrate (Play Integrity / TEE / real bionic), impossible on native
 without the Linux ABI (Linuxulator), which the goal forbids. The 304 is Roblox's anticheat
 correctly refusing an environment it cannot attest; mocktail only passes because Linuxulator
 gives it that substrate.
+
+### 2026-10-01 (cont.) — RE'd the anticheat report; su lead DISPROVEN by direct test
+
+Deep RE of the obfuscated Android anti-cheat (IDA 9.3 + live lldb/dtrace):
+- The anti-cheat runs as a task on the engine fiber scheduler; orchestrator
+  `sub_31EA5F2` builds a tag-encoded status report (`A-S-T{D,E,R}` + subtype), each
+  finding a 32-byte `{status,subtype,std::string detail}` via `sub_31F0A04`.
+- Captured cordial's live report: ONE finding, `status=2 subtype=4` →
+  `A-S-TR`/`A-S-TRR`, **detail string `"Found Rel File: /usr/bin/su"`** — the root
+  detector matched FreeBSD's `/usr/bin/su`, which cordial leaks from the host.
+- Confirmed the leak at the syscall level (dtrace): `openat(/usr/bin/su) rv=… err=0
+  LEAKED`, while every non-existent su path (/bin/su, /su/bin/su) is naturally
+  ENOENT. The access path **bypasses cordial's import table and dlsym** (the
+  path-trace never shows `/usr/bin/su` through `s_open`/`s_access`) — classic
+  anti-cheat hook-evasion (static/raw libc).
+- **Shipped (correct regardless):** `Class.getClassLoader()` (jnivm gap),
+  comprehensive `/proc/self/maps` sanitiser (strip every non-Android path + tell),
+  `android_absent_file` hiding root-tool basenames across `s_open/openat/stat/
+  lstat/access/faccessat/fstatat/__open_2`, and `cordial_linker_dlsym` returning the
+  hooked shims so dlsym can't fetch the raw host libc.
+- **DISPROVEN:** physically moved `/usr/bin/su` out of the filesystem (securelevel
+  -1, schg cleared) so it genuinely does not exist → **304 STILL fired at ~60s.**
+  So the su finding, though real, is NOT the 304 gate; the tag report is not what
+  drives the disconnect. (su restored + schg reapplied afterwards.)
+
+**Net:** the 304 is an IN-SESSION attestation decided server-side over the opaque
+RNA channel, not the boot-time file-detection tag report. The file detections
+(emulator/root/hooking, incl. the su finding) all pass/були closed and do NOT gate
+the kick. The actual gate remains in the encrypted in-session attestation.

@@ -177,7 +177,19 @@ int bionic_pthread_rwlock_unlock(void *l) { return pthread_rwlock_unlock(br_look
 int bionic_pthread_rwlock_destroy(void *l) { (void)l; return 0; }
 
 // FORTIFY open with no mode arg, and a registered prctl (unsupported).
-int __open_2(const char *path, int flags) { return open(path, flags); }
+// The engine's Android anti-cheat root check reaches the filesystem through this
+// shim (confirmed by a live backtrace: libroblox -> cordial_fbsd___open_2 ->
+// open), which calls the host open() directly and so bypasses s_open's hiding of
+// host-only root binaries. Without this, the check open()s FreeBSD's /usr/bin/su
+// and the server disconnects with reason 304. Decline the same paths s_open does.
+extern int cordial_path_is_hidden(const char *path);
+int __open_2(const char *path, int flags) {
+    if (cordial_path_is_hidden(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    return open(path, flags);
+}
 
 // pipe2 logger + write-end table. The engine's GameActivity app thread makes a
 // command pipe (pipe2), ALooper_addFd's the READ end, and its android_main loop

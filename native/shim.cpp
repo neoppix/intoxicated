@@ -1,4 +1,5 @@
 // extern "C" surface over mcpelauncher-linker's C++ API.
+#include <cstring>
 //
 // The linker's own interface takes std::unordered_map<std::string, void*>, which
 // Rust cannot construct. Everything here is a translation of that, and nothing
@@ -108,7 +109,30 @@ void cordial_linker_set_realpath(void* handle, const char* path) {
     fprintf(stderr, "[linker] realpath override unavailable: patches/0004 is not applied\n");
 }
 
+// cordial's hooked libc shims (s_open/s_openat/s_access/... with the root-file
+// hiding, /proc redirect and bionic struct translation) are installed into the
+// engine's import table. But the engine also resolves symbols dynamically via
+// dlsym, and Roblox's Android anti-cheat uses that to fetch the *raw* host libc
+// (e.g. `dlsym(handle, "openat")`) specifically to step around import hooks — and
+// then opened FreeBSD's /usr/bin/su through it, tripping the 304 root check. Hand
+// dlsym the same shim the import table got, so there is one consistent, hooked
+// view of these calls however they are reached.
+extern "C" struct CordialSystemSymbolDecl {
+    const char* name;
+    void* addr;
+};
+extern "C" const CordialSystemSymbolDecl* cordial_system_symbols(size_t* count);
+
 void* cordial_linker_dlsym(void* handle, const char* symbol) {
+    if (symbol) {
+        size_t n = 0;
+        const CordialSystemSymbolDecl* tab = cordial_system_symbols(&n);
+        for (size_t i = 0; i < n; ++i) {
+            if (std::strcmp(tab[i].name, symbol) == 0) {
+                return tab[i].addr;
+            }
+        }
+    }
     return linker::dlsym(handle, symbol);
 }
 
