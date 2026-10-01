@@ -3363,3 +3363,30 @@ Deep RE of the obfuscated Android anti-cheat (IDA 9.3 + live lldb/dtrace):
 RNA channel, not the boot-time file-detection tag report. The file detections
 (emulator/root/hooking, incl. the su finding) all pass/були closed and do NOT gate
 the kick. The actual gate remains in the encrypted in-session attestation.
+
+### 2026-10-01 (cont.) — 304 isolated to Linux-kernel-ABI the anticheat reads unhookably
+
+- The boot file-detection report (su/emulator/root tags) is NOT the 304 gate:
+  physically removed /usr/bin/su from disk before launch → 304 still fired at ~60s.
+  So those findings are local/telemetry, separate from the kick.
+- The 304 is an IN-SESSION attestation, decided on Roblox's servers (the decision
+  code is not in our client — our client only RECEIVES 304), from what the client
+  sends over the RNA game channel (RUPP/WebTransport, custom-encrypted, opaque; main
+  connection uses directServerReturn RUPP, first byte 0x01, not standard QUIC).
+- The anti-cheat reads the environment through its OWN static/raw libc, NOT the
+  engine's imported libc: proven by dtrace+path-trace — `openat(/usr/bin/su)` succeeds
+  at the syscall level while cordial's `s_open`/`s_access`/`s_openat`/dlsym shims never
+  see the path. So it gets GENUINE FreeBSD kernel/libc behaviour, which cordial cannot
+  hook or Android-ise. Every signal it reads that way is FreeBSD's, not Linux/Android.
+- mocktail runs the byte-identical engine and passes — because Linuxulator gives it the
+  real Linux kernel ABI those unhookable reads land on. cordial on native FreeBSD cannot.
+
+**Architectural conclusion:** the 304 is Roblox's Android anti-cheat validating genuine
+Linux-kernel behaviour that it samples via unhookable static libc and reports in an
+encrypted in-session attestation. Native FreeBSD cannot produce that behaviour, and
+cordial cannot intercept the reads (they bypass every userland hook). The only ways past
+are: (a) the real Linux syscall ABI — Linuxulator/Sober/Wine — which the goal forbids;
+(b) kernel-level interception of the anti-cheat's reads (effectively building a targeted
+Linuxulator); or (c) RE Roblox's RUPP protocol + crypto to forge the attestation, which
+is the ban path Neil warned against. Everything else — HTTP, UA, /proc, /sys, maps,
+files, su, classloader, dlsym, join body, L2 validation — is ruled out with evidence.
