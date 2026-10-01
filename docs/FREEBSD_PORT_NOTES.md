@@ -3292,3 +3292,45 @@ external prerequisite is a genuine bionic-libc / Linux-syscall-ABI execution sub
 for the engine's imports — which on a real device is the OS and under mocktail is
 Linuxulator, the one layer the goal forbids. No non-patch, non-Linuxulator fix is reachable
 without one of the two multi-day RE efforts above.
+
+### 2026-10-01 (cont.) — 304 fully characterised via IDA+lldb: client passes ALL detections; verdict is server-side
+
+Dynamic + static RE nailed the anticheat surface:
+- **304 = `DisconnectAndroidAnticheatKick`** (reason-name string @0x2f074b; distinct from
+  305 `...EmulatorKick`, 306 `...RootedKick`, and the 318/319 `DisconnectRemoteAttestation*`
+  TCG challenge-response family). The reason strings only feed a telemetry name-mapper
+  (sub_6965AE3); the actual send is server-side numeric.
+- **The anticheat runs as a task on the engine's fiber scheduler** (sub_29D5AB0/C00). Its
+  check orchestrator is sub_31EA5F2, which runs the emulator-file detector and the maps
+  scanner sub_31F04E5.
+- **lldb breakpoint on sub_31F04E5 dumped its live search strings** (5th arg = decrypted
+  std::string array): the maps scanner looks for `Frida-`/`frida-`/`.frida.`/`/frida-`,
+  ` /su `, `Xposed`/`xposed`. Plus direct file probes (dtrace) for Magisk
+  (`com.topjohnwu.magisk`), QEMU/Genymotion (`/dev/qemu_pipe`, `/dev/socket/genyd`,
+  `qemud`), Xposed dalvik-cache, emulator `init/ueventd/fstab.{vbox86,nox,...}`, `su`.
+  **Every one is ENOENT/absent on cordial — cordial PASSES all client-side detections.**
+- The TCG attestation path (`NativeMetaInterface.getDeviceAttestationToken`,
+  `rblx-challenge-id`, `ChallengeRequiredEvent`, `DisconnectRemoteAttestation*`) is
+  **never invoked** in a full traced session (confirmed: not in the JNI trace, not
+  implemented in cordial) — so 318/319 is not what fires; it is plain 304.
+- Anticheat does not crash (no `AnticheatCrash`), and secure storage
+  (`IPlatformLocalStorageHandler.get/setSecureValue`) round-trips (auth persists).
+
+**Therefore:** cordial passes every observable client-side anticheat check, with byte-
+identical files/code to the mocktail client that survives. The 304 is the **server's**
+verdict on the client's periodic Android-anticheat report, which travels over the custom-
+encrypted RNA channel (opaque; not QUIC). The connection is otherwise healthy
+(replication works, assets stream), so the report is being SENT and REJECTED, not dropped.
+The rejection is decided by server logic + report crypto that depends on the genuine
+Android runtime substrate (bionic libc / platform attestation) cordial cannot reproduce
+natively.
+
+**Bottom line for a fix:** no native, non-patch change to cordial satisfies it, because
+cordial already passes everything it is asked locally. The only ways past are (a) reverse-
+engineer the RNA protocol + the anticheat report crypto and forge a valid-looking report
+— which is spoofing the anticheat, i.e. exactly the "patch" path Neil warned gets accounts
+banned (a forged attestation is what Roblox later flags) — or (b) supply a genuine platform
+attestation substrate (Play Integrity / TEE / real bionic), impossible on native FreeBSD
+without the Linux ABI (Linuxulator), which the goal forbids. The 304 is Roblox's anticheat
+correctly refusing an environment it cannot attest; mocktail only passes because Linuxulator
+gives it that substrate.
