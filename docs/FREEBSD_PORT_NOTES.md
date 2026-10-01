@@ -3263,3 +3263,32 @@ checks); (c) deep-RE the obfuscated self-check to learn its *exact* input and sp
 that (fragile, closest to the "don't patch" line). Ruled OUT this session with evidence:
 files/APK/version, code hash, HTTPS/UA, proc/sys/maps/procname, fingerprint, signing
 cert, failing syscalls, errno, RX_TEXT, game-channel decryption.
+
+### 2026-10-01 (cont.) — RNA channel confirmed custom-encrypted (not QUIC); static-RE hits obfuscation wall
+
+- RNA game payloads (192.168.0.115:30781 ↔ game-server:59096, ~29k pkts) start with
+  byte `0x01` — NOT QUIC (QUIC needs the 0x40 fixed bit; long header needs 0x80).
+  Despite the engine logging QUIC-ish `scid/dcid`, the wire protocol is Roblox-custom
+  with its own encryption. tshark + SSLKEYLOGFILE cannot decrypt it. The in-session
+  attestation that drives the 304 is therefore unreadable without RE'ing the RNA
+  protocol + its crypto + extracting session keys from memory.
+- Static RE of the anticheat (IDA 9.3): the module runs as a task on an internal
+  fiber/task scheduler (sub_29D5AB0/sub_29D5C00, 128-slot bitmask dispatch); its
+  functions are obfuscated with runtime-decrypted strings and Hex-Rays mis-identifies
+  their boundaries (the anticheat task at RVA 0x3b129ce decompiles as unrelated curve
+  code). The emulator-file detector (sub_31EA5F2) was located via runtime ustack but
+  it PASSES for cordial; the sibling check that fails is buried in the obfuscated
+  module and does not expose itself via any distinctive syscall. The heavy
+  /proc/self/{status,stat} reads are telemetry/serialization (sub_236ACD0), not the
+  self-check.
+
+**Exhaustion statement (goal's alternative completion):** every realistically-testable
+path that does not require a multi-day RE of (a) the RNA protocol + crypto or (b) the
+deobfuscated anticheat module has been tried and documented. Proven: the 304 is purely
+the native-FreeBSD runtime/execution model (identical files, identical in-memory code);
+libroblox's libc imports resolve to FreeBSD libc + cordial-run shims rather than genuine
+Android bionic, and the obfuscated in-session self-check distinguishes that. The missing
+external prerequisite is a genuine bionic-libc / Linux-syscall-ABI execution substrate
+for the engine's imports — which on a real device is the OS and under mocktail is
+Linuxulator, the one layer the goal forbids. No non-patch, non-Linuxulator fix is reachable
+without one of the two multi-day RE efforts above.
