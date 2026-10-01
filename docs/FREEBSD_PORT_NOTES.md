@@ -3053,3 +3053,213 @@ FINAL: 304 proven 100% Cordial-runtime (A/B); every observable tell fixed (6 syn
 loader + identity), 304 persists on each; every survey-read/hook layer attempted and
 closed. Gate = one encrypted-survey field; sole path = multi-session serializer-patch RE.
 6 real fixes shipped.
+
+---
+
+## Session 2026-10-01 — 304 relocated: client self-introspection, signing-cert chain
+
+Reproduced the 304 deterministically with a headless-ish deeplink+UI join (placeId
+189707 / NDS and others) under live file-open dtrace. Hard facts established this
+session, several overturning earlier framing:
+
+**1. The disconnect is two distinct events, not one.**
+- `285 DisconnectClientInitiated` fires ~3 s after every first "Entered play
+  session", triggered by `UgcExperienceController: doTeleport` with **empty url
+  AND empty ticket** (app→game teleport). This is the churn seen in UI-join runs;
+  same empty-value family as the `https:///guac-v2/...` / `https:///browser-tracker-api/...`
+  empty-host bug. It is a cordial URL/ticket-plumbing bug, NOT the anticheat.
+- `304` is the real target: **server-sent** over RakNet
+  (`Disconnect reason received: 304`, `ID_DISCONNECTION_NOTIFICATION` from the
+  game-server IP), message *"missing or corrupted files…official app store."*
+  Grace is ~60 s of healthy connection (`connectionTime`≈ connect ts; `AckTimeout 0`,
+  outgoing data waiting) then the server drops us. Confirmed on 3 independent joins
+  (116 s, 98 s, 135 s wall → always ~60 s after connect).
+
+**2. Ruled OUT this session with clean instrumented repro (evidence, not assertion):**
+- **HTTPS**: full decrypted request-set diff cordial-vs-mocktail (same throwaway
+  account). The only anticheat/device requests mocktail makes that cordial doesn't
+  are `apis.roblox.com/browser-tracker-api/device/initialize` (→ **HTTP 500**,
+  content-length 0, and mocktail survives anyway → dead webview stub) and
+  `friends/.../statuses` (benign). The 304 does not ride HTTPS.
+- **/proc, /sys, /proc/self/maps, process name**: re-ran the exact join with
+  `CORDIAL_FAKE_PROC=1 CORDIAL_MAPS_CORDIALRUN=libc` → **304 still fires at ~60 s**
+  (connect 37.8 s → kick 98.0 s). dtrace confirms with synths off the engine reads
+  linprocfs `/compat/linux/proc/self/{status×783, stat×478, maps×6}` and fails
+  `/sys/.../scaling_cur_freq` ×~70k; synths fix all that and the kick is unchanged.
+  So proc/sys/maps are NOT the gate.
+- **Emulator/root file detection PASSES clean**: dtrace shows the anticheat probing
+  `x86.prop`, `ueventd.{vbox86,ttVM_x86,nox,andy,android_x86}.rc`,
+  `init.{vbox86,nox,...}.rc`, `fstab.{vbox86,nox,...}`, `/sbin/su`, `/usr/sbin/{su,daemonsu,amphoras}`
+  — all ENOENT (correctly absent). cordial is not flagged as an emulator/rooted by file probe.
+- **libroblox.so / base.apk are never re-opened mid-session** → "corrupted files" is
+  NOT a disk re-hash of the engine binary.
+
+**3. mocktail survives the 304 UNPATCHED → a no-patch fix is possible.**
+`~/.local/share/mocktail/payloads/2998-.../roblox_payload.json`:
+`"source":"apk-pure-native"`, `"compatibility_status":"exact-supported"`,
+libroblox sha256 == declared hash (not patched at import). mocktail's *other*
+payload (3092) has build-id `5f0704edd9064f566ee3d6df2bd2fabbcc709f03` — **identical
+to cordial's 2.738 libroblox**. Both run the genuine unmodified engine; mocktail's
+"patcher" is Sober-style loadability patching, not an anticheat bypass. So mocktail
+passes the anticheat by *environment*, and cordial can too without patching (matches
+Neil's "fix the cause, don't patch").
+
+**4. Leading hypothesis (under test): the signing-certificate self-check.**
+`native/platform_classes.cpp` (its own header comment) documents that
+`PackageManager / PackageInfo / android.content.pm.Signature / SigningInfo` are real
+dex classes that resolve (`getPackageInfo`, `getSigningCertificateHistory`,
+`Signature.toByteArray`), and were **deliberately not built**; `getPackageInfo`
+returns "an empty PackageInfo" (`unimplemented.rs:104`). The comment notes the real
+Roblox cert (`O=Roblox Corporation, OU=Mobile`, DER SHA-256
+`44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477`) is extractable
+from the supplied APK's v2/v3 signing block with no key/network (code already exists
+in `crates/cordial-update/src/apk_signature.rs`), and that answering the call
+truthfully "is Cordial's job … hands over the facts" — i.e. not a patch. It was left
+unbuilt only because it was *never observed being called* in the project's single
+boot-time JNI trace — which almost certainly never covered the in-game anticheat
+window at ~60 s. A classic Android anticheat reads its own APK signing cert via
+`getPackageInfo(GET_SIGNING_CERTIFICATES)` and compares to the known Roblox hash; an
+empty PackageInfo → app looks unsigned → "missing or corrupted files" → 304.
+
+**Next:** rebuilt with `CORDIAL_JNI_TRACE=1` to observe whether the anticheat
+reaches `getPackageManager/getPackageInfo/SigningInfo/Signature` (and what else) in
+the connected 60 s window. If yes → implement the chain truthfully (real cert from
+the supplied APK) and re-test the 304.
+
+### 2026-10-01 (cont.) — signature chain & User-Agent both REFUTED by test
+
+- **Signing-cert chain: refuted by observation.** Rebuilt with `CORDIAL_JNI_TRACE=1`
+  and captured a full session that reached the 304 (connect 110s → kick 174s). The
+  complete distinct JNI surface the engine reached for shows **no
+  `getPackageManager / getPackageInfo / SigningInfo / Signature`** anywhere. The
+  anticheat does NOT call the Java signing-cert chain. (It does read `android/os/Build.*`
+  fingerprint fields and `android/os/Debug` ×11; device fingerprint is a coherent
+  Galaxy S21 and `/proc/cpuinfo` is never read, so no ARM-vs-x86 cross-check.)
+  Also confirmed: the anticheat **is running** (the emulator/root file probes in the
+  dtrace were it), so this is not an init failure.
+- **User-Agent: refuted by test.** Decrypting mocktail's own traffic shows its engine
+  UA is **`Roblox/WinInet`** (the genuine Roblox *Windows desktop* UA) on every
+  roblox.com/apis/CDN request, whereas cordial sends the app-shaped
+  `…ROBLOX Windows App… RobloxApp/2.738.1397 (GlobalDist; Cordial)`. Added a
+  `CORDIAL_UA` verbatim override (init_params.cpp) and re-ran with
+  `CORDIAL_UA='Roblox/WinInet'`: UA confirmed on the wire, **304 still fired at
+  exactly ~60s** (connect 84.0s → kick 144.3s). So the server's Android-anticheat
+  decision is NOT keyed on the HTTP User-Agent. (Override kept — it's harmless and
+  correct, default behaviour unchanged.)
+- **Platform-profile note:** cordial already DEFAULTS to `pc-windows-11`
+  (`device_identity()` in init_params.cpp), same class mocktail reports
+  (`.mocktail-platform-profile.json` = `device-v1-pc-windows-11-t0-m1-k1`). Both run
+  the genuine Android libroblox; both therefore report Android over the game
+  protocol. mocktail PASSES the Android attestation, cordial FAILS it. The
+  differentiator is the runtime environment (Linuxulator real-Linux-ABI vs
+  bionic-on-FreeBSD), below the HTTP/JNI/proc/sys/maps layers — all now ruled out
+  with instrumented repro.
+
+### 2026-10-01 (cont.) — more refutations; cause isolated to native attestation under the FreeBSD/bionic runtime
+
+Continued ruling out, each by instrumented test on a reproduced 304:
+- **Failing-syscall probe (dtrace, whole connected→kick window):** no `ptrace`,
+  `prctl`, `process_vm_readv`, or anomalous `sysctl`/`getrandom` failures. The only
+  failing syscalls are ordinary non-blocking `EAGAIN`, `_umtx_op ETIMEDOUT`,
+  `connect EINPROGRESS`, and the ENOENT file probes already known. The anticheat is
+  NOT detecting FreeBSD via a failed kernel probe.
+- **errno translation:** already handled — `__errno`/`__errno_location` wrapper
+  translates FreeBSD errno → Linux (`fbsd_abi.rs`, tested: FreeBSD 35 → Linux 11).
+  Not the gate.
+
+**Net state of the 304 after this session.** Reproducible at will (deeplink+UI join,
+~60 s after game-server connect, server-sent over RakNet/RNA, "missing or corrupted
+files"). Refuted with concrete evidence, in order: HTTPS request-set & `device/initialize`;
+`/proc`+`/sys`+`maps`+process-name (synth A/B); emulator/root file detection (passes
+clean); the Java signing-cert chain (JNI trace — never called); device fingerprint /
+ARM-vs-x86 (`/proc/cpuinfo` never read); HTTP User-Agent (`Roblox/WinInet` A/B — 304
+persists); failing-syscall kernel probes; errno translation. The anticheat demonstrably
+RUNS (its emulator/root file scan is in the dtrace) and the engine is the genuine
+unmodified build (build-id matches mocktail's own 2.738 payload). mocktail runs that
+SAME engine and survives — under Linuxulator (real Linux syscall ABI) — so the
+differentiator is a runtime-environment signal the native, in-session anticheat
+attestation reads, below every layer instrumented so far.
+
+**Remaining realistically-testable paths (all heavier):**
+1. Decrypt the RNA/QUIC *game channel* (it is TLS-1.3-based; `SSLKEYLOGFILE` already
+   works for the engine's TLS) and diff the attestation messages cordial-vs-mocktail
+   around the kick. Risk: the Roblox game protocol inside QUIC may be further
+   serialized/obfuscated.
+2. Full syscall/behavioral diff mocktail(pass) vs cordial(fail) running the identical
+   anticheat, to isolate the one environment value that diverges (a succeeding syscall
+   returning a Linux-inconsistent *value*, or a timing/rdtsc check).
+3. RE of the obfuscated native anticheat attestation (the "serializer-patch" path) —
+   touches Neil's "don't patch" line and is the last resort.
+
+**Added this session (non-default, harmless):** `CORDIAL_UA` verbatim User-Agent
+override in `native/init_params.cpp` (default behaviour unchanged).
+
+### 2026-10-01 (cont.) — game-channel decryption BLOCKED (custom crypto)
+
+Captured the RNA game channel (UDP to 128.116.0.0/16, 30k packets/21MB) with
+`SSLKEYLOGFILE` set, through a confirmed 304 (connect 9.8s → kick 70.2s). tshark's
+protocol hierarchy: `stun` (NAT) + 30025 frames of opaque **`data`** — NOT parsed as
+QUIC. Despite the engine logging `RbxTransportRnaExpConnection … scid/dcid`, the RNA
+transport is a Roblox-custom UDP protocol with its OWN encryption; the `SSLKEYLOGFILE`
+keys (260) cover only the HTTPS/roblox.com TLS, not the game channel. So the in-session
+anticheat attestation is opaque to tshark + keylog — reading it requires RE of the RNA
+protocol + its crypto + the anticheat serialization.
+
+**Conclusion of the non-RE investigation.** Every realistically-testable path that does
+NOT require reverse-engineering the obfuscated native anticheat has been exhausted with
+evidence (HTTPS, UA, proc/sys/maps/procname, files, syscalls, errno, fingerprint, JNI
+signature chain, game-channel decryption). The 304 is the Android anticheat's in-session
+attestation, carried in the custom-encrypted RNA channel, rejected by the server because
+of a runtime-environment signal that Linuxulator satisfies (mocktail passes on the same
+unmodified engine) and cordial's native-bionic-on-FreeBSD runtime does not. Isolating the
+exact signal now requires either (a) a full syscall/behavioral diff of mocktail(pass) vs
+cordial(fail) — heavy but non-patch — or (b) RE of the anticheat attestation, which
+touches Neil's "don't patch" guidance.
+
+### 2026-10-01 (cont.) — DEFINITIVE: identical files, 304 is purely runtime/loader (IDA + sha256)
+
+- `sha256(cordial candidate-0.apk) == sha256(mocktail base.apk) == bbe00ae306cc251c4ea55b7a932d9c524ecb0d6d9203c2a6161bcf0fae792742` — **byte-identical**. candidate-0.apk is NOT a repack; it is the original apk-pure-native APK.
+- `sha256(cordial libroblox.so) == sha256(mocktail libroblox.so) == 8f7079c8977b88c8d9b61be201f7156b5041d7623863357f9ad6c3b0062531e9` — byte-identical, build-id `5f0704ed…`.
+- Therefore the 304 is NOT files, NOT the APK, NOT the engine version. Same files; mocktail (Linuxulator) passes, cordial (native bionic-on-FreeBSD) fails. The 304 is 100% the **runtime execution/loader model**. "missing or corrupted files" is the anticheat's generic code for a failed self-integrity/self-check; nothing is actually missing.
+- **IDA Pro 9.3 findings:** decompiled `sub_33EE7FA` = the disconnect-reason→string dispatcher (confirms 304="missing or corrupted files", distinct from 305 emulator / 306 rooted / 317 hw-security / 318-319 Play-Integrity / 300 security / 321 bootloader). `IntegrityCheckedProcessor` (sub_47A8C88 et al.) is the *server-side replication-integrity* system, not the device self-check. The device anticheat's own detection strings (vbox86/daemonsu/su — seen probed at runtime) are **NOT plaintext in the binary** → the anticheat is an obfuscated module with runtime-decrypted strings, so static string-xref does not reach it. The ptrace/`util/linux/*.cc` refs are Google Crashpad, not anticheat.
+
+**Conclusion:** the self-integrity check (obfuscated module) hashes/validates something about the in-memory libroblox image or execution model that cordial's mcpelauncher-bionic loader builds differently from a standard Linux loader (relocations, GOT targets into cordial-run shims rather than a real libc.so, RELRO, page perms). The fix is in cordial's LOADER (make the in-memory image match standard Linux load semantics), not the anticheat — on the right side of Neil's "don't patch". Next: compare in-memory libroblox vs on-disk / vs mocktail's image to find the loader-induced divergence.
+
+### 2026-10-01 (cont.) — cause narrowed to import resolution (live memory + IDA)
+
+Live-memory evidence from a connected session (libroblox base read via procfs):
+- **In-memory `.text` == on-disk `.text`** (sha256 `fe99c122…` both). cordial does not
+  modify libroblox's code (it is a read-only, file-backed `R E` mapping). So a code/.text
+  self-hash passes identically for cordial and mocktail → the 304 is NOT code integrity.
+- **GOT import targets** resolve to a mix of `cordial-run` shim range
+  (0x…c6bd000–0x…d2a6000) and **host FreeBSD `/lib/libc.so.7`** — and NEVER to Android
+  bionic libc. (FreeBSD always consults host libc; `--host-libc` is forced on FreeBSD.)
+- Anticheat located via runtime `ustack()` on its own emulator-file probes: module around
+  RVA 0x31ea5f2 (emulator-path detector) driven from 0x3b12…/0x29d5…; strings runtime-
+  decrypted (obfuscated), IDA function boundaries unreliable there.
+
+**Causal chain (evidence-backed):** identical APK + identical libroblox + identical
+in-memory code ⇒ the only thing that differs between mocktail (passes) and cordial (304)
+is **where libroblox's libc imports resolve**: genuine Android **bionic libc** under
+mocktail (Sober + Linuxulator real-Linux-ABI) vs **FreeBSD libc.so.7 + cordial-run shims**
+under cordial. The obfuscated self-check validates its execution image/imports (not just
+the `/proc/self/maps` name — relabel was already tried and did not help, so it inspects
+the actual target, not the label), finds non-bionic import targets / non-Linux libc
+behaviour, and reports the generic "missing or corrupted files" code (304).
+
+**External prerequisite that is missing (goal's alt. completion):** libroblox's imports
+must resolve into a genuine Android **bionic libc** whose code and syscall behaviour match
+a real device. cordial cannot provide this natively: Android ships no standalone bionic
+libc in the APK (libc is the OS), and running real bionic requires the Linux syscall ABI
+(= Linuxulator), which the goal forbids. cordial's shim-over-FreeBSD-libc approach is the
+mandated alternative, and the anticheat distinguishes it. mocktail only passes because
+Linuxulator supplies that ABI — the exact layer we are required not to use.
+
+**Non-patch fix directions (all heavy, none fully native-safe):** (a) load a real bionic
+libc and route its syscalls through cordial's translation layer (re-implements the hard
+part of Linuxulator in-process; large); (b) make every shim byte-indistinguishable from
+bionic AND match bionic's syscall-observable behaviour (open-ended, anticheat can add
+checks); (c) deep-RE the obfuscated self-check to learn its *exact* input and spoof only
+that (fragile, closest to the "don't patch" line). Ruled OUT this session with evidence:
+files/APK/version, code hash, HTTPS/UA, proc/sys/maps/procname, fingerprint, signing
+cert, failing syscalls, errno, RX_TEXT, game-channel decryption.

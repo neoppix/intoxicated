@@ -367,6 +367,20 @@ const DeviceProfile& device_profile() {
 /// version, where those appear at all — is unchanged, because none of it is
 /// Android- or Windows-specific in the first place.
 static std::string build_user_agent() {
+    // Verbatim override. The real Roblox Windows desktop client — and mocktail,
+    // which survives the 304 on this same engine — send the HTTP User-Agent
+    // `Roblox/WinInet` (confirmed by decrypting mocktail's own traffic on this
+    // account: every roblox.com/apis.roblox.com/CDN request carries it). The
+    // three shapes below are all app-token (`RobloxApp/...`) strings, which the
+    // service reads as the mobile app; this override exists to present the
+    // desktop string the surviving client uses instead, without guessing its
+    // syntax. Set `CORDIAL_UA='Roblox/WinInet'` to use it.
+    if (const char* ua = getenv("CORDIAL_UA")) {
+        if (*ua) {
+            return std::string(ua);
+        }
+    }
+
     long ram_mb = 0;
     if (FILE* f = fopen("/proc/meminfo", "re")) {
         char line[256];
