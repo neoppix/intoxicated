@@ -114,16 +114,60 @@ public:
                 ch = '/';
             }
         }
+        if (std::getenv("CORDIAL_TRACE_CLASSLOADER")) {
+            std::fprintf(stderr, "[cordial][classloader] loadClass/findClass: %s\n", path.c_str());
+        }
         return env->GetClass(path.c_str());
     }
+
+    /// `java.lang.Class.getClassLoader()`.
+    ///
+    /// **Load-bearing for the server-side anti-cheat (304 kick).** Roblox's
+    /// Android anti-cheat obtains the application `ClassLoader` through this call
+    /// (`FindClass` the app class -> `getClassLoader` on it -> cache the loader
+    /// and its `findClass` method), then resolves and verifies its own classes
+    /// through that loader. Confirmed by RE of `libroblox.so`: the loader is
+    /// stashed in a global the check reads, and if it is null the check returns
+    /// "untrusted" and the client reports a degraded anti-cheat status that the
+    /// server disconnects with reason 304 (`DisconnectAndroidAnticheatKick`,
+    /// user-visible as "missing or corrupted files") ~60 s into the session.
+    /// libjnivm never provided `getClassLoader`, so the loader came back null;
+    /// handing back the same loader `loadClass`/`findClass` are registered on
+    /// closes that gap. Returning a real loader is answering a genuine platform
+    /// call, not spoofing a check.
+    static std::shared_ptr<ClassLoader> getClassLoader(ENV* env, Object*) {
+        if (std::getenv("CORDIAL_TRACE_CLASSLOADER")) {
+            std::fprintf(stderr, "[cordial][classloader] Class.getClassLoader() -> singleton\n");
+        }
+        return singleton(env);
+    }
+
+    static std::shared_ptr<ClassLoader> singleton(ENV* env);
 
     static void Register(ENV* env) {
         env->GetClass<ClassLoader>("java/lang/ClassLoader");
         auto c = env->GetClass("java/lang/ClassLoader");
         c->HookInstanceFunction(env, "loadClass", &ClassLoader::loadClass);
         c->HookInstanceFunction(env, "findClass", &ClassLoader::loadClass);
+        // `Class.getClassLoader()` is a method on java.lang.Class, so it is
+        // hooked on that class rather than on ClassLoader. The engine reaches it
+        // via GetObjectClass(someJClass) -> GetMethodID("getClassLoader").
+        auto cls = env->GetClass("java/lang/Class");
+        cls->HookInstanceFunction(env, "getClassLoader", &ClassLoader::getClassLoader);
     }
 };
+
+static std::shared_ptr<ClassLoader> g_classloader;
+static std::mutex g_classloader_mutex;
+
+std::shared_ptr<ClassLoader> ClassLoader::singleton(ENV* env) {
+    std::lock_guard<std::mutex> lock(g_classloader_mutex);
+    if (!g_classloader) {
+        g_classloader = std::make_shared<ClassLoader>();
+        to_jni(env, g_classloader);
+    }
+    return g_classloader;
+}
 
 /// `android.content.res.AssetManager`
 ///
