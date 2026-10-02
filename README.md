@@ -5,7 +5,7 @@
 <h1 align="center">Intoxicated</h1>
 
 <p align="center">
-  <strong>Roblox on FreeBSD — 100% native.</strong><br>
+  <strong>Roblox on FreeBSD. 100% native.</strong><br>
   No linuxulator. No emulator. No Wine. No Waydroid. Nothing under <code>/compat/linux</code>.<br>
   The official Roblox engine running as a real FreeBSD process.
 </p>
