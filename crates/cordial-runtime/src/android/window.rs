@@ -63,6 +63,9 @@ struct Xlib {
     send_event: unsafe extern "C" fn(Display, Window, c_int, c_long, *mut c_void) -> c_int,
     sync: unsafe extern "C" fn(Display, c_int) -> c_int,
     store_name: unsafe extern "C" fn(Display, Window, *const c_char) -> c_int,
+    change_property: unsafe extern "C" fn(
+        Display, Window, c_ulong, c_ulong, c_int, c_int, *const u8, c_int,
+    ) -> c_int,
     flush: unsafe extern "C" fn(Display) -> c_int,
     destroy_window: unsafe extern "C" fn(Display, Window) -> c_int,
     // ---- input, added for keyboard/mouse delivery ----
@@ -160,6 +163,7 @@ impl Xlib {
             create_simple_window: sym!("XCreateSimpleWindow"),
             map_window: sym!("XMapWindow"),
             store_name: sym!("XStoreName"),
+            change_property: sym!("XChangeProperty"),
             flush: sym!("XFlush"),
             destroy_window: sym!("XDestroyWindow"),
             select_input: sym!("XSelectInput"),
@@ -715,8 +719,8 @@ struct XSizeHints {
 /// `packaging/io.github.luohoa97.Cordial.desktop`. A mismatch is invisible in normal
 /// use and shows up as an unnamed window in OBS and portal capture pickers, and
 /// as a second unbranded taskbar entry. See ADR-009.
-const WM_RES_NAME: &str = "cordial";
-const WM_RES_CLASS: &str = "Cordial";
+const WM_RES_NAME: &str = "intoxicated";
+const WM_RES_CLASS: &str = "Intoxicated";
 
 #[repr(C)]
 struct XClassHint {
@@ -907,6 +911,37 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
             .collect();
         let name = CString::new(ascii).unwrap_or_default();
         (xlib.store_name)(display, w, name.as_ptr());
+
+        // Set the taskbar / window icon (the Intoxicated logo) via _NET_WM_ICON.
+        // The property is an array of CARDINALs: width, height, then width*height
+        // ARGB pixels (0xAARRGGBB), one or more images concatenated. `icon_blob`
+        // is that sequence stored as little-endian u32; Xlib's format-32 wants
+        // each value in a C `long`, so widen to c_ulong before handing it over.
+        // Works without any installed .desktop/theme, which is what a
+        // run-from-source build needs.
+        {
+            const ICON_BLOB: &[u8] = include_bytes!("intoxicated_icon.bin");
+            let icon: Vec<c_ulong> = ICON_BLOB
+                .chunks_exact(4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as c_ulong)
+                .collect();
+            const XA_CARDINAL: c_ulong = 6; // predefined atom, no intern needed
+            const PROP_MODE_REPLACE: c_int = 0;
+            let net_wm_icon = CString::new("_NET_WM_ICON").unwrap();
+            let prop = (xlib.intern_atom)(display, net_wm_icon.as_ptr(), 0);
+            if prop != 0 && !icon.is_empty() {
+                (xlib.change_property)(
+                    display,
+                    w,
+                    prop,
+                    XA_CARDINAL,
+                    32,
+                    PROP_MODE_REPLACE,
+                    icon.as_ptr() as *const u8,
+                    icon.len() as c_int,
+                );
+            }
+        }
 
         // Without WM hints a window manager is free to place this wherever it
         // likes and to decide it does not take keyboard focus. Both were

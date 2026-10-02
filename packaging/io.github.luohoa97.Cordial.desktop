@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Cordial
+Name=Intoxicated
 GenericName=Roblox Client
 Comment=Run Roblox on Linux
 # cordial-shell, not cordial, and the shortening is the bug rather than the
@@ -24,4 +24,4 @@ Categories=Game;
 # handler that is never given the URL it was invoked for.
 MimeType=x-scheme-handler/roblox-player;x-scheme-handler/roblox;
 StartupNotify=true
-StartupWMClass=Cordial
+StartupWMClass=Intoxicated

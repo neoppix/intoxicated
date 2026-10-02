@@ -45,7 +45,7 @@ impl Brand {
     /// The name the window, the about dialog and the task switcher use.
     pub fn name(self) -> &'static str {
         match self {
-            Brand::Cordial => "Cordial",
+            Brand::Cordial => "Intoxicated",
             Brand::Frostbite => "Frostbite",
         }
     }

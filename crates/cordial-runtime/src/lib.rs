@@ -13,7 +13,7 @@
 /// that has to work; naming it in the title means a screenshot says which
 /// backend produced it without anyone having to ask.
 pub fn window_title(backend: &str) -> String {
-    format!("Cordial {} ({backend})", env!("CARGO_PKG_VERSION"))
+    format!("Intoxicated {} ({backend})", env!("CARGO_PKG_VERSION"))
 }
 
 pub mod android;
