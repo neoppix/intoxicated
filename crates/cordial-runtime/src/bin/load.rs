@@ -817,6 +817,79 @@ extern "C" fn run_bootstrap() {
                 }
             });
         }
+
+        // Keep Cordial's launch flags applied, so the engine's own flag
+        // reloader cannot quietly revert them mid-session.
+        //
+        // **This fixes the "240 drops to 60 after a couple of minutes and never
+        // comes back" report, root cause confirmed by measurement 2026-10-02.**
+        // The fps unlock rides `DFIntTaskSchedulerTargetFps=9999`, a *dynamic*
+        // flag. The engine runs its own `DynamicFastVariableReloader`, which
+        // re-fetches Roblox's document ~2 minutes in (and every
+        // `FIntScheduledFlagFetchPeriodMinutes`, 180, after). That document does
+        // not carry `DFIntTaskSchedulerTargetFps`, so on each re-fetch the
+        // engine resets it to its own compiled-in default -- 60, the Android
+        // handheld target -- and the TaskScheduler pins there for the rest of
+        // the run. It reads as a tab-out bug only because that is where a player
+        // happens to be at the two-minute mark; it reproduces with nobody
+        // touching the window, and `CORDIAL_REFRESH_HZ`, focus, the compositor,
+        // the GPU clock and the present mode were each ruled out first.
+        //
+        // The fix is to re-send the merged document on a cadence shorter than
+        // any dip a player would notice. Re-sending is cheap and side-effect
+        // free: `client_settings.rs` establishes a second
+        // `nativeInitClientSettings` is accepted mid-run (returns 0 and takes
+        // effect), the document is identical every time so the engine's
+        // `writeFlagCache` sees a matching signature and skips the disk write,
+        // and the call that proved this out drove no shader recompile and left
+        // no dent in the present rate -- 60.0/s stepped straight to 239.8/s in
+        // the next window. The reverted value is only ever restored, never
+        // changed, so a run that was already at its target sees nothing happen.
+        //
+        // Default on, because the drop hits every build on every display and
+        // the cost is a flag re-send every five seconds on a thread of its own.
+        // Five seconds is the measured sweet spot: a 30 s present-rate window
+        // straddling the revert still read 237.1/s with it, so the blip never
+        // surfaces, while the re-send stayed free -- the identical document
+        // skips the cache write and drives no GPU work. `CORDIAL_KEEP_FLAGS=off`
+        // disables it for an A/B against the bug; `CORDIAL_KEEP_FLAGS_MS` tunes
+        // the cadence (floored at 1 s so a typo cannot spin the engine's flag
+        // path).
+        let keep_flags = !matches!(
+            std::env::var("CORDIAL_KEEP_FLAGS").as_deref(),
+            Ok("off") | Ok("0")
+        );
+        if keep_flags {
+            let interval_ms = std::env::var("CORDIAL_KEEP_FLAGS_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&ms| ms >= 1000)
+                .unwrap_or(5_000);
+            // The merged launch document, cached once rather than re-read: it
+            // does not change within a run, and re-reading would only reopen the
+            // live-edit question `CORDIAL_EXPERIMENT_RESETTLE_MS` exists to ask.
+            let doc = plan.settings.clone();
+            // Crossed as an integer for the same reason the experiment above
+            // does: a raw pointer is not `Send`, and this one points at a symbol
+            // in a library that stays mapped for the life of the process.
+            let native = plan.settings_native as usize;
+            println!(
+                "  [intoxicated] keep-flags: re-applying launch flags every {interval_ms} ms so \
+                 the engine's reloader cannot revert the fps cap (CORDIAL_KEEP_FLAGS=off to disable)"
+            );
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+                if let Err(e) = linker::game_activity::init_client_settings(
+                    native as *mut std::ffi::c_void,
+                    &doc,
+                    "",
+                    "",
+                ) {
+                    eprintln!("[intoxicated] keep-flags: re-apply failed, stopping: {e}");
+                    break;
+                }
+            });
+        }
     }
     // `post` immediately after `settings`, and the flag names last.
     //

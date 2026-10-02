@@ -229,13 +229,23 @@ pub fn backend_close_window() {
 
 /// Whether the user has closed the engine's window, for the active backend.
 ///
-/// The X11 backend answers `false` unconditionally rather than growing a second
-/// implementation of this: ADR-011 makes X11 the diagnostic fallback, and a
-/// closed window there still ends the way it always has, on `--run`.
+/// Both backends answer for real. `window.rs` already advertises
+/// `WM_DELETE_WINDOW` and records the window manager's close request in its own
+/// `WINDOW_CLOSED` flag (see its `CLIENT_MESSAGE` handler); routing X11 to that
+/// here is what makes the close button end the process.
+///
+/// **This used to answer `false` unconditionally on X11**, on the reasoning
+/// that ADR-011 makes X11 the diagnostic fallback and a closed window there
+/// "still ends the way it always has, on `--run`". That holds only while a
+/// `--run` timer is set. The `intoxicated` launcher runs `--run 0` (no timer,
+/// run until the window closes), so on X11 the close button did nothing and the
+/// process stayed alive with no window -- the reported bug. The close is a real
+/// user action on either backend and is honoured on both; `CORDIAL_NO_CLOSE_EXIT`
+/// still gates whether it ends the run, unchanged.
 pub fn window_closed() -> bool {
     match backend() {
         Backend::Wayland => wayland::window_closed(),
-        Backend::X11 => false,
+        Backend::X11 => window::window_closed(),
     }
 }
 
