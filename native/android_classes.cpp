@@ -214,7 +214,7 @@ std::atomic<unsigned> g_textbox_generation{0};
 /// booleans were being argued about from a log that only ever showed two.
 void trace_textbox_info(const char* source, const CordialTextBoxInfo& i) {
     fprintf(stderr,
-            "[cordial] textbox spec from %s x=%g y=%g w=%g h=%g fontSize=%g "
+            "[intoxicated] textbox spec from %s x=%g y=%g w=%g h=%g fontSize=%g "
             "multiline=%d xAlign=%d yAlign=%d textColor=%#x font=%d "
             "textInputType=%d returnKeyType=%d manualFocusRelease=%d "
             "textWrapped=%d z14=%d\n",
@@ -238,7 +238,7 @@ extern "C" void cordial_textbox_focused(long long handle, const char* text,
                                         const CordialTextBoxInfo* info) {
     const bool trace = getenv("CORDIAL_TRACE_TEXT") != nullptr;
     if (trace) {
-        fprintf(stderr, "[cordial] textbox focused handle=%lld current=%zu bytes\n",
+        fprintf(stderr, "[intoxicated] textbox focused handle=%lld current=%zu bytes\n",
                 handle, text ? strlen(text) : 0);
     }
     {
@@ -265,7 +265,7 @@ extern "C" void cordial_textbox_focused(long long handle, const char* text,
             if (source) {
                 trace_textbox_info(source, g_textbox_info);
             } else {
-                fprintf(stderr, "[cordial] textbox spec unavailable\n");
+                fprintf(stderr, "[intoxicated] textbox spec unavailable\n");
             }
         }
     }
@@ -275,7 +275,7 @@ extern "C" void cordial_textbox_focused(long long handle, const char* text,
 
 extern "C" void cordial_textbox_blurred() {
     if (getenv("CORDIAL_TRACE_TEXT")) {
-        fprintf(stderr, "[cordial] textbox blurred\n");
+        fprintf(stderr, "[intoxicated] textbox blurred\n");
     }
     {
         // The spec goes with the focus. A caller that kept drawing an editor
@@ -668,7 +668,7 @@ bool identity_known() {
 void trace_identity(const char* field) {
     static const bool on = getenv("CORDIAL_TRACE_IDENTITY") != nullptr;
     if (!on) return;
-    fprintf(stderr, "[cordial] identity asked: %s (%s)\n", field,
+    fprintf(stderr, "[intoxicated] identity asked: %s (%s)\n", field,
             identity_known() ? "signed in" : "nobody");
 }
 
@@ -796,7 +796,7 @@ public:
         // whose spec is unknown means our `<init>` hook never matched and the
         // fourteen values went past us.
         if (getenv("CORDIAL_TRACE_TEXT") != nullptr) {
-            fprintf(stderr, "[cordial] showKeyboard: info=%s spec_known=%s\n",
+            fprintf(stderr, "[intoxicated] showKeyboard: info=%s spec_known=%s\n",
                     info ? "object" : "NULL",
                     info ? (info->spec_known ? "true" : "false") : "n/a");
         }

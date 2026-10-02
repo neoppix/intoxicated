@@ -1092,7 +1092,7 @@ fn build_report_page(parent: &impl IsA<gtk::Window>) -> adw::PreferencesPage {
             gtk::gio::Cancellable::NONE,
             |result| {
                 if let Err(e) = result {
-                    eprintln!("[cordial] could not open the issue tracker: {e}");
+                    eprintln!("[intoxicated] could not open the issue tracker: {e}");
                 }
             },
         );

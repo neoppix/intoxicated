@@ -2281,7 +2281,7 @@ impl WaylandWindow {
                 (None, _) => ("off".to_owned(), "n/a".to_owned(), "(process default)".to_owned(), 1.0),
             };
             eprintln!(
-                "[cordial] text editor placed from {} x={} y={} w={} h={} \
+                "[intoxicated] text editor placed from {} x={} y={} w={} h={} \
                  xAlign={} yAlign={} multiline={} textInputType={} returnKeyType={} \
                  textWrapped={} fontSlot={slot} fontId={id} family={family:?} \
                  fontSize={} fromRbxFontRatio={ratio} drawnFontSize={}",
@@ -2451,7 +2451,7 @@ impl WaylandWindow {
             Ok(_) => carried,
             Err(e) => {
                 if super::input::trace_text() {
-                    eprintln!("[cordial] nativeGetTextBoxInfo failed: {e}");
+                    eprintln!("[intoxicated] nativeGetTextBoxInfo failed: {e}");
                 }
                 carried
             }
@@ -2947,7 +2947,7 @@ impl WaylandWindow {
         ] {
             if held & button != 0 {
                 if super::input::trace_mouse() {
-                    eprintln!("[cordial] pointer left the canvas holding {button}; releasing it");
+                    eprintln!("[intoxicated] pointer left the canvas holding {button}; releasing it");
                 }
                 self.dispatch_pointer_button(button, false);
             }
@@ -3025,7 +3025,7 @@ impl WaylandWindow {
                     .store(if survives { 0 } else { self.now_ms() }, Ordering::Relaxed);
                 if !survives && super::input::trace_mouse() {
                     eprintln!(
-                        "[cordial] pointer lock: right drag ended without a lock behind it; \
+                        "[intoxicated] pointer lock: right drag ended without a lock behind it; \
                          disregarding the engine's request until it reads false once"
                     );
                 }
@@ -3256,7 +3256,7 @@ unsafe extern "C" fn pointer_button(
         // line per frame while the pointer moves over the dialog.
         if super::input::trace_mouse() {
             eprintln!(
-                "[cordial] click withheld from the engine: a web-view dialog is in front"
+                "[intoxicated] click withheld from the engine: a web-view dialog is in front"
             );
         }
         return;
@@ -3614,7 +3614,7 @@ unsafe extern "C" fn locked_pointer_locked(_data: *mut c_void, _lp: *mut c_void)
     super::input::reset_mouse_delta();
     super::input::forget_pending_unlocked_delta();
     if super::input::trace_mouse() {
-        eprintln!("[cordial] pointer lock: compositor sent locked");
+        eprintln!("[intoxicated] pointer lock: compositor sent locked");
     }
 }
 
@@ -3636,7 +3636,7 @@ unsafe extern "C" fn locked_pointer_unlocked(_data: *mut c_void, _lp: *mut c_voi
     super::input::reset_mouse_delta();
     super::input::forget_pending_unlocked_delta();
     if super::input::trace_mouse() {
-        eprintln!("[cordial] pointer lock: compositor sent unlocked");
+        eprintln!("[intoxicated] pointer lock: compositor sent unlocked");
     }
 }
 
@@ -3901,7 +3901,7 @@ impl WaylandWindow {
                 && super::input::trace_mouse()
             {
                 eprintln!(
-                    "[cordial] pointer lock: the engine's request went false, so the \
+                    "[intoxicated] pointer lock: the engine's request went false, so the \
                      right-drag leftover has expired; honouring it again"
                 );
             }
@@ -4059,7 +4059,7 @@ impl WaylandWindow {
             // alt-tabbed away -- where deactivation is correct and expected --
             // does not churn a destroy and a create every second.
             println!(
-                "[cordial] pointer lock: deactivated and not restored; asking again"
+                "[intoxicated] pointer lock: deactivated and not restored; asking again"
             );
             self.release_pointer();
             *self.lock_inactive_since.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -4178,7 +4178,7 @@ fn constrain_toplevel() -> bool {
             Some(std::time::Instant::now());
         if super::input::trace_mouse() {
             let (x, y) = self.pointer_position();
-            eprintln!("[cordial] pointer lock: requested at ({x}, {y})");
+            eprintln!("[intoxicated] pointer lock: requested at ({x}, {y})");
         }
     }
 
@@ -4232,7 +4232,7 @@ fn constrain_toplevel() -> bool {
         super::input::reset_mouse_delta();
         super::input::forget_pending_unlocked_delta();
         if super::input::trace_mouse() {
-            eprintln!("[cordial] pointer lock: released, cursor hinted to ({x}, {y})");
+            eprintln!("[intoxicated] pointer lock: released, cursor hinted to ({x}, {y})");
         }
     }
 
@@ -4842,7 +4842,7 @@ impl WaylandWindow {
         if super::input::trace_text() {
             // A length, not the character. See `input::trace_text_contents`.
             eprintln!(
-                "[cordial] wayland key {} keysym={keysym:#x} text={} keycode={:?} focus={:?}",
+                "[intoxicated] wayland key {} keysym={keysym:#x} text={} keycode={:?} focus={:?}",
                 if down { "down" } else { "up" },
                 super::input::redacted(
                     std::str::from_utf8(&text_buf[..text_len]).unwrap_or("")

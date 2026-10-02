@@ -1593,7 +1593,74 @@ enum DiskMoment {
     AfterExit,
 }
 
+/// Force nvidia's GPU to maximum performance for the life of the process, and
+/// restore the previous setting on exit.
+///
+/// nvidia's default adaptive PowerMizer downclocks the GPU hard when load dips
+/// (e.g. the user tabs away and the game idles for a moment) and then gets stuck
+/// in a low power state — P3/~540MHz on a 3105MHz-capable card was measured —
+/// which physically caps the game at ~60fps even after the user comes back and
+/// the engine is trying to render 240. Mode 1 ("prefer maximum performance")
+/// keeps it at full clocks. This is the single most common "why is my FPS stuck
+/// at 60" on nvidia+Linux, so it belongs in the client, not a user's shell
+/// profile. Best-effort and quiet: a machine with no `nvidia-settings` (AMD,
+/// Intel, no driver) or no display is left untouched, and nothing here can fail
+/// the launch. `CORDIAL_GPU_MAXPERF=off` disables it. Restored on normal exit via
+/// `Drop`; a hard kill (-9) skips the restore, which the next launch re-sets.
+struct GpuPerfGuard {
+    prev: Option<String>,
+}
+impl GpuPerfGuard {
+    fn engage() -> Self {
+        if std::env::var("CORDIAL_GPU_MAXPERF").as_deref() == Ok("off")
+            || std::env::var_os("DISPLAY").is_none()
+        {
+            return Self { prev: None };
+        }
+        let prev = std::process::Command::new("nvidia-settings")
+            .args(["-q", "[gpu:0]/GPUPowerMizerMode", "-t"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.lines().next().unwrap_or("").trim().to_string())
+            .filter(|s| matches!(s.as_str(), "0" | "1" | "2"));
+        if prev.is_some() {
+            let _ = std::process::Command::new("nvidia-settings")
+                .args(["-a", "[gpu:0]/GPUPowerMizerMode=1"])
+                .output();
+            println!(
+                "  [gpu] nvidia PowerMizer -> maximum performance for this session \
+                 (restored on exit; CORDIAL_GPU_MAXPERF=off to disable)"
+            );
+        }
+        Self { prev }
+    }
+}
+impl Drop for GpuPerfGuard {
+    fn drop(&mut self) {
+        if let Some(p) = &self.prev {
+            let _ = std::process::Command::new("nvidia-settings")
+                .args(["-a", &format!("[gpu:0]/GPUPowerMizerMode={p}")])
+                .output();
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    // Startup credit, printed once as the first line of every run: Intoxicated is
+    // a fork of cordial, and the original work is acknowledged here. Everything
+    // after this is Intoxicated's own log.
+    println!(
+        "Intoxicated {} — a native FreeBSD fork of cordial (the Roblox client for \
+         Linux) by luohoa97 & the Cordial contributors · GPL-3.0 · with thanks.",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    // Keep the GPU at full clocks for the whole session (nvidia PowerMizer fix);
+    // held until main returns, then the previous setting is restored.
+    let _gpu_perf_guard = GpuPerfGuard::engage();
+
     // Raise RLIMIT_NOFILE to a moderate cap. The default 1024 soft limit
     // inherited from a login shell is exhausted by the engine's cache/socket
     // fds on the X11 path (occasional EMFILE) and, worse, kills the headless

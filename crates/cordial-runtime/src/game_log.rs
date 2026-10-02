@@ -404,7 +404,7 @@ fn resolve_game_in_background(universe_id: u64) {
     std::thread::spawn(move || {
         let details = crate::roblox_api::resolve_game(universe_id);
         if let Some(d) = &details {
-            println!("[cordial] game: {} by {}", d.name, d.creator);
+            println!("[intoxicated] game: {} by {}", d.name, d.creator);
         }
         *DEFAULTS.lock().unwrap_or_else(|e| e.into_inner()) = details;
         // The join already published a presence without any of this; this is
@@ -479,7 +479,7 @@ pub fn poll() {
         match event {
             Event::Joined { place_id, universe_id, user_id } => {
                 println!(
-                    "[cordial] game: joined place {place_id} (universe {universe_id}) as {user_id}"
+                    "[intoxicated] game: joined place {place_id} (universe {universe_id}) as {user_id}"
                 );
                 {
                     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -506,7 +506,7 @@ pub fn poll() {
                 resolve_game_in_background(universe_id);
             }
             Event::Joining { job_id, place_id } => {
-                println!("[cordial] game: joining server {job_id} of place {place_id}");
+                println!("[intoxicated] game: joining server {job_id} of place {place_id}");
                 let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
                 // A different place means a different visit, so nothing from
                 // the last one carries over. Same place is a rejoin of the
@@ -518,11 +518,11 @@ pub fn poll() {
                 state.job_id = Some(job_id);
             }
             Event::Server { address, port } => {
-                println!("[cordial] game: server {address}:{port}");
+                println!("[intoxicated] game: server {address}:{port}");
                 STATE.lock().unwrap_or_else(|e| e.into_inner()).server_address = Some(address);
             }
             Event::Left => {
-                println!("[cordial] game: left");
+                println!("[intoxicated] game: left");
                 // The experience's presence goes with the experience. Without
                 // this, leaving a game that set a presence would leave its
                 // details on the Discord profile until another game replaced
@@ -543,7 +543,7 @@ pub fn poll() {
                     // has a cookie jar and storage that a hard exit would drop
                     // mid-write, and `request_quit` is what every other way
                     // out of this client already goes through.
-                    println!("[cordial] game: CORDIAL_CLOSE_ON_LEAVE is set; closing");
+                    println!("[intoxicated] game: CORDIAL_CLOSE_ON_LEAVE is set; closing");
                     crate::android::looper::request_quit();
                 }
             }
@@ -569,7 +569,7 @@ pub fn poll() {
                         // handing it to Discord as a join secret, which is a
                         // different capability from showing a presence and
                         // has not been asked for.
-                        println!("[cordial] game: BloxstrapRPC launch data ({} bytes)", launch.len());
+                        println!("[intoxicated] game: BloxstrapRPC launch data ({} bytes)", launch.len());
                     } else {
                         // Whatever pictures the game is now asking for have to
                         // be resolved before they can be shown, and that is
@@ -601,7 +601,7 @@ pub fn poll() {
                     }
                 }
                 Ok(None) => {}
-                Err(e) => println!("[cordial] game: unusable BloxstrapRPC line: {e}"),
+                Err(e) => println!("[intoxicated] game: unusable BloxstrapRPC line: {e}"),
             },
         }
     }

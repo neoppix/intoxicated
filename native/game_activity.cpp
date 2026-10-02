@@ -115,7 +115,7 @@ public:
             }
         }
         if (std::getenv("CORDIAL_TRACE_CLASSLOADER")) {
-            std::fprintf(stderr, "[cordial][classloader] loadClass/findClass: %s\n", path.c_str());
+            std::fprintf(stderr, "[intoxicated][classloader] loadClass/findClass: %s\n", path.c_str());
         }
         return env->GetClass(path.c_str());
     }
@@ -137,7 +137,7 @@ public:
     /// call, not spoofing a check.
     static std::shared_ptr<ClassLoader> getClassLoader(ENV* env, Object*) {
         if (std::getenv("CORDIAL_TRACE_CLASSLOADER")) {
-            std::fprintf(stderr, "[cordial][classloader] Class.getClassLoader() -> singleton\n");
+            std::fprintf(stderr, "[intoxicated][classloader] Class.getClassLoader() -> singleton\n");
         }
         return singleton(env);
     }
@@ -623,7 +623,7 @@ extern "C" void cordial_ime_set_state(const char* text, int sel_start, int sel_e
                                       int comp_start, int comp_end) {
     if (getenv("CORDIAL_TRACE_TEXT")) {
         fprintf(stderr,
-                "[cordial] InputConnection.setState text=%zu bytes sel=[%d,%d) composing=[%d,%d)\n",
+                "[intoxicated] InputConnection.setState text=%zu bytes sel=[%d,%d) composing=[%d,%d)\n",
                 text ? strlen(text) : 0, sel_start, sel_end, comp_start, comp_end);
     }
     {
@@ -639,14 +639,14 @@ extern "C" void cordial_ime_set_state(const char* text, int sel_start, int sel_e
 
 extern "C" void cordial_ime_set_soft_keyboard_active(int active, int flags) {
     if (getenv("CORDIAL_TRACE_TEXT")) {
-        fprintf(stderr, "[cordial] InputConnection.setSoftKeyboardActive(%d, flags=%d)\n", active, flags);
+        fprintf(stderr, "[intoxicated] InputConnection.setSoftKeyboardActive(%d, flags=%d)\n", active, flags);
     }
     g_ime_soft_keyboard_active.store(active, std::memory_order_release);
 }
 
 extern "C" void cordial_ime_restart_input() {
     if (getenv("CORDIAL_TRACE_TEXT")) {
-        fprintf(stderr, "[cordial] InputConnection.restartInput\n");
+        fprintf(stderr, "[intoxicated] InputConnection.restartInput\n");
     }
     // `restartInput` means "forget whatever editing session was in progress",
     // which is exactly what bumping the generation without changing the

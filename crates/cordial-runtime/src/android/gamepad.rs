@@ -187,7 +187,7 @@ pub fn gamepad_type() -> i32 {
             Ok(n) => n,
             _ => {
                 eprintln!(
-                    "[cordial] CORDIAL_GAMEPAD_TYPE={} is not a number; using 0",
+                    "[intoxicated] CORDIAL_GAMEPAD_TYPE={} is not a number; using 0",
                     v.to_string_lossy()
                 );
                 0
@@ -324,7 +324,7 @@ fn announce(id: i32, n_buttons: u8, n_axes: u8) {
     // needs to know which pad produced which glyphs, and a photograph of a
     // screen does not record what was plugged in.
     eprintln!(
-        "[cordial] gamepad {id}: {} -> {:?}, announcing gamepadType={ty} (UNVERIFIED)",
+        "[intoxicated] gamepad {id}: {} -> {:?}, announcing gamepadType={ty} (UNVERIFIED)",
         name.as_deref().unwrap_or("(no name in /sys)"),
         family.unwrap_or(Family::Unrecognised)
     );
@@ -338,7 +338,7 @@ fn announce(id: i32, n_buttons: u8, n_axes: u8) {
         static SAID: OnceLock<()> = OnceLock::new();
         SAID.get_or_init(|| {
             eprintln!(
-                "[cordial] gamepad: the button glyphs Roblox draws may show the wrong \
+                "[intoxicated] gamepad: the button glyphs Roblox draws may show the wrong \
                  controller brand. Which integer means which brand is not established \
                  -- see docs/analysis or the README. The buttons themselves work. \
                  Override with CORDIAL_GAMEPAD_TYPE=<n>, or set CORDIAL_GAMEPAD=0 to \
@@ -518,7 +518,7 @@ fn is_a_controller(id: i32) -> bool {
                 if input::trace_gamepad() {
                     let name = device_name(id);
                     eprintln!(
-                        "[cordial] gamepad: /dev/input/js{id} ({}) declares no joystick or \
+                        "[intoxicated] gamepad: /dev/input/js{id} ({}) declares no joystick or \
                          gamepad button, so it is not a controller; ignoring it",
                         name.as_deref().unwrap_or("no name in /sys")
                     );
@@ -606,7 +606,7 @@ fn drain(pad: &mut Pad) -> bool {
         static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
             eprintln!(
-                "[cordial] gamepad: /dev/input/js{} sent events without an init burst; \
+                "[intoxicated] gamepad: /dev/input/js{} sent events without an init burst; \
                  its shape is unknown so nothing is being forwarded",
                 pad.id
             );
@@ -681,7 +681,7 @@ pub fn poll() {
             }
             if let Some(file) = open_pad(id) {
                 if input::trace_gamepad() {
-                    eprintln!("[cordial] gamepad: opened /dev/input/js{id}");
+                    eprintln!("[intoxicated] gamepad: opened /dev/input/js{id}");
                 }
                 pads.push(Pad { id, file, announced: false });
             }
@@ -698,7 +698,7 @@ pub fn poll() {
         pads.retain(|p| p.id != id);
         input::deliver_gamepad_disconnect(id);
         if input::trace_gamepad() {
-            eprintln!("[cordial] gamepad: /dev/input/js{id} went away");
+            eprintln!("[intoxicated] gamepad: /dev/input/js{id} went away");
         }
     }
 }
@@ -716,7 +716,7 @@ fn poll_probe() {
     }
     let ty = gamepad_type();
     eprintln!(
-        "[cordial] gamepad: CORDIAL_GAMEPAD_PROBE announcing a synthetic pad, \
+        "[intoxicated] gamepad: CORDIAL_GAMEPAD_PROBE announcing a synthetic pad, \
          gamepadType={ty}. The ordinals are UNVERIFIED -- compare the button \
          glyphs the engine draws against rbxasset textures/ui/Controls/\
          {{DefaultController,PlayStationController,XboxController}} and sweep \

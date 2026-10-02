@@ -237,7 +237,7 @@ static DeviceIdentity device_identity() {
         // reaches the engine, so a value it did not understand has to be
         // visible from a run of the client alone.
         fprintf(stderr,
-                "[cordial] CORDIAL_DEVICE_PROFILE=\"%s\" is not a device profile; using "
+                "[intoxicated] CORDIAL_DEVICE_PROFILE=\"%s\" is not a device profile; using "
                 "pc-windows-11. Known: roblox-app, android-tablet, pc-windows-11\n",
                 e);
         return DeviceIdentity::PcWindows11;
@@ -1536,7 +1536,7 @@ static bool trace_param_reads() {
 }
 
 static void note_param_read(const char* klass, const char* field) {
-    fprintf(stderr, "[cordial] param read: %s.%s\n", klass, field);
+    fprintf(stderr, "[intoxicated] param read: %s.%s\n", klass, field);
 }
 
 /// `com.roblox.engine.jni.model.DeviceParams`
@@ -1788,7 +1788,7 @@ public:
         // never appears in Cordial's own logs or the engine's FLog output --
         // it goes out on the wire, not into anything grep can reach here.
         std::string ua = build_user_agent();
-        fprintf(stderr, "[cordial] device identity: %s (isTablet=%s, User-Agent: %s)\n",
+        fprintf(stderr, "[intoxicated] device identity: %s (isTablet=%s, User-Agent: %s)\n",
                 device_identity_label(),
                 device_identity() == DeviceIdentity::AndroidTablet ? "true" : "false",
                 ua.c_str());
@@ -1898,7 +1898,7 @@ public:
         p->appUserId = identity_user_id();
         p->isUnder13 = identity_is_under13();
         p->membershipType = identity_membership_type();
-        fprintf(stderr, "[cordial] app start as %s\n",
+        fprintf(stderr, "[intoxicated] app start as %s\n",
                 identity_known() ? "a signed-in user" : "nobody signed in");
         p->vrContext = AndroidActivity::Create(env);
         to_jni(env, p);

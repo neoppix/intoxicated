@@ -257,7 +257,7 @@ pub fn font_slot() -> Option<u8> {
             Ok(slot) => slot,
             Err(bad) => {
                 eprintln!(
-                    "[cordial] CORDIAL_TEXTBOX_FONT_SLOT={bad} is not one of \
+                    "[intoxicated] CORDIAL_TEXTBOX_FONT_SLOT={bad} is not one of \
                      {CANDIDATE_SLOTS:?} or \"none\"; using slot {DEFAULT_FONT_SLOT}"
                 );
                 Some(DEFAULT_FONT_SLOT)
@@ -332,12 +332,12 @@ pub fn log_unresolved(id: i32, drawn: Option<&Face>) {
     }
     match drawn {
         Some(face) => eprintln!(
-            "[cordial] editor font: id {id} has no row in the APK's font-mappings.json; \
+            "[intoxicated] editor font: id {id} has no row in the APK's font-mappings.json; \
              drawing {} instead",
             face.family
         ),
         None => eprintln!(
-            "[cordial] editor font: id {id} has no row in the APK's font-mappings.json \
+            "[intoxicated] editor font: id {id} has no row in the APK's font-mappings.json \
              and no shipped face could be registered; the editor keeps whatever family \
              the process already had"
         ),

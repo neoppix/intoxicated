@@ -146,9 +146,9 @@ static void note_call(const char* method, const char* key) {
         return;
     }
     if (key) {
-        fprintf(stderr, "[cordial] local storage: %s key=%s\n", method, key);
+        fprintf(stderr, "[intoxicated] local storage: %s key=%s\n", method, key);
     } else {
-        fprintf(stderr, "[cordial] local storage: %s\n", method);
+        fprintf(stderr, "[intoxicated] local storage: %s\n", method);
     }
 }
 
@@ -525,11 +525,11 @@ static void dump_registered(ENV* env, const char* name) {
     }
     auto c = env->GetClass(name);
     if (!c) {
-        fprintf(stderr, "[cordial] local storage: no class %s\n", name);
+        fprintf(stderr, "[intoxicated] local storage: no class %s\n", name);
         return;
     }
     for (auto& m : c->methods) {
-        fprintf(stderr, "[cordial] local storage: registered %s.%s%s%s\n", name, m->name.data(),
+        fprintf(stderr, "[intoxicated] local storage: registered %s.%s%s%s\n", name, m->name.data(),
                 m->signature.data(), m->_static ? "  (static)" : "");
     }
 }
@@ -560,7 +560,7 @@ public:
         p->nativeRef = ref;
         to_jni(env, p);
         if (trace_local_storage()) {
-            fprintf(stderr, "[cordial] local storage: ILocalStorageHandlerCore$CppProxy built\n");
+            fprintf(stderr, "[intoxicated] local storage: ILocalStorageHandlerCore$CppProxy built\n");
         }
         return p;
     }
@@ -651,7 +651,7 @@ int cordial_local_storage_set_platform_impl(void* fn, char* err, size_t err_len)
             jni->ExceptionClear();
         }
         if (getenv("CORDIAL_TRACE_LOCAL_STORAGE")) {
-            fprintf(stderr, "[cordial] local storage: setPlatformImpl returned %s%s\n",
+            fprintf(stderr, "[intoxicated] local storage: setPlatformImpl returned %s%s\n",
                     core ? "a core" : "null", pending ? ", exception pending" : "");
         }
         return 0;

@@ -233,7 +233,7 @@ fn pump(reader: impl std::io::Read + Send + 'static, tail: Tail, to_stderr: bool
             // **A clock on every line the runtime prints.**
             //
             // `native/liblog.cpp` stamps the Android log, but Cordial's own
-            // `[roblox]`/`[cordial]` narration -- `app ready: Startup` among it
+            // `[roblox]`/`[intoxicated]` narration -- `app ready: Startup` among it
             // -- is scattered `println!` with no shared emitter, so there was
             // nowhere to stamp it at the source without touching every site.
             // This is that one place: every line the child writes passes

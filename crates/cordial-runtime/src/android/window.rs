@@ -63,9 +63,6 @@ struct Xlib {
     send_event: unsafe extern "C" fn(Display, Window, c_int, c_long, *mut c_void) -> c_int,
     sync: unsafe extern "C" fn(Display, c_int) -> c_int,
     store_name: unsafe extern "C" fn(Display, Window, *const c_char) -> c_int,
-    change_property: unsafe extern "C" fn(
-        Display, Window, c_ulong, c_ulong, c_int, c_int, *const u8, c_int,
-    ) -> c_int,
     flush: unsafe extern "C" fn(Display) -> c_int,
     destroy_window: unsafe extern "C" fn(Display, Window) -> c_int,
     // ---- input, added for keyboard/mouse delivery ----
@@ -163,7 +160,6 @@ impl Xlib {
             create_simple_window: sym!("XCreateSimpleWindow"),
             map_window: sym!("XMapWindow"),
             store_name: sym!("XStoreName"),
-            change_property: sym!("XChangeProperty"),
             flush: sym!("XFlush"),
             destroy_window: sym!("XDestroyWindow"),
             select_input: sym!("XSelectInput"),
@@ -1030,9 +1026,9 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
                 );
                 if cursor != 0 {
                     (xlib.define_cursor)(display, w, cursor);
-                    eprintln!("[cordial] host cursor hidden over the client window");
+                    eprintln!("[intoxicated] host cursor hidden over the client window");
                 } else {
-                    eprintln!("[cordial] could not create a blank cursor; host pointer stays visible");
+                    eprintln!("[intoxicated] could not create a blank cursor; host pointer stays visible");
                 }
                 // The cursor holds its own reference to the pixmap contents, so
                 // the pixmap is freed now rather than leaked for the process.
@@ -1649,7 +1645,7 @@ impl HostWindow {
             // pointer is a real failure of the lock the user asked for, and
             // burying it behind a trace flag nobody has set by default is
             // exactly the kind of silent stub AGENTS.md rules out.
-            eprintln!("[cordial] X11 pointer lock was refused (XGrabPointer={result})");
+            eprintln!("[intoxicated] X11 pointer lock was refused (XGrabPointer={result})");
             return;
         }
 
@@ -1700,7 +1696,7 @@ impl HostWindow {
 
         if super::input::trace_mouse() {
             eprintln!(
-                "[cordial] X11 pointer lock acquired at ({}, {}) via {}",
+                "[intoxicated] X11 pointer lock acquired at ({}, {}) via {}",
                 centre.0,
                 centre.1,
                 if self.xi.is_some() { "XI_RawMotion" } else { "warp" },
@@ -1788,7 +1784,7 @@ impl HostWindow {
         super::input::forget_pending_unlocked_delta();
 
         if super::input::trace_mouse() {
-            eprintln!("[cordial] X11 pointer lock released");
+            eprintln!("[intoxicated] X11 pointer lock released");
         }
     }
 
@@ -2206,7 +2202,7 @@ impl HostWindow {
                     LockedMotion::Echo => {
                         if super::input::trace_mouse() && state.warp_echo_wait > 0 {
                             eprintln!(
-                                "[cordial] X11 pointer lock: warp echo confirmed at ({}, {}) after discarding {} stale event(s)",
+                                "[intoxicated] X11 pointer lock: warp echo confirmed at ({}, {}) after discarding {} stale event(s)",
                                 ev.x, ev.y, state.warp_echo_wait
                             );
                         }
@@ -2218,7 +2214,7 @@ impl HostWindow {
                         state.warp_echo_wait += 1;
                         if super::input::trace_mouse() {
                             eprintln!(
-                                "[cordial] X11 pointer lock: discarding stale motion at ({}, {}), waiting for warp echo at ({}, {}) (wait={})",
+                                "[intoxicated] X11 pointer lock: discarding stale motion at ({}, {}), waiting for warp echo at ({}, {}) (wait={})",
                                 ev.x, ev.y, centre.0, centre.1, state.warp_echo_wait
                             );
                         }
@@ -2240,7 +2236,7 @@ impl HostWindow {
                 if dx != 0 || dy != 0 {
                     if super::input::trace_mouse() {
                         eprintln!(
-                            "[cordial] X11 pointer lock: motion at ({}, {}) -> delta ({dx}, {dy}), re-warping to ({cx}, {cy})",
+                            "[intoxicated] X11 pointer lock: motion at ({}, {}) -> delta ({dx}, {dy}), re-warping to ({cx}, {cy})",
                             ev.x, ev.y
                         );
                     }
@@ -2377,7 +2373,7 @@ impl HostWindow {
                 state.absolute_devices.push((source, a));
                 if a {
                     eprintln!(
-                        "[cordial] X11 pointer lock: device {source} reports absolute positions; \
+                        "[intoxicated] X11 pointer lock: device {source} reports absolute positions; \
                          its raw motion is ignored and the camera follows it by warping instead"
                     );
                 }
@@ -2394,7 +2390,7 @@ impl HostWindow {
         state.raw.add(d);
         if super::input::trace_mouse() {
             eprintln!(
-                "[cordial] X11 raw motion: time={} device={source} accelerated=({:.3}, {:.3}) raw=({:.3}, {:.3}) -> ({:.3}, {:.3})",
+                "[intoxicated] X11 raw motion: time={} device={source} accelerated=({:.3}, {:.3}) raw=({:.3}, {:.3}) -> ({:.3}, {:.3})",
                 key.0, acc.0, acc.1, unacc.0, unacc.1, d.0, d.1
             );
         }
@@ -2434,7 +2430,7 @@ impl HostWindow {
         // unattributable.
         if super::input::trace_mouse() || super::input::trace_text() {
             eprintln!(
-                "[cordial] X11 Focus{} mode={mode} detail={detail} ({})",
+                "[intoxicated] X11 Focus{} mode={mode} detail={detail} ({})",
                 if focus_in { "In" } else { "Out" },
                 if focus_change_is_real(mode, detail) { "acted on" } else { "a grab; ignored" },
             );
@@ -2476,7 +2472,7 @@ impl HostWindow {
         // Wayland's `pointer_leave` had the same fault and the same fix.
         for b in held_button_bits(buttons) {
             if super::input::trace_mouse() {
-                eprintln!("[cordial] X11 focus out holding button {b}; releasing it");
+                eprintln!("[intoxicated] X11 focus out holding button {b}; releasing it");
             }
             self.dispatch_button_bit(handle, b, x, y, false);
         }
@@ -2502,7 +2498,7 @@ impl HostWindow {
                 pass_key_event(false, x_keycode - 8, 0);
             }
             if super::input::trace_mouse() || super::input::trace_text() {
-                eprintln!("[cordial] X11 focus out: released keys still held");
+                eprintln!("[intoxicated] X11 focus out: released keys still held");
             }
         }
     }
@@ -2552,7 +2548,7 @@ impl HostWindow {
                 pass_key_event(false, x_keycode - 8, 0);
             }
             if super::input::trace_mouse() || super::input::trace_text() {
-                eprintln!("[cordial] X11 keyboard grab ended: released keys let go during it");
+                eprintln!("[intoxicated] X11 keyboard grab ended: released keys let go during it");
             }
         }
     }
@@ -2619,7 +2615,7 @@ impl HostWindow {
             // `text=` is a length unless `CORDIAL_TRACE_TEXT_SHOW_PASSWORDS=1`:
             // one character at a time is still a password, printed slowly.
             eprintln!(
-                "[cordial] key {} keysym={keysym:#x} text={} keycode={:?} focus={:?}",
+                "[intoxicated] key {} keysym={keysym:#x} text={} keycode={:?} focus={:?}",
                 if down { "down" } else { "up" },
                 super::input::redacted(typed_text),
                 keysym_to_android(keysym),

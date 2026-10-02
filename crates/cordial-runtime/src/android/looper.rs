@@ -1151,7 +1151,7 @@ pub fn pump(duration: std::time::Duration, game_activity_handle: Option<i64>) {
             let secs = heartbeat_at.elapsed().as_secs_f64();
             let drawn = now.saturating_sub(heartbeat_presents);
             println!(
-                "[cordial] health: {drawn} presents in {secs:.0}s ({:.1}/s), {now} total{}",
+                "[intoxicated] health: {drawn} presents in {secs:.0}s ({:.1}/s), {now} total{}",
                 drawn as f64 / secs,
                 if drawn == 0 { " -- nothing was drawn" } else { "" }
             );

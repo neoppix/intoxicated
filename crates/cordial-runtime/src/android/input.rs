@@ -780,7 +780,7 @@ fn dispatch_touch(
         // compositor and this side disagreeing about what is down, and all
         // three are dropped rather than guessed at.
         if trace_touch() {
-            eprintln!("[cordial] touch {what} for an unknown contact; dropped");
+            eprintln!("[intoxicated] touch {what} for an unknown contact; dropped");
         }
         return;
     };
@@ -795,7 +795,7 @@ fn dispatch_touch(
             Ok(Some(consumed)) => {
                 if trace_touch() {
                     eprintln!(
-                        "[cordial] onTouchEventNative(action={:#x}, contacts={}) -> {consumed}",
+                        "[intoxicated] onTouchEventNative(action={:#x}, contacts={}) -> {consumed}",
                         d.action,
                         d.contacts.len()
                     );
@@ -824,7 +824,7 @@ fn dispatch_touch(
         );
         if trace_touch() {
             eprintln!(
-                "[cordial] nativePassInput(id={}, x={}, y={}, action={action}, w={w}, h={h}) \
+                "[intoxicated] nativePassInput(id={}, x={}, y={}, action={action}, w={w}, h={h}) \
                  -> {r:?}",
                 contact.id, contact.x, contact.y
             );
@@ -1066,7 +1066,7 @@ pub fn deliver_gamepad_connect(id: i32, gamepad_type: i32) {
     }
     let r = cordial_linker_sys::game_activity::gamepad_connect(f, id, gamepad_type);
     if trace_gamepad() {
-        eprintln!("[cordial] nativeGamepadConnect(id={id}, type={gamepad_type}) -> {r:?}");
+        eprintln!("[intoxicated] nativeGamepadConnect(id={id}, type={gamepad_type}) -> {r:?}");
     }
 }
 
@@ -1078,7 +1078,7 @@ pub fn deliver_gamepad_disconnect(id: i32) {
     }
     let r = cordial_linker_sys::game_activity::gamepad_disconnect(f, id);
     if trace_gamepad() {
-        eprintln!("[cordial] nativeGamepadDisconnect(id={id}) -> {r:?}");
+        eprintln!("[intoxicated] nativeGamepadDisconnect(id={id}) -> {r:?}");
     }
 }
 
@@ -1090,7 +1090,7 @@ pub fn deliver_gamepad_button(id: i32, key_code: i32, action: i32) {
     }
     let r = cordial_linker_sys::game_activity::gamepad_button(f, id, key_code, action);
     if trace_gamepad() {
-        eprintln!("[cordial] nativeGamepadButton(id={id}, key={key_code}, action={action}) -> {r:?}");
+        eprintln!("[intoxicated] nativeGamepadButton(id={id}, key={key_code}, action={action}) -> {r:?}");
     }
 }
 
@@ -1102,7 +1102,7 @@ pub fn deliver_gamepad_axis(id: i32, axis: i32, x: f32, y: f32, z: f32) {
     }
     let r = cordial_linker_sys::game_activity::gamepad_axis(f, id, axis, x, y, z);
     if trace_gamepad() {
-        eprintln!("[cordial] nativeGamepadAxis(id={id}, axis={axis}, {x}, {y}, {z}) -> {r:?}");
+        eprintln!("[intoxicated] nativeGamepadAxis(id={id}, axis={axis}, {x}, {y}, {z}) -> {r:?}");
     }
 }
 
@@ -1117,7 +1117,7 @@ pub fn deliver_gamepad_supported_key(id: i32, key_code: i32, supported: bool, ga
     );
     if trace_gamepad() {
         eprintln!(
-            "[cordial] nativeSetGamepadSupportedKey(id={id}, key={key_code}, \
+            "[intoxicated] nativeSetGamepadSupportedKey(id={id}, key={key_code}, \
              supported={supported}, type={gamepad_type}) -> {r:?}"
         );
     }
@@ -1140,7 +1140,7 @@ pub fn deliver_gamepad_supported_motion(
     );
     if trace_gamepad() {
         eprintln!(
-            "[cordial] nativeSetGamepadSupportedMotion(id={id}, axis={axis}, source={source}, \
+            "[intoxicated] nativeSetGamepadSupportedMotion(id={id}, axis={axis}, source={source}, \
              supported={supported}, type={gamepad_type}) -> {r:?}"
         );
     }
@@ -1183,7 +1183,7 @@ pub fn set_mouse_lock_native(native: *mut c_void) {
 ///
 /// ```text
 /// input: nativeGetMainWindowIsMouseLockedCenter resolved
-/// [cordial] nativeGetMainWindowIsMouseLockedCenter() -> false
+/// [intoxicated] nativeGetMainWindowIsMouseLockedCenter() -> false
 /// ```
 ///
 /// So it resolves, it is called every pump, it answers, and it does not throw —
@@ -1264,7 +1264,7 @@ pub fn engine_wants_pointer_lock() -> Option<bool> {
                 let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
                 if *last != Some(v) {
                     *last = Some(v);
-                    eprintln!("[cordial] nativeGetMainWindowIsMouseLockedCenter() -> {v}");
+                    eprintln!("[intoxicated] nativeGetMainWindowIsMouseLockedCenter() -> {v}");
                 }
             }
             Some(v)
@@ -1272,7 +1272,7 @@ pub fn engine_wants_pointer_lock() -> Option<bool> {
         Err(e) => {
             FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
             eprintln!(
-                "[cordial] nativeGetMainWindowIsMouseLockedCenter() failed ({e}); \
+                "[intoxicated] nativeGetMainWindowIsMouseLockedCenter() failed ({e}); \
                  not asking again this session. Pointer capture now depends on the \
                  mouse button alone."
             );
@@ -1330,7 +1330,7 @@ pub fn report_keyboard_state(current_geometry: (i32, i32)) {
     let (w, h) = current_geometry;
     let r = cordial_linker_sys::game_activity::update_keyboard_size(f, false, 0, h, w, 0);
     if trace_text() {
-        eprintln!("[cordial] updateKeyboardSize(visible=false, x=0, y={h}, w={w}, h=0) -> {r:?}");
+        eprintln!("[intoxicated] updateKeyboardSize(visible=false, x=0, y={h}, w={w}, h=0) -> {r:?}");
     }
 }
 
@@ -1456,7 +1456,7 @@ pub fn pass_key_event(down: bool, evdev_code: i32, modifiers: i32) {
         track_key_held(down, evdev_code);
         if trace_text() {
             eprintln!(
-                "[cordial] pass_key_event suppressed: code={evdev_code} down={down} \
+                "[intoxicated] pass_key_event suppressed: code={evdev_code} down={down} \
                  (a text box has focus and would eat this)"
             );
         }
@@ -1467,7 +1467,7 @@ pub fn pass_key_event(down: bool, evdev_code: i32, modifiers: i32) {
     }
     if trace_text() && release_of_a_forwarded_press && would_suppress {
         eprintln!(
-            "[cordial] pass_key_event code={evdev_code} up: forwarded anyway, \
+            "[intoxicated] pass_key_event code={evdev_code} up: forwarded anyway, \
              its press reached the engine before the box took focus"
         );
     }
@@ -1489,7 +1489,7 @@ pub fn pass_key_event(down: bool, evdev_code: i32, modifiers: i32) {
     // for it: that is `CORDIAL_TRACE=1`, which aborts the engine.
     if trace_text() {
         eprintln!(
-            "[cordial] pass_key_event down={down} code={key_code} mods={modifiers:#x} \
+            "[intoxicated] pass_key_event down={down} code={key_code} mods={modifiers:#x} \
              focus={:?} gen={}",
             cordial_linker_sys::game_activity::focused_textbox(),
             cordial_linker_sys::game_activity::textbox_generation(),
@@ -1686,7 +1686,7 @@ pub fn pass_text(which: i64, text: &str, cursor: i32) {
     if !sync.is_null() {
         if let Err(e) = cordial_linker_sys::game_activity::sync_textbox(sync, text, cursor) {
             if trace_text() {
-                eprintln!("[cordial] syncTextbox failed: {e}");
+                eprintln!("[intoxicated] syncTextbox failed: {e}");
             }
         }
     }
@@ -1746,7 +1746,7 @@ pub fn pass_text(which: i64, text: &str, cursor: i32) {
             .get_or_init(|| std::env::var_os("CORDIAL_PASSTEXT_FLAG").is_some());
         if let Err(e) = cordial_linker_sys::game_activity::pass_text(f, which, text, flag, cursor) {
             if trace_text() {
-                eprintln!("[cordial] passText failed: {e}");
+                eprintln!("[intoxicated] passText failed: {e}");
             }
         }
     }
@@ -1754,7 +1754,7 @@ pub fn pass_text(which: i64, text: &str, cursor: i32) {
         // The size, not the text. See `trace_text_contents` — this line used to
         // print a password in full on every keystroke of it.
         eprintln!(
-            "[cordial] text -> {} caret={cursor} sync={} passText={}",
+            "[intoxicated] text -> {} caret={cursor} sync={} passText={}",
             redacted(text),
             !sync.is_null(),
             !f.is_null()
@@ -1951,7 +1951,7 @@ pub fn pass_mouse_move_delta(x: f32, y: f32, dx: f32, dy: f32) {
     }
     let r = cordial_linker_sys::game_activity::pass_mouse_move(f, x, y, dx, dy);
     if trace_mouse() {
-        eprintln!("[cordial] nativePassMouseMove(x={x}, y={y}, dx={dx}, dy={dy}) -> {r:?}");
+        eprintln!("[intoxicated] nativePassMouseMove(x={x}, y={y}, dx={dx}, dy={dy}) -> {r:?}");
     }
 }
 
@@ -1976,7 +1976,7 @@ pub fn pass_mouse_button(x: f32, y: f32, down: bool, android_button: i32) {
     let r = cordial_linker_sys::game_activity::pass_mouse_button(f, x, y, down, button);
     if trace_mouse() {
         eprintln!(
-            "[cordial] nativePassMouseButton(x={x}, y={y}, down={down}, \
+            "[intoxicated] nativePassMouseButton(x={x}, y={y}, down={down}, \
              android={android_button}, roblox={button}) -> {r:?}"
         );
     }
@@ -2025,7 +2025,7 @@ pub fn wheel(handle: i64, x: f32, y: f32, hscroll: f32, vscroll: f32, event_time
         // "the wheel does nothing" has two quite different causes, and this
         // line tells them apart without a debugger.
         eprintln!(
-            "[cordial] nativePassMouseWheel(x={x}, y={y}, delta={v}) -> {passed:?}; \
+            "[intoxicated] nativePassMouseWheel(x={x}, y={y}, delta={v}) -> {passed:?}; \
              AGDK ACTION_SCROLL h={h} v={v} handle={handle}"
         );
     }
@@ -2047,7 +2047,7 @@ fn wheel_scale() -> f32 {
             Ok(f) if f.is_finite() && f != 0.0 => f,
             _ => {
                 eprintln!(
-                    "[cordial] CORDIAL_WHEEL_SCALE={} is not a non-zero number; using 1.0",
+                    "[intoxicated] CORDIAL_WHEEL_SCALE={} is not a non-zero number; using 1.0",
                     v.to_string_lossy()
                 );
                 1.0
@@ -2636,7 +2636,7 @@ fn reseed_if_needed(buf: &mut TextField) {
             // the branch that does the work, and it is correct -- a box
             // refocused with content in it reports that content's length.
             eprintln!(
-                "[cordial] textbox reseed gen={generation} ime_gen={} ime_len={} showkb_len={}",
+                "[intoxicated] textbox reseed gen={generation} ime_gen={} ime_len={} showkb_len={}",
                 cordial_linker_sys::game_activity::ime_state_generation(),
                 cordial_linker_sys::game_activity::ime_state_text().chars().count(),
                 cordial_linker_sys::game_activity::textbox_text().chars().count(),
@@ -2934,7 +2934,7 @@ pub fn script_button(handle: i64, x: f32, y: f32, down: bool, android_button: i3
         SyntheticDevice::Finger => {
             if trace_touch() {
                 eprintln!(
-                    "[cordial] scripted button {android_button:#x} has no meaning to a finger; \
+                    "[intoxicated] scripted button {android_button:#x} has no meaning to a finger; \
                      dropped"
                 );
             }
@@ -2961,7 +2961,7 @@ pub fn script_type(handle: i64, text: &str, now_ms: i64) -> usize {
         }
         let Some(which) = cordial_linker_sys::game_activity::focused_textbox() else {
             if trace_text() {
-                eprintln!("[cordial] script type: no focused textbox");
+                eprintln!("[intoxicated] script type: no focused textbox");
             }
             continue;
         };
