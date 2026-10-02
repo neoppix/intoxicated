@@ -44,8 +44,13 @@
 #include <sys/mount.h>
 #include <cstdint>
 #include <unistd.h>
+#include <vector>
+#include <unordered_set>
 #if defined(__FreeBSD__)
 #include <sys/sysctl.h>
+#include <sys/user.h>
+#include <sys/auxv.h>
+#include <elf.h>
 #endif
 
 namespace {
@@ -265,7 +270,194 @@ int s_access(const char* path, int mode) {
     return r;
 }
 
+#if defined(__FreeBSD__)
+// Defined further down; used by the /proc synthesis just below.
+static const char* strip_compat_prefix(const char* path);
+
+// ---------- Native /proc process enumeration (replaces the last linprocfs use)
+//
+// The engine's anticheat lists /proc and reads each /proc/<pid>/cmdline to scan
+// running processes for cheat tools, plus /proc/self/fd and /proc/self/auxv.
+// Those were the only reads still falling through to linprocfs. Served here from
+// FreeBSD's own `kern.proc` sysctls and `elf_aux_info`, so the port needs no
+// /compat/linux mount at all. This is NOT faking a process list: it reports the
+// same real processes linprocfs would, so the anticheat's scan sees exactly what
+// it saw before and behaves identically. Gated on CORDIAL_FAKE_PROC, and kept
+// entirely off the real-directory path RbxStorage's content cache walks -- that
+// path (the one the 304 dirent bug lived on) is untouched; a synthetic dir is a
+// distinct, registered object `s_readdir`/`s_closedir` recognise by pointer.
+
+struct SynthDir {
+    std::vector<std::pair<std::string, unsigned char>> entries;  // (name, DT_*)
+    size_t idx = 0;
+};
+static std::mutex g_synthdir_mu;
+static std::unordered_set<SynthDir*> g_synthdirs;
+
+// Every live PID, via KERN_PROC_PROC (processes, not threads). Empty on failure,
+// which leaves the scan with nothing to walk rather than a wrong answer.
+static std::vector<int> cordial_enumerate_pids() {
+    std::vector<int> pids;
+    int mib[3] = {CTL_KERN, KERN_PROC, KERN_PROC_PROC};
+    size_t len = 0;
+    if (sysctl(mib, 3, nullptr, &len, nullptr, 0) != 0 || len == 0) {
+        return pids;
+    }
+    len += len / 4 + sizeof(struct kinfo_proc);  // headroom for races
+    std::vector<char> buf(len);
+    if (sysctl(mib, 3, buf.data(), &len, nullptr, 0) != 0) {
+        return pids;
+    }
+    size_t n = len / sizeof(struct kinfo_proc);
+    const auto* kp = reinterpret_cast<const struct kinfo_proc*>(buf.data());
+    for (size_t i = 0; i < n; ++i) {
+        if (kp[i].ki_pid > 0) {
+            pids.push_back(kp[i].ki_pid);
+        }
+    }
+    return pids;
+}
+
+// A pid's argv as the Linux /proc/<pid>/cmdline blob: NUL-separated, so it must
+// carry a length rather than ride a strlen path. Written into `out`, returns the
+// byte count (0 on failure or a kernel thread with no argv).
+static size_t cordial_proc_cmdline(int pid, char* out, size_t cap) {
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ARGS, pid};
+    size_t len = cap;
+    if (sysctl(mib, 4, out, &len, nullptr, 0) != 0) {
+        return 0;
+    }
+    return len;
+}
+
+// A Linux-shaped auxv (array of 8+8-byte type/value pairs, AT_NULL-terminated)
+// built from the values FreeBSD exposes. bionic already took its real auxv off
+// the stack at exec; this secondary /proc read just needs plausible, valid
+// entries. Written into `out`, returns the byte count.
+static size_t cordial_proc_auxv(char* out, size_t cap) {
+    struct Aux { uint64_t type, val; };
+    static unsigned char at_random[16] = {0};
+    if (at_random[0] == 0 && at_random[15] == 0) {
+        // Fill once from the real stack-canary source if available.
+        unsigned long r = 0;
+        if (elf_aux_info(AT_PAGESZ, &r, sizeof r) != 0) {
+            r = 4096;
+        }
+        for (int i = 0; i < 16; ++i) {
+            at_random[i] = static_cast<unsigned char>((getpid() * 2654435761u) >> (i % 4 * 8)) ^ (i + 1);
+        }
+    }
+    unsigned long pagesz = 4096, clktck = 100, hwcap = 0, hwcap2 = 0;
+    elf_aux_info(AT_PAGESZ, &pagesz, sizeof pagesz);
+    elf_aux_info(AT_HWCAP, &hwcap, sizeof hwcap);
+#ifdef AT_HWCAP2
+    elf_aux_info(AT_HWCAP2, &hwcap2, sizeof hwcap2);
+#endif
+    const Aux aux[] = {
+        {6 /*AT_PAGESZ*/, pagesz},
+        {17 /*AT_CLKTCK*/, clktck},
+        {16 /*AT_HWCAP*/, hwcap},
+        {26 /*AT_HWCAP2*/, hwcap2},
+        {11 /*AT_UID*/, (uint64_t)getuid()},
+        {12 /*AT_EUID*/, (uint64_t)geteuid()},
+        {13 /*AT_GID*/, (uint64_t)getgid()},
+        {14 /*AT_EGID*/, (uint64_t)getegid()},
+        {23 /*AT_SECURE*/, 0},
+        {25 /*AT_RANDOM*/, (uint64_t)(uintptr_t)at_random},
+        {0 /*AT_NULL*/, 0},
+    };
+    size_t n = sizeof aux;
+    if (n > cap) n = cap;
+    memcpy(out, aux, n);
+    return n;
+}
+
+// Binary /proc content (embedded NULs), returned with an explicit length so it
+// cannot ride the strlen path the text synth uses. Non-negative return means
+// handled. Thread-local buffer: the engine reads these serially per thread.
+static const char* synth_proc_bin(const char* path, size_t* out_len) {
+    if (path == nullptr || std::getenv("CORDIAL_FAKE_PROC") == nullptr) {
+        return nullptr;
+    }
+    path = strip_compat_prefix(path);
+    static thread_local char buf[8192];
+    if (std::strcmp(path, "/proc/self/auxv") == 0) {
+        *out_len = cordial_proc_auxv(buf, sizeof buf);
+        return buf;
+    }
+    // /proc/<pid>/cmdline, but not self/0 (those stay the Android package name
+    // the existing text synth already serves). Numeric pid only.
+    size_t plen = std::strlen(path);
+    if (plen > 14 && std::strncmp(path, "/proc/", 6) == 0 &&
+        std::strcmp(path + plen - 8, "/cmdline") == 0) {
+        int pid = 0;
+        const char* p = path + 6;
+        if (*p >= '1' && *p <= '9') {  // a real numeric pid, not "self" or "0"
+            for (; *p >= '0' && *p <= '9'; ++p) pid = pid * 10 + (*p - '0');
+            if (std::strcmp(p, "/cmdline") == 0 && pid > 0) {
+                *out_len = cordial_proc_cmdline(pid, buf, sizeof buf);
+                return buf;
+            }
+        }
+    }
+    return nullptr;
+}
+
+// A synthetic DIR for /proc and /proc/self/fd, or nullptr for anything else.
+static DIR* synth_opendir(const char* path) {
+    if (path == nullptr || std::getenv("CORDIAL_FAKE_PROC") == nullptr) {
+        return nullptr;
+    }
+    const char* p = strip_compat_prefix(path);
+    SynthDir* sd = nullptr;
+    if (std::strcmp(p, "/proc") == 0 || std::strcmp(p, "/proc/") == 0) {
+        sd = new SynthDir();
+        sd->entries.push_back({".", DT_DIR});
+        sd->entries.push_back({"..", DT_DIR});
+        sd->entries.push_back({"self", DT_LNK});
+        char num[16];
+        for (int pid : cordial_enumerate_pids()) {
+            std::snprintf(num, sizeof num, "%d", pid);
+            sd->entries.push_back({num, DT_DIR});
+        }
+    } else if (std::strcmp(p, "/proc/self/fd") == 0 ||
+               std::strcmp(p, "/proc/self/fd/") == 0) {
+        sd = new SynthDir();
+        sd->entries.push_back({".", DT_DIR});
+        sd->entries.push_back({"..", DT_DIR});
+        char num[16];
+        int maxfd = static_cast<int>(sysconf(_SC_OPEN_MAX));
+        if (maxfd <= 0 || maxfd > 65536) maxfd = 1024;
+        for (int fd = 0; fd < maxfd; ++fd) {
+            if (fcntl(fd, F_GETFD) != -1) {
+                std::snprintf(num, sizeof num, "%d", fd);
+                sd->entries.push_back({num, DT_LNK});
+            }
+        }
+    }
+    if (sd == nullptr) {
+        return nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> g(g_synthdir_mu);
+        g_synthdirs.insert(sd);
+    }
+    return reinterpret_cast<DIR*>(sd);
+}
+
+static bool is_synth_dir(DIR* d) {
+    std::lock_guard<std::mutex> g(g_synthdir_mu);
+    return g_synthdirs.count(reinterpret_cast<SynthDir*>(d)) != 0;
+}
+#endif  // __FreeBSD__
+
 DIR* s_opendir(const char* path) {
+#if defined(__FreeBSD__)
+    if (DIR* synth = synth_opendir(path)) {
+        trace("opendir", path, "synth-proc");
+        return synth;
+    }
+#endif
     REMAP(path);
     DIR* d = ::opendir(real);
     trace(d ? "opendir" : "opendir!", real, d ? "ok" : "null");
@@ -301,6 +493,26 @@ struct dirent* s_readdir(DIR* d) {
     // Valid until the next readdir on this thread, which matches bionic's
     // contract for the common single-stream enumeration RbxStorage does.
     thread_local bionic_dirent slot;
+    // Synthetic /proc or /proc/self/fd: walk the entry list built at opendir.
+    // Same single-stream, same-thread contract; this path never calls into the
+    // real readdir translation RbxStorage depends on.
+    if (is_synth_dir(d)) {
+        SynthDir* sd = reinterpret_cast<SynthDir*>(d);
+        if (sd->idx >= sd->entries.size()) {
+            return nullptr;
+        }
+        const auto& e = sd->entries[sd->idx++];
+        memset(&slot, 0, sizeof slot);
+        slot.d_ino = sd->idx;  // nonzero; readers only require it be set
+        slot.d_off = static_cast<int64_t>(sd->idx);
+        slot.d_type = e.second;
+        size_t nl = e.first.size();
+        if (nl > sizeof(slot.d_name) - 1) nl = sizeof(slot.d_name) - 1;
+        memcpy(slot.d_name, e.first.data(), nl);
+        slot.d_name[nl] = '\0';
+        slot.d_reclen = static_cast<uint16_t>(offsetof(bionic_dirent, d_name) + nl + 1);
+        return reinterpret_cast<struct dirent*>(&slot);
+    }
     struct ::dirent* fb = ::readdir(d);
     if (!fb) return nullptr;
     memset(&slot, 0, sizeof slot);
@@ -316,6 +528,15 @@ struct dirent* s_readdir(DIR* d) {
 }
 
 int s_closedir(DIR* d) {
+    if (is_synth_dir(d)) {
+        SynthDir* sd = reinterpret_cast<SynthDir*>(d);
+        {
+            std::lock_guard<std::mutex> g(g_synthdir_mu);
+            g_synthdirs.erase(sd);
+        }
+        delete sd;
+        return 0;
+    }
     return ::closedir(d);
 }
 #endif
@@ -878,6 +1099,16 @@ static int try_synth_fd(const char* path, int host_flags) {
     if ((host_flags & (O_WRONLY | O_RDWR | O_CREAT)) != 0) {
         return -1;
     }
+    // Binary /proc content (cmdline, auxv) first: it carries a length because it
+    // has embedded NULs the strlen path below would truncate.
+    {
+        size_t blen = 0;
+        if (const char* bsynth = synth_proc_bin(path, &blen)) {
+            int fd = fd_from_bytes(bsynth, blen);
+            synthfd_tag(fd, CORDIAL_PROC_SUPER_MAGIC);
+            return fd;
+        }
+    }
     if (const char* synth = synth_proc_content(path)) {
         int fd = fd_from_bytes(synth, std::strlen(synth));
         synthfd_tag(fd, CORDIAL_PROC_SUPER_MAGIC);
@@ -964,6 +1195,13 @@ int s_close(int fd) {
 FILE* s_fopen(const char* path, const char* mode) {
     ANDROID_HIDE(path, nullptr);
 #if defined(__FreeBSD__)
+    {
+        size_t blen = 0;
+        if (const char* bsynth = synth_proc_bin(path, &blen)) {
+            trace("fopen", path, "synth-proc-bin");
+            return ::fmemopen(const_cast<char*>(bsynth), blen, "r");
+        }
+    }
     if (const char* synth = synth_proc_content(path)) {
         trace("fopen", path, "synth-android");
         return ::fmemopen(const_cast<char*>(synth), std::strlen(synth), "r");
