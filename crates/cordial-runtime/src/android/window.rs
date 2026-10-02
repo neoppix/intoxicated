@@ -115,6 +115,17 @@ struct Xlib {
     /// already read off the socket, counted without any I/O. See
     /// `pump_input_events` for why the socket alone is not enough to ask.
     events_queued: unsafe extern "C" fn(Display, c_int) -> c_int,
+    /// `XkbSetDetectableAutoRepeat`: ask the server to signal keyboard
+    /// auto-repeat as bare repeated `KeyPress` events with *no* synthetic
+    /// `KeyRelease` between them. Without it, holding a key (walking, holding E
+    /// to interact) makes the server emit a `KeyRelease`+`KeyPress` pair for
+    /// every repeat tick, which `dispatch_key` forwarded as up/down/up/down --
+    /// the engine saw the key let go and re-pressed dozens of times a second,
+    /// so a held key "cancelled and spammed" after the repeat delay. Called
+    /// once in `open`; the matching keycode `detail` lets `dispatch_key` also
+    /// drop the now-redundant repeat *presses* for game input while text still
+    /// repeats. `XkbIgnoreExtension`-safe: present in every libX11 since 1996.
+    set_detectable_auto_repeat: unsafe extern "C" fn(Display, c_int, *mut c_int) -> c_int,
 }
 
 /// `XColor`. Only the pixel/RGB prefix is read by `XCreatePixmapCursor`, but the
@@ -187,6 +198,7 @@ impl Xlib {
             query_keymap: sym!("XQueryKeymap"),
             query_extension: sym!("XQueryExtension"),
             events_queued: sym!("XEventsQueued"),
+            set_detectable_auto_repeat: sym!("XkbSetDetectableAutoRepeat"),
         })
     }
 }
@@ -1037,6 +1049,17 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
         }
 
         (xlib.select_input)(display, w, INPUT_EVENT_MASK);
+        // Detectable auto-repeat: without it the server sends a KeyRelease
+        // before every repeat KeyPress for a held key, and `dispatch_key`
+        // forwarded that as a release/press burst -- a held key cancelled and
+        // spammed the engine once the repeat delay elapsed. With it, a held key
+        // is bare repeated presses and the real release only comes when the key
+        // is physically let go. Process-global to this X connection, so it is
+        // set once here. The `supported` out-argument is not read: every X
+        // server Cordial can reach supports it, and the fallback if one did not
+        // would be exactly today's behaviour, which `dispatch_key`'s own repeat
+        // drop already guards against.
+        (xlib.set_detectable_auto_repeat)(display, 1, std::ptr::null_mut());
         (xlib.map_window)(display, w);
         // Let the window manager finish its own placement before arguing with
         // it. Moving before it has acted is a race that the window manager
@@ -2635,15 +2658,29 @@ impl HostWindow {
         // AKEYCODE has a name for it, and an email address is unusable without
         // it. So this is now a branch rather than an exit.
         if let Some(keycode) = keysym_to_android(keysym) {
-            {
+            // A key already held that comes "down" again is an auto-repeat
+            // tick. `XkbSetDetectableAutoRepeat` (set in `open`) means those now
+            // arrive as bare `KeyPress` with no synthetic release between them,
+            // so the repeat is visible here as a down for a key still in
+            // `held_keys`. Drop it for the engine's key path: holding a key for
+            // a game action (walking, holding E to interact) is one press held,
+            // not a burst of presses -- forwarding each tick is what made a held
+            // key "spam" once the repeat delay elapsed. The text path below
+            // still runs on every tick, so holding a key inside a textbox
+            // repeats the character the way Android's own auto-repeat does.
+            let is_repeat = {
                 let mut input = self.input.lock().unwrap_or_else(|e| e.into_inner());
+                let already = down && input.held_keys.contains(&(keycode, ev.detail as i32));
                 track_held_key(&mut input.held_keys, down, (keycode, ev.detail as i32));
+                already
+            };
+            if !is_repeat {
+                deliver_key(handle, down, keycode, ev.detail as i32, meta, 0, unicode, now, now);
+                // The evdev code, not the Android keycode. X11 keycodes are evdev
+                // offset by 8 -- XKB reserves the low 8 for historical reasons every
+                // consumer has to undo. See `pass_key_event`.
+                pass_key_event(down, ev.detail as i32 - 8, meta);
             }
-            deliver_key(handle, down, keycode, ev.detail as i32, meta, 0, unicode, now, now);
-            // The evdev code, not the Android keycode. X11 keycodes are evdev
-            // offset by 8 -- XKB reserves the low 8 for historical reasons every
-            // consumer has to undo. See `pass_key_event`.
-            pass_key_event(down, ev.detail as i32 - 8, meta);
         } else {
             super::trace(format_args!("unmapped X11 keysym {keysym:#x}"));
         }
