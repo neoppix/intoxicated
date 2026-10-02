@@ -7,6 +7,8 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <pthread_np.h>
+#include <sys/param.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -539,15 +541,60 @@ int bionic_timerfd_settime(int fd, int flags, const void *new_value, void *old_v
 }
 
 // Linux x86-64 syscall numbers.
-#define LX_getpid          39
-#define LX_gettid          186
-#define LX_set_tid_address 218
-#define LX_getrandom       318
-#define LX_futex           202
-#define LX_clock_gettime   228
-#define LX_gettimeofday    96
+#define LX_read            0
+#define LX_write           1
+#define LX_open            2
+#define LX_close           3
+#define LX_stat            4
+#define LX_fstat           5
+#define LX_lstat           6
+#define LX_lseek           8
+#define LX_ioctl           16
+#define LX_pread64         17
+#define LX_access          21
 #define LX_sched_yield     24
 #define LX_nanosleep       35
+#define LX_getpid          39
+#define LX_uname           63
+#define LX_fcntl           72
+#define LX_readlink        89
+#define LX_gettimeofday    96
+#define LX_getuid          102
+#define LX_getgid          104
+#define LX_geteuid         107
+#define LX_getegid         108
+#define LX_getppid         110
+#define LX_statfs          137
+#define LX_fstatfs         138
+#define LX_gettid          186
+#define LX_futex           202
+#define LX_getdents64      217
+#define LX_set_tid_address 218
+#define LX_clock_gettime   228
+#define LX_exit_group      231
+#define LX_tgkill          234
+#define LX_openat          257
+#define LX_newfstatat      262
+#define LX_readlinkat      267
+#define LX_faccessat       269
+#define LX_getrandom       318
+
+// Reach cordial's registered libc shims (s_openat/s_fstat/... with the /proc
+// redirect, root-file hiding and bionic struct translation) so a RAW syscall the
+// anti-cheat issues produces the exact same result the libc path does — the point
+// of the whole raw-syscall trap (native/syscall_trap.c). Linux-convention errno
+// is applied by the caller via the -1 return; the shims set a FreeBSD errno which
+// cordial_fbsd_errno_to_linux maps there.
+struct CordialSystemSymbolDecl { const char* name; void* addr; };
+extern const struct CordialSystemSymbolDecl* cordial_system_symbols(size_t* count);
+static void* cordial_shim(const char* name) {
+    size_t n = 0;
+    const struct CordialSystemSymbolDecl* t = cordial_system_symbols(&n);
+    for (size_t i = 0; i < n; i++) {
+        if (t[i].name && strcmp(t[i].name, name) == 0) return t[i].addr;
+    }
+    return NULL;
+}
 
 long bionic_syscall(long number, ...) {
     va_list ap;
@@ -598,6 +645,108 @@ long bionic_syscall(long number, ...) {
             }
             return r;
         }
+    // ── file / path syscalls: route through cordial's shims so a raw syscall
+    // matches the libc path byte-for-byte (same /proc redirect, su-hiding,
+    // bionic struct layout). ──────────────────────────────────────────────
+    case LX_openat: {
+        // s_openat is variadic (mode); keep the pointer variadic so the x86-64
+        // call sets AL=0 as the callee expects.
+        typedef int (*fn)(int, const char*, int, ...);
+        fn f = (fn)cordial_shim("openat");
+        return f ? f((int)a0, (const char*)a1, (int)a2, (unsigned)a3) : -1;
+    }
+    case LX_open: {
+        typedef int (*fn)(const char*, int, ...);
+        fn f = (fn)cordial_shim("open");
+        return f ? f((const char*)a0, (int)a1, (unsigned)a2) : -1;
+    }
+    case LX_stat: {
+        typedef int (*fn)(const char*, void*);
+        fn f = (fn)cordial_shim("stat");
+        return f ? f((const char*)a0, (void*)a1) : -1;
+    }
+    case LX_lstat: {
+        typedef int (*fn)(const char*, void*);
+        fn f = (fn)cordial_shim("lstat");
+        return f ? f((const char*)a0, (void*)a1) : -1;
+    }
+    case LX_fstat: {
+        typedef int (*fn)(int, void*);
+        fn f = (fn)cordial_shim("fstat");
+        return f ? f((int)a0, (void*)a1) : -1;
+    }
+    case LX_newfstatat: {
+        typedef int (*fn)(int, const char*, void*, int);
+        fn f = (fn)cordial_shim("newfstatat");
+        return f ? f((int)a0, (const char*)a1, (void*)a2, (int)a3) : -1;
+    }
+    case LX_access: {
+        typedef int (*fn)(const char*, int);
+        fn f = (fn)cordial_shim("access");
+        return f ? f((const char*)a0, (int)a1) : -1;
+    }
+    case LX_faccessat: {
+        typedef int (*fn)(int, const char*, int, int);
+        fn f = (fn)cordial_shim("faccessat");
+        return f ? f((int)a0, (const char*)a1, (int)a2, (int)a3) : -1;
+    }
+    case LX_readlink: {
+        typedef long (*fn)(const char*, char*, size_t);
+        fn f = (fn)cordial_shim("readlink");
+        return f ? f((const char*)a0, (char*)a1, (size_t)a2) : -1;
+    }
+    case LX_readlinkat: {
+        // AT_FDCWD (-100 on Linux): same as readlink; otherwise fall back to the
+        // host readlinkat (no path rewrite, but these targets are not hidden).
+        if ((int)a0 == -100) {
+            typedef long (*fn)(const char*, char*, size_t);
+            fn f = (fn)cordial_shim("readlink");
+            if (f) return f((const char*)a1, (char*)a2, (size_t)a3);
+        }
+        return readlinkat((int)a0, (const char*)a1, (char*)a2, (size_t)a3);
+    }
+    // ── plain pass-throughs: the engine's libc uses the host's unshimmed
+    // version of these too, so a raw call matches without translation. ──────
+    case LX_read:      return read((int)a0, (void*)a1, (size_t)a2);
+    case LX_write:     return write((int)a0, (const void*)a1, (size_t)a2);
+    case LX_close: {
+        // Route through cordial's close shim so a synth-fd tag is dropped on close.
+        typedef int (*fn)(int);
+        fn f = (fn)cordial_shim("close");
+        return f ? f((int)a0) : close((int)a0);
+    }
+    case LX_lseek:     return lseek((int)a0, (off_t)a1, (int)a2);
+    case LX_pread64:   return pread((int)a0, (void*)a1, (size_t)a2, (off_t)a3);
+    // ── trivial identity getters. ──────────────────────────────────────────
+    case LX_getuid:    return (long)getuid();
+    case LX_geteuid:   return (long)geteuid();
+    case LX_getgid:    return (long)getgid();
+    case LX_getegid:   return (long)getegid();
+    case LX_getppid:   return (long)getppid();
+    // fstatfs/statfs: route to cordial's shims, which report procfs/sysfs for a
+    // synth /proc|/sys fd (the anti-cheat fstatfs()es /proc/self/maps to confirm it
+    // is really procfs) and an ext4 magic + real sizes for real files — the Linux
+    // `struct statfs` layout the bionic caller expects. Same shim the libc path
+    // uses, so raw and libc agree.
+    case LX_fstatfs: {
+        typedef int (*fn)(int, void*);
+        fn f = (fn)cordial_shim("fstatfs");
+        return f ? f((int)a0, (void*)a1) : -1;
+    }
+    case LX_statfs: {
+        typedef int (*fn)(const char*, void*);
+        fn f = (fn)cordial_shim("statfs");
+        return f ? f((const char*)a0, (void*)a1) : -1;
+    }
+    case LX_exit_group:
+        _exit((int)a0);
+        // ioctl/fcntl/getdents64/tgkill are deliberately NOT handled here: their
+        // request codes / struct layouts / semantics differ between Linux and
+        // FreeBSD and the libc path shims them separately, so a naive pass-through
+        // would mismatch. They fall through to the logged default; if the raw path
+        // ever issues one, CORDIAL_TRACE_RAWSYS names it and it gets a real
+        // translation then.
+
     default:
         // A refusal here is silent to the engine's caller and to us, which is
         // the shape of bug that hides for weeks: `CORDIAL_TRACE_SYSCALL=1`
@@ -729,7 +878,10 @@ int uname(struct cordial_bionic_utsname *u) {
     // is not load-bearing the way `sysname` is; what matters is that it reads as
     // a Linux kernel, not FreeBSD. x86_64 matches what Cordial runs and what the
     // x86_64 Roblox APK targets.
-    strlcpy(u->release, "5.10.157-android13-4-00003-gcordial", sizeof u->release);
+    // The trailing `-g<hash>` must read as a real 12-hex kernel git hash: the old
+    // `-gcordial` suffix was a literal "this is Cordial" fingerprint in a string
+    // the anti-cheat can report verbatim.
+    strlcpy(u->release, "5.10.157-android13-4-00003-gb5a8f0e7c2d1", sizeof u->release);
     strlcpy(u->version, "#1 SMP PREEMPT Thu Jan 1 00:00:00 UTC 2026",
             sizeof u->version);
     strlcpy(u->machine, "x86_64", sizeof u->machine);

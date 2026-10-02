@@ -152,6 +152,18 @@ int cordial_getaddrinfo(const char* node, const char* service,
         host_hints_p = &host_hints;
     }
 
+    // bionic/glibc treat an empty service string ("") as "no service" (port 0)
+    // and resolve the node successfully; FreeBSD's getaddrinfo instead returns
+    // EAI_SERVICE. The engine's RUPP / RakPeer path resolves its own machine
+    // address with getaddrinfo(gethostname(), "") — confirmed live:
+    // getaddrinfo(host="pascal", serv="") = 9 while serv=NULL = 0 — and that
+    // failure left the trust token with no local address, so the game server
+    // rejected the session at its ~60 s grace with the 304 AndroidAnticheatKick.
+    // Normalise to NULL so the call behaves as it does on Android.
+    if (service && service[0] == '\0') {
+        service = nullptr;
+    }
+
     struct addrinfo* out = nullptr;
     int rc = ::getaddrinfo(node, service, host_hints_p, &out);
     if (rc != 0) {

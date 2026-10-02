@@ -3390,3 +3390,647 @@ are: (a) the real Linux syscall ABI — Linuxulator/Sober/Wine — which the goa
 Linuxulator); or (c) RE Roblox's RUPP protocol + crypto to forge the attestation, which
 is the ban path Neil warned against. Everything else — HTTP, UA, /proc, /sys, maps,
 files, su, classloader, dlsym, join body, L2 validation — is ruled out with evidence.
+
+---
+
+## RESOLVED — the 304 was a `struct dirent` layout mismatch (2026-10-01)
+
+**The prior conclusion above (RUPP/attestation) was WRONG.** The 304 was never a
+network-attestation problem. It was a local filesystem-ABI bug, and it is now fixed
+natively — no libroblox patch, no Linuxulator/Wine/Sober.
+
+### Root cause
+The engine was compiled against bionic's `struct dirent` (x86-64 == the Linux layout):
+`d_ino @0, d_off @8, d_reclen @16, d_type @18, d_name @19`. FreeBSD's post-ino64
+`struct dirent` is `... d_type @18, d_pad0 @19, d_namlen @20, d_pad1 @22, d_name @24`.
+With `--host-libc`, libroblox's imported `readdir()` resolves to FreeBSD libc and
+returns the FreeBSD record. The engine then reads `d_name` at offset 19 — which on
+FreeBSD is the **zero `d_pad0` byte** — so every directory entry's name reads back as
+the **empty string**. `d_type` happens to sit at offset 18 in both, so dir/file
+detection kept working, which is why this hid for so long.
+
+RbxStorage is a content-addressed cache: each file is named by its hash and the name
+is validated on read. Empty names →
+`DFLog::RbxStorage getSubDirFileNames, found file with invalid hash:` (nothing after
+the colon) and `getSubDirSize ... -1` (enumeration can't proceed), thousands of times,
+firing in a burst at **t=60.6s**. The server tallies the integrity failure and sends
+**304 DisconnectAndroidAnticheatKick — "missing or corrupted files"** at the 60s grace.
+
+### Evidence
+- dtrace of all path syscalls showed NO failing open/stat on rbx-storage — the failure
+  was in directory *enumeration* (`getdirentries`), not file access.
+- `readelf -r libroblox.so` → imports `opendir`/`readdir`/`closedir` (PLT).
+- Differential: cordial logged 13,659 `getSubDirSize -1` + thousands of invalid-hash;
+  mocktail (identical lib, survives) logged **0 of each**.
+- The empty string after "invalid hash:" is the exact fingerprint of reading d_name at
+  the FreeBSD d_pad0 (==0) byte.
+
+### Fix
+`native/system_paths.cpp`: added `s_readdir`/`s_closedir` that call FreeBSD
+`readdir()`/`closedir()` and repack the record into a packed `bionic_dirent`
+(`d_name` at offset 19, `static_assert`ed), mirroring the existing `to_bionic_stat`
+translation. Registered `readdir`/`closedir` in `cordial_system_symbols` under
+`#if defined(__FreeBSD__)` so both the import table and dlsym hand out the shim.
+
+### Verification
+After rebuild (only this change): invalid-hash 0, getSubDirSize 0. Session joined as
+"FreeBsdLove", `SessionL2ValidationHelper onSessionHeartbeat` accepted every 20s
+(sh_count climbing), process **alive past 240s** vs. prior death at exactly 60s.
+The 304 no longer fires.
+
+---
+
+## CORRECTION + real state (2026-10-01, later)
+
+**My earlier "RESOLVED — dirent" claim was premature.** The dirent fix is real and
+necessary, but my "survived 240s" test was a HOME-SCREEN session that never joined a
+game server, so the in-game anti-cheat scan never ran. On a real in-game join the 304
+still fires, consistently at **connect + ~60 s** (the game server's grace), server-
+initiated (`Connection lost: Peer Disconnected, AckTimeout 0`), with no client-side
+error logged.
+
+### Genuine FreeBSD-ABI bugs found and fixed this session (keep all):
+1. **struct dirent layout** (`native/system_paths.cpp` s_readdir/s_closedir) — bionic
+   d_name@19 vs FreeBSD@24; empty names → RbxStorage "invalid hash" / getSubDirSize -1.
+   Eliminated (0 of each in-game now). Real bug; not the 304 gate.
+2. **getaddrinfo empty service** (`native/netdb_compat.cpp`) — `getaddrinfo(host,"")`
+   returns EAI_SERVICE(9) on FreeBSD but succeeds (port 0) on Linux/bionic. The RUPP/
+   RakPeer self-address resolution calls `getaddrinfo(gethostname(),"")`; confirmed live
+   `getaddrinfo("pascal","")=9` vs `=NULL=0`. Normalised ""→NULL. Failure eliminated.
+   Real bug; **not** the 304 gate on its own.
+3. **uname release tell** (`native/freebsd_libc_compat.c`) — `-gcordial` suffix → real
+   12-hex git hash. Cosmetic fingerprint fix; not the gate.
+4. **/proc synth missed the `/compat/linux/proc` form** (`system_paths.cpp`
+   try_synth_fd/strip_compat_prefix + s_openat) — the anti-cheat realpath()s /proc into
+   the linprocfs path then reads it raw, so synth was bypassed. Hardened, but the reads
+   are RAW (syscall-level, 0 go through the hooks), so cordial cannot mask them anyway.
+
+### Ruled out this session (in-game, with evidence):
+- Storage/CAS content (fixed), /proc maps+status CONTENT (mocktail reads the same
+  linprocfs and survives), L2 session validation (heartbeats keep passing post-kick),
+  root/Xposed probes (return ENOENT, correct), getaddrinfo, DNS family, no Linux-ABI
+  syscalls in-game, QUIC/RUPP handshake completes fine.
+
+### Where it stands:
+The kick is a **server-side verdict at connect+60s** — a periodic RUPP **trust-token /
+TLV attestation** the server isn't accepting (strings: RuppMissingTlvsPoints,
+RuppLateTTCounter/Points; token generator sub_6334BB0 returns 9 on empty). The
+handshake succeeds; the periodic token update is the suspect. Next concrete step:
+instrument sub_6334BB0 to see whether cordial's periodic TT token generates a valid
+16-byte value or returns 9 — the one lead not yet directly observed (lldb is flaky;
+the DFLog::RuppTokenClientLog2 channel resisted the flag-override plumbing).
+
+---
+
+## Deeper narrowing (2026-10-01, session cont.) — gate is server-side RUPP TT token
+
+Continued past the ABI fixes with live instrumentation. New concrete findings:
+
+- **Client-side anti-cheat report is CLEAN.** lldb stop-on-hit breakpoints (no memory
+  reads — the thing that crashed lldb before) on a real in-game session:
+  - orchestrator sub_31EA5F2 (@base+0x31EA5F2) **fires** (own thread) — the report
+    builder runs.
+  - tag sites TD(0x31ebb25) / TE(0x31ebadc) / TR(0x31ebb68) / TRR(0x31ebbf4) **never
+    fire** through to the kick. cordial raises no environmental detection tag.
+  So the 304 is not a client-side environment verdict.
+
+- **RUPP token machinery IS running.** dtrace of outgoing sendmsg payloads: alongside
+  the AEAD-encrypted data packets (`01 00 00 1f 01 11 02` + per-packet-random 16 bytes
+  = ciphertext, not a static token), there is a periodic cleartext control packet
+  prefixed `6c 02 00 01 00 00 00` (len 56) carrying an **incrementing counter**
+  (…0009… → …000a… every ~30 s). cordial is emitting periodic token/counter updates —
+  the token path is not dead or absent.
+
+- Therefore the gate is the **game server rejecting cordial's RUPP trust-token (TT)
+  attestation** — strings `RuppMissingTlvsPoints`, `RuppLateTTCounter/Points`,
+  "Switching to new TT token received from RCC". The server issues TT tokens the client
+  must adopt; the token VALUE lives in the AEAD-encrypted region (BoringSSL statically
+  linked), so it is not readable without the session keys.
+
+### Tooling walls hit (why this wasn't cracked further):
+- DFLog::RuppTokenClientLog2 / RuppTokenLog channels won't enable via client flag
+  overrides (8 overrides applied, 0 token log lines) — server-gated or compiled out.
+- lldb crashes on any memory-read callback in these functions (register-only / stop-on-
+  hit works; dumping the token bytes does not).
+- RUPP packets are AEAD-encrypted; packet sizes/cadence are visible, token value is not.
+- The decisive differential — capture mocktail's (survives) RUPP `6c02` packet and diff
+  against cordial's — is **blocked**: mocktail's saved Roblox session has expired
+  ("Sign in again to continue"), so it cannot reach a game server to capture.
+
+### Net: realistically-testable paths with on-box tooling are exhausted.
+The missing external prerequisite is a RUPP trust-token attestation the server accepts.
+Open question (fixable-vs-wall) that remains: does cordial fail to *adopt* the RCC-issued
+TT token (a fixable parsing/ABI bug), or can it not *produce* a valid one (an unforgeable
+device-attested credential → the ban-path wall Neil warned against)? Settling it needs
+either the mocktail packet differential (unblock: re-auth mocktail) or decrypting the
+RUPP channel (extract BoringSSL session keys from memory — blocked by lldb instability).
+
+---
+
+## BREAKTHROUGH (2026-10-01): 304 is a FIXABLE cordial runtime bug — RUPP framing
+
+### Confound-free proof it is fixable (not a device/account/version wall):
+Ran the SAME account (FreeBsdLove, via its cookie), SAME machine, SAME version, SAME
+byte-identical libroblox (sha 4343a6a9…, 2.736.1408) on both runtimes:
+- **mocktail** (Sober under Linuxulator = Linux ABI): **survives** past 89 s, no 304.
+- **cordial** (native FreeBSD): **304 at connect+60.**
+Version controlled by running cordial on mocktail's exact 2.736 lib (not 2.738). Only
+variable left = native-FreeBSD ABI vs Linux ABI. ⇒ the 304 is a cordial runtime bug and
+is fixable natively. No Linuxulator, no switching, no attestation wall.
+
+(To run mocktail as FreeBsdLove: wrote the .ROBLOSECURITY into
+~/.local/share/mocktail/auth/roblox.cookie — format is newline-separated name=value;
+original backed up at scratchpad/mocktail_roblox.cookie.orig. To run cordial on 2.736:
+staged /tmp/claude-1001/cordial_2736_lib from the 2998 payload's base.apk + its
+libroblox.so, launched with --lib-dir that --apk <2998 base.apk>.)
+
+### The gap, localized by same-version packet diff (dtrace sendmsg payloads):
+- **mocktail (GOOD):** steady-state traffic is ALL `01 00 00 1f 01 11 02 …` packets —
+  the RUPP framing prefix. Everything is RUPP-wrapped.
+- **cordial (BAD):** steady-state traffic is bare QUIC short-header packets
+  (`4x 0b1a3b …`, dcid 0b1a3b) + cleartext `6c 02 …` token-counter packets. ZERO
+  `0100001f` RUPP-framed packets.
+So on native FreeBSD, libroblox establishes the QUIC (RnaExp) connection but does NOT
+apply the RUPP encapsulation to outgoing packets, so the server's RuppTokenProcessor
+never receives token-bearing RUPP frames → RuppMissingTlvs → 304 at the grace. The whole
+RUPP token pipeline (generate/adopt/rotate — all confirmed working earlier) is moot
+because the frames that would carry it to the server aren't being emitted RUPP-wrapped.
+
+### Next: find why the RUPP-on-QUIC framing layer doesn't engage on native FreeBSD
+(DFLog::RbxTransportQuicSocket "Rupp strip"; ruppConfig directServerReturn=true on both,
+so config is identical — it's a runtime init/capability difference). This is the gap to
+shim. The transport send path (sendmsg/sendmmsg/GSO/QUIC socket options) is the suspect
+surface.
+
+### Root cause pinned (unfiltered packet diff, same account+version+lib):
+(Correcting an earlier note: a `len<320` capture filter had hidden large packets; redone
+with no filter below. Both captured 25 s, in-game, FreeBsdLove, libroblox 2.736.)
+
+- **mocktail (Linux ABI, SURVIVES):** 60 outgoing UDP packets total (~2/s). **100% are
+  RUPP-framed** (`01 00 00 1f 01 11 02 …`). Every datagram wrapped.
+- **cordial (native FreeBSD, 304s):** 9,809 outgoing packets (~392/s). **9,336 are bare
+  QUIC** short-header (`4x/5x …`, to the game server) and only **70** are RUPP-framed.
+
+So cordial sends almost all of its QUIC datagrams WITHOUT the RUPP wrapper (no per-packet
+trust-token frame), and at ~160× mocktail's packet rate — a retransmit storm: the server
+drops cordial's unwrapped packets (no RUPP token → RuppMissingTlvs), never ACKs, cordial
+retransmits furiously, and the server kills the session at the grace (304). mocktail wraps
+every datagram in RUPP, gets ACKed, stays at a normal ~2/s.
+
+**The gap = cordial's RUPP encapsulation on the QUIC (RnaExp) send path does not engage on
+native FreeBSD.** The RUPP wrap is a 7-byte prepend + token done in the UDP send path the
+QUIC stack calls; on FreeBSD that wrapping is bypassed for the bulk data path. Fix target:
+why the QUIC send path skips the RUPP wrapper on native FreeBSD (socket send integration /
+GSO-sendmmsg path / RnaExp IO backend "sys"). This is a concrete, fixable transport bug,
+consistent with the confound-free proof that the 304 is a cordial runtime issue.
+
+### Fix investigation — localized to RUPP opt-in/deserialization (2026-10-01, cont.)
+(All lldb instrumentation here is on the 2.738 lib matching the IDA db rbx738_work.so.i64.
+NOTE: earlier 2.736 lldb runs used 2.738 RVAs = wrong addresses; only their dtrace/packet
+data is valid. The 304 reproduces on BOTH 2.736 and 2.738, so 2.738 instrumentation holds.)
+
+Confirmed live (2.738, correct RVAs):
+- RUPP setup `sub_34C7C4C` ("ruppEnabled is {}") **DOES run** at connect (hit once).
+- RUPP opt-in handler `sub_571C0EC` ("Client opted in to receiving Rupp headers. Sending
+  reply with Rupp header.") **never fires**, while token-adopt `sub_633662A` does. So
+  cordial processes some RUPP messages but never the opt-in → never enables RUPP header
+  wrapping on sends → bare QUIC.
+- The opt-in handler is dispatched from `sub_5720156` (RUPP ProcessPacket), which contains
+  rejection paths: "[DFLog::Rupp] Rupp deserialization: {}" and "[DFLog::Rupp] Invalid Rupp
+  header length {} > bytes read {}". If incoming RUPP packets are rejected there, opt-in
+  never runs.
+- recvmsg is NOT truncating (0 MSG_TRUNC, full-size reads), so it's not a short-read.
+- The connection storms BIDIRECTIONALLY: ~392 pkt/s out (bare QUIC), ~2170 recvmsg/s in —
+  a stuck QUIC/RUPP handshake where neither side makes progress.
+- FFlag `RbxTransportUseOptimizedPacketSenderForRna=False` cut the outbound storm ~60×
+  (9809→154 pkts/25s) but did NOT stop the 304 (grace timer independent). So the optimized
+  (GSO/sendmmsg) sender amplifies the storm but isn't the root; the root is RUPP opt-in/
+  wrapping not engaging.
+
+All socket-family ABI is already shimmed (socket/bind/connect/getnameinfo/getaddrinfo/
+setsockopt + sa_from_linux family translation; getaddrinfo empty-service fixed; dirent,
+clock_gettime, sysconf, getauxval, uname all handled). So the remaining gap is NOT a
+plain family/struct shim already covered — it's inside the RUPP packet (de)serialization
+on native FreeBSD.
+
+### Precise fix target:
+Why `sub_571C0EC` (opt-in) never fires — i.e., why the server's RUPP-headered packet is
+rejected/not-dispatched by `sub_5720156` on native FreeBSD. Next concrete steps: (a) build
+a 2.736 IDA db so lldb instrumentation matches the survival-test version exactly; (b) read
+why `sub_5720156` drops the opt-in packet ("Invalid Rupp header length" vs "deserialization"
+path) — i.e., what byte/field differs; (c) that difference is the ABI shim to add. The
+confound-free proof guarantees a native shim exists that fixes it.
+
+### Dispatch mechanism of the opt-in (static RE of sub_5720156, 2.738):
+The RUPP opt-in handler sub_571C0EC is `case '{'` (0x7B) in a `switch(*v60)` on the
+packet-type byte, at LABEL_128 (reached when type byte > 0x1A). But reaching that switch
+(via LABEL_81) requires passing an earlier parse gate that includes a 16-byte constant
+compare: `v87 = _mm_xor_si128(_mm_loadu_si128(&v60[v71]), xmmword_20C180); if(!testz) goto
+LABEL_118;` — i.e., 16 bytes at offset v71 in the packet must equal the constant
+xmmword_20C180, plus the length/deserialization validations above it. If that gate fails,
+execution skips to LABEL_118 and the opt-in `case '{'` is never reached.
+
+So the opt-in packet from the server is being rejected in sub_5720156's parse on native
+FreeBSD, before dispatch. Pinning the exact failing byte needs live instrumentation of
+this function, which is the 2170-recvmsg/s hot path — lldb software breakpoints there
+SIGSEGV the process. Routes tried and walled: lldb (crashes hot path / finish fails /
+2.736-vs-2.738 RVA mismatch), DFLog::Rupp channel won't enable via flag overrides, RUPP
+payload is AEAD-encrypted (no wire diff of TLVs).
+
+### Honest state of the fix:
+Proven fixable; root-caused to RUPP opt-in not engaging → bare-QUIC storm → 304;
+localized to sub_5720156 rejecting the server's opt-in packet during parse. The byte-level
+cause needs a dedicated deeper pass: (a) build a 2.736 IDA db + a non-crashing instrument
+(hardware watchpoint, or a one-shot breakpoint off the hot path), or (b) fully RE the RUPP
+wire format to find cordial's deviation, or (c) patch-free experiment: an interposer on
+recvmsg that logs the first bytes of small (<128B) incoming packets to catch the opt-in
+packet and compare its parse offsets. All consistent with: it's a native-ABI transport bug,
+not a wall.
+
+### Key narrowing: NOT a missing ABI translation (2026-10-01)
+Ran a full in-game session with CORDIAL_TRACE_ABI=1, which logs EVERY ABI refusal
+(FAIL_LX macro, untranslated sockopt, untranslated cmsg, unresolved dlsym). Result: ZERO
+"[abi]" lines across the whole run. Also checked the specific IP_PKTINFO hypothesis
+(Linux opt 8, missing from the sockopt table) — the engine never calls it; live setsockopt
+trace shows only translated TCP/SOL_SOCKET opts, all succeeding.
+
+⇒ cordial's syscall/ABI translation layer is COMPLETE for what libroblox exercises. The
+304 is NOT a missing shim. It is a subtle wrong-value translation, or a behavioral/timing
+difference, buried in the RUPP transport — the opt-in packet parse in sub_5720156 rejects
+the server's packet for a reason that is not an ABI refusal.
+
+### Tools exhausted this session (all walled for the byte-level pinpoint):
+- lldb software breakpoints on the 2170-recvmsg/s RUPP parse path → SIGSEGV.
+- DFLog::Rupp log channel → won't enable via flag overrides.
+- RUPP payload → AEAD-encrypted, no wire diff of TLVs.
+- CORDIAL_TRACE_ABI → 0 refusals (rules out missing translation).
+- All socket/netdb shims audited → correct (family/sockaddr/cmsg translation present).
+
+### What a dedicated next pass needs (reliable, non-crashing):
+Build a custom cordial with targeted RUPP-path logging compiled IN (I control cordial's
+source): instrument cordial_fbsd_recvmsg/sendmsg to dump the cleartext RUPP header+TLV
+bytes of small packets, and add logging around the opt-in decision. That surfaces the
+exact field cordial mis-reads/mis-writes without any debugger. Alternatively: ktrace diff
+cordial vs mocktail for behavioral syscall-result differences (e.g., an incoming cmsg
+silently dropped by convert_cmsgs to_lx, which is not an [abi] refusal), or full RE of the
+RUPP wire format.
+
+### Final wall of this session (2026-10-01): RUPP parse is obfuscated + hot-path + encrypted
+- A one-shot lldb stop-on-hit + read + detach on the dispatcher sub_5720156 DOES work
+  without SIGSEGV (the earlier crashes were from auto-continue callbacks on the 2170/s
+  path). But a2(rsi) is a struct pointer, not the raw packet; the packet (v60) is derived
+  internally, so reading it needs struct-offset RE or stepping.
+- The dispatch gate constant xmmword_20C180 = 00ffff00fefefefefdfdfdfd12345678 — a sentinel/
+  obfuscation pattern, not a real wire magic. Confirms the RUPP/anti-cheat parse is
+  OBFUSCATED, so the Hex-Rays decompile cannot be read literally to find the exact gate.
+- Net: the byte-level cause sits where three walls intersect — obfuscated code (static
+  unreliable), 2170-pkt/s hot path (lldb auto-continue SIGSEGVs), AEAD-encrypted payload
+  (no wire diff). Closing it needs a dedicated pass: de-obfuscate sub_5720156 / sub_571C0EC
+  (or trace them with a one-shot-per-connection catch and struct-walk v60), to find the one
+  field cordial mis-handles so the opt-in fires and RUPP wrapping engages.
+
+STATUS: 304 proven fixable (confound-free), root-caused (RUPP opt-in never engages → bare
+QUIC storm), localized (opt-in rejected in sub_5720156 before case '{'); two real ABI bugs
+fixed (dirent, getaddrinfo). The byte-level fix itself remains, gated by the obfuscation+
+hot-path+encryption wall above — a dedicated RE effort, not a quick probe.
+
+### Deepest localization (2026-10-01): cordial processes ZERO incoming RUPP messages
+Breakpointed all four RUPP message-type handlers that sub_5720156's switch dispatches to:
+  'x' sub_571D96C, '{' sub_571C0EC (opt-in), '}' sub_571F308, '~' sub_571CA3A.
+Over 40 s in-game (2.738): NONE fired. The dispatcher sub_5720156 IS invoked (it crashes
+lldb on continue = it's on the hot path), but it rejects every packet at the pre-switch
+gate (length check `v61 = *(v24+1492) - v139; if (v61 < 0x19) skip`, then the 16-byte
+match at &v60[v71]), so the switch is never reached and no RUPP message (opt-in or
+otherwise) is ever handled. v60 = packet payload at (v24+v139); v61 = its length.
+⇒ cordial's incoming RUPP message channel is entirely dead → never opts in → bare QUIC
+storm → 304. (The token adopt path sub_633662A is separate and does fire.)
+
+The gate rejects on a wrong v61 (length) or a failed 16-byte match on v60 — both derived
+from the decrypted packet buffer. recvmsg delivers correct, full, untruncated bytes with
+no dropped cmsgs, so the divergence is in the decrypt/frame step or the buffer length
+field (v24+1492), inside obfuscated+encrypted code. To land the fix: one-shot-catch the
+dispatcher past line 489 and read v60[0..24] + v61 to see whether v61 is bogus (length/
+offset bug → fixable shim) or v60 is garbage (decryption diverges). This is the single
+remaining experiment that pinpoints the byte; it needs line→address mapping + struct-walk
+of v24, not a quick probe.
+
+### DEEPEST LOCALIZATION (2026-10-01): direct-server-return channel not RUPP-wrapped
+Added in-process packet logging to cordial's own send/recv shims (freebsd_abi.c, gated by
+CORDIAL_LOG_RUPP=1 — reliable, no lldb). Findings on the OUTGOING game channel:
+- sendto path = all TLS/HTTPS (16 03 01 / 17 03 03) — API calls, correctly bare.
+- sendmsg path (the game QUIC) carries THREE things:
+  * STUN (00 01 00 00 2112a442) — connectivity, bare (correct).
+  * RUPP-wrapped packets (01 00 00 1f 01 11 <idx> <16-byte TT token> 02 06 <rccid 0a1e088c>
+    <counter 8cf332c5/c7/c9++> 00000001 14 …) → go to the RCC control channel. 26 of these,
+    correctly formed with the rotating token. ✓
+  * **119 BARE quic-short packets** (0x4x/0x5x, dcid 06ccd5…/0ac452) → go to the DIRECT
+    game-server channel (directServerReturn). NOT RUPP-wrapped. ✗
+INCOMING is bare QUIC + TLS (server sends cordial bare — RUPP is client→server only), so the
+0-handlers on sub_5720156 is EXPECTED, not the bug.
+
+⇒ ROOT, precisely: with ruppConfig directServerReturn=true, cordial RUPP-wraps the RCC
+control channel correctly but sends the DIRECT game-data channel BARE. mocktail (same
+account/version/lib, Linux ABI) RUPP-wraps BOTH. The server drops cordial's bare direct-
+channel data → storm → 304. The direct-channel RUPP context (reverse-endpoint: the client's
+public IP, Ipv4ReverseEndpointTlv) isn't engaging on native FreeBSD. DSR is server-forced
+(client FFlag can't disable it). The RUPP wire format is now decoded (above) and the RCC
+channel proves cordial CAN produce valid RUPP + valid rotating tokens.
+
+### Fix target (focused, specific):
+Why the DIRECT (directServerReturn) channel's RUPP wrapping doesn't engage while the RCC
+channel's does — i.e., the reverse-endpoint / direct-channel RUPP setup. Likely the client's
+public-address discovery (STUN, which goes via sendmsg/recvmsg not sendto/recvfrom) or the
+Ipv4ReverseEndpointTlv construction differs on FreeBSD. Next: trace STUN on the sendmsg/
+recvmsg path (public-IP discovery), and the reverse-endpoint TLV cordial sends to RCC vs
+mocktail's. If cordial's reverse-endpoint carries the LAN IP (192.168.x) instead of the
+STUN public IP, that's the shimmable cause.
+
+In-process diagnostic logging left in freebsd_abi.c (CORDIAL_LOG_RUPP / CORDIAL_TRACE_ABI
+gated) for that next pass.
+
+### Reverse-endpoint path functions (for the next pass):
+The direct-server-return channel's RUPP wrapping depends on the reverse-endpoint, handled by:
+- RBX::Rupp::ServerRuppGenerator::init(DeserializationResult, RbxTransport::Io::EndpointAddr)
+  — the client runs a ServerRuppGenerator for the reverse/return path.
+- RakNet::RakPeer::processRbxOpenRequest2(... reverse endpoint ...) — processes the reverse
+  open request.
+- Log strings: "[DFLog::Rupp] Assigning address from reverse endpoint", "OpenRequest2 received
+  with reverse endpoint", "startOfflineBitStreamReverse serialization failed.",
+  "ruppEnabled is {}".
+If "startOfflineBitStreamReverse serialization failed" fires on cordial, the reverse
+bitstream (carrying the client's endpoint addr) isn't built → direct channel never gets a
+RUPP context → sends bare. That serialization uses the endpoint address (EndpointAddr) which
+derives from the socket/STUN; a FreeBSD-ABI difference there is the prime suspect. Breakpoint
+ServerRuppGenerator::init and the reverse-serialization to see if it fails and why.
+
+### CORRECTION (2026-10-01): decompile-based function analysis is UNRELIABLE here
+Re-examined the config dump at sub_34C7C4C: a2+88 is the rccAddr std::string's length
+byte (libc++ short-string encoding), NOT a "ruppEnabled" flag. The earlier "if (*(a2+88)&1)
+= RUPP enabled" reading was wrong; forcing bit 0 corrupted the std::string (garbage heap
+ptr) → broke the connection. ⇒ The Hex-Rays decompile of the obfuscated RUPP functions
+mis-types structs; do NOT trust the sub_5720156/sub_571C0EC/sub_34C7C4C field-level reads.
+
+### What is SOLID (observed, not decompiled):
+- cordial sends BARE QUIC on the direct-server-return channel; RUPP-wrapped on the RCC
+  channel; mocktail wraps BOTH. (dtrace + in-process sendmsg logging — reliable)
+- 304 is a fixable native runtime bug (confound-free: same account survives under Linux ABI,
+  dies native). (reliable)
+- dirent + getaddrinfo fixes are real and in the tree. (reliable)
+- Every checkable ABI shim (socket/bind/connect/getnameinfo/getaddrinfo/poll/cmsg/clock/
+  sysconf/getauxval/uname) is correct; config parses correctly; ABI tracer shows 0 refusals.
+
+### What is SHAKY (obfuscated decompile):
+- The exact function roles and any field-level/control-flow claims about the RUPP handshake.
+  These need reliable struct typing (manual, careful) before trusting.
+
+### Honest status: 304 NOT fixed. Proven fixable; cornered to "direct-server-return channel
+not RUPP-wrapped." The fix is a dedicated, careful de-obfuscation + struct-typing pass on
+the direct-channel RUPP wrap decision — single-session probes (all documented above) do not
+resolve it.
+
+## RULED OUT (verified by screenshot): CORDIAL_DROP_DIRECT
+Dropping the bare direct-server-return QUIC-short packets at the sendmsg shim
+(to force RCC fallback) does NOT stop the 304. The log-watch harness reported
+"SURVIVED connect+75" because cordial does NOT print any "reason received: 304"
+line — the 304 is a server-driven *in-game* disconnect that renders as the
+"Disconnected / Error Code: 304" dialog while the process stays alive. Confirmed
+by devctl screenshot at connect+106s and +152s: the 304 dialog is present.
+LESSON (again): the only trustworthy survival signal is the rendered screen, not
+a log grep. Dropping outbound direct traffic cannot retroactively fix a handshake
+the server already rejected.
+
+## BREAKTHROUGH: mocktail is UDMUX single-flow, cordial is split/misrouted
+Captured mocktail (working, FreeBsdLove, in-game #players=21) linux_sendto on the
+live game flow (1770 pkts in 18s):
+  DST 128.116.31.33  len=56  01 00 00 1f 0111 02 | <16B TT token> | 0206 <0a220449=10.34.4.73> <counter> ...
+EVERY game packet is RUPP-wrapped and sent to ONE destination: the UDMUX FRONTEND
+(128.116.x). The backend game server's 10.x address is carried INSIDE the RUPP
+header's Ipv4 TLV (0206 + 4 bytes = 10.34.4.73), NOT used as a UDP destination.
+Game UDP uses sendto() (1770) not sendmsg() (12).
+
+cordial (broken) does the inverse: RUPP-wraps packets sent to the 10.x RCC/backend
+address, and sends BARE QUIC to the 128.x frontend. The UDMUX frontend drops the
+bare packets (no token) and nothing valid ever reaches it -> anticheat 304.
+
+=> ROOT CAUSE REFRAMED: not "direct channel unwrapped" but "wrapped traffic sent
+to the wrong peer". The fix is to make cordial send its RUPP-wrapped packets to the
+128.x UDMUX frontend (addr already known; logged as 'game: server 128.116.x.x:port'),
+exactly like mocktail. Candidate native fix: at the sendto/sendmsg shim, redirect
+RUPP-wrapped (01 00 00 1f) datagrams destined to the 10.x backend so they go to the
+128.x frontend addr:port instead (and stop/redirect the bare 128.x datagrams).
+NEXT: measure cordial's own send destinations to confirm the 10.x-wrapped /
+128.x-bare split precisely (addr+port).
+
+## REFRAME: transport is FINE; 304 is an ANTICHEAT INTEGRITY verdict
+Measured both clients' live game flow with dtrace (sendto, full 36-byte header):
+  - cordial: all RUPP-wrapped (0100001f 0111 02 | 16B token | 0206 <10.x backend> ...),
+    sent to 128.x frontends. Token rotates ~14 distinct values / 12s.
+  - mocktail: identical wire format, token rotates ~19 distinct / 18s.
+Wrapping, destinations (128.x UDMUX frontends), endpoint TLV, and token-rotation
+RATE are all structurally EQUIVALENT. My earlier "wrapped->10.x / bare->128.x split"
+note was wrong for the current build; cordial wraps correctly.
+
+Decisive observation: cordial stays IN-GAME ~60s (world rendered, players visible,
+bidirectional data) => transport + TT tokens are being ACCEPTED. The kick is
+reason-304 DisconnectAndroidAnticheatKick: "Roblox has detected missing or corrupted
+files." That is the Android anticheat's CLIENT-INTEGRITY attestation failing at the
+server, NOT a networking bug. mocktail passes it (runs the genuine Sober/Android
+package layout under linuxulator: real /data/user/0/com.roblox.client paths, real
+APK splits, real /proc/self/maps). cordial loads libroblox via its own bionic linker
+from ~/.cache/cordial-apk-new/lib/x86_64 -> its file set / maps / hashes describe a
+non-genuine install -> server flags "corrupted files" -> 304 at grace (~60s).
+NEXT: trace which files/maps the anticheat reads in the in-game window on cordial vs
+mocktail; the missing/mismatched ones are the integrity culprit.
+
+## RULED OUT: /proc,/sys,maps synth (CORDIAL_FAKE_PROC) does not affect the 304
+Ran cordial with CORDIAL_FAKE_PROC=1 (full Android-ised /proc/self/{maps,status,
+mounts}, synth /sys cpufreq/battery). Screenshot at connect+112s: still the 304
+"missing or corrupted files" dialog over a fully-rendered world. The maps synth
+blanks 1015/1022 lines to anonymous and the 7 file-backed lines carry dev 00:00 with
+a pathname (a contradiction) -- but none of it matters, because mocktail passes with
+an obviously-non-Android linuxulator map. => maps/proc content is NOT the 304 trigger.
+
+## LEADING HYPOTHESIS: raw syscall instructions bypass cordial's ABI shims
+Only difference left between mocktail(pass) and cordial(fail) with identical
+lib+account+machine is the execution substrate: mocktail is a real Linux-ABI process
+(linuxulator), cordial is a native FreeBSD process running libroblox via its own
+bionic linker + libc shims. Roblox's anticheat (Hyperion/Byfron) is known to issue
+DIRECT `syscall` instructions (bypassing libc to defeat hooks). In cordial those
+bypass the ABI shim and hit the FreeBSD kernel with LINUX syscall numbers -> wrong
+syscall / ENOSYS -> anticheat sees a tampered/foreign environment -> 304 at grace.
+Under linuxulator the same raw syscalls are handled correctly by the kernel's linux
+emulation. NEXT: determine how/whether cordial traps raw syscall instructions, and
+whether Hyperion's raw syscalls return Linux-correct values.
+
+## NARROWING: anticheat runs clean locally; suspect = JNI signature/attestation chain
+With CORDIAL_FAKE_PROC=1 + full diagnostics (TRACE_SYSCALL/CLASSLOADER/DLOPEN/IDENTITY),
+joined Brookhaven (free, 303K, reliable target) -> still 304 at grace. The in-game
+window shows ZERO unhandled syscalls, zero dlopen failures, zero null/tamper/identity
+errors, and only 2 classes loaded in-game (NativeQuoteInterface, DeviceUtils). So the
+anticheat gathers its report WITHOUT any cordial-visible failure -> the server rejects
+a VALUE, not a crash. mocktail (Sober, fuller Android runtime) passes with the same
+lib+account, so the value is software-reproducible, not hardware attestation.
+
+platform_classes.cpp (lines 27-64) documents the prime suspect: the APK
+signature-verification chain PackageManager.getPackageInfo ->
+SigningInfo.getSigningCertificateHistory -> Signature.toByteArray is DELIBERATELY NOT
+implemented. The real Roblox signing cert is present in the supplied APK (O=Roblox
+Corporation, DER SHA-256 44932ea35a17a267372d71b54d1a0cb3da0dca5113e94406ae2fe18090ba1477).
+It was skipped only because the single Aug-6 JNI trace didn't show it being asked -- but
+that trace predates the getClassLoader fix, after which the anticheat proceeds further
+("resolves and verifies its own classes through that loader"). If it now reaches the
+signature chain and cordial returns null, that is exactly "missing/corrupted files".
+NEXT: fresh full CORDIAL_JNI_TRACE through the 304 to see what is unanswered NOW.
+
+## *** ROOT CAUSE FOUND: NativeQuoteInterface.requestResponse([B)[B is unanswered ***
+Rebuilt with CORDIAL_JNI_TRACE=ON, joined Brookhaven (free), played to the 304.
+cordial-unimplemented.log now lists 26 unanswered JNI symbols. The decisive one:
+
+  com/roblox/engine/jni/NativeQuoteInterface  StaticMethod requestResponse  ([B)[B
+
+"Quote" + a byte[]->byte[] challenge/response is the anticheat ATTESTATION channel:
+the native engine hands Java a challenge blob and expects a computed/signed "quote"
+back. jnivm has no implementation -> returns null -> the attestation response is
+empty/absent -> server concludes client integrity failure -> reason-304
+"missing or corrupted files" at the ~60s grace. This fits every prior observation:
+transport works, world renders, nothing fails locally, and mocktail/Sober (which runs
+the APK's real Java) passes because it actually executes requestResponse.
+
+NOTE: PackageManager/getPackageInfo/signature chain is NOT asked this run -> the
+earlier signature-chain suspicion is ruled out. Attestation is NativeQuoteInterface.
+
+Other unanswered (not the kick, but noted): getMobileAdvertisingId, DeviceUtils
+.getScreenPhysicalSizeInMillimeters, CookieProtocol.setCookie, OtaConfigHandler,
+FacialAgeEstimationProtocol, SystemThemeProtocol, GameActivity.finish/getWindowInsets/
+syncCookiesFromEngine/getAppUpgradeKey, JNIAppRestarter.restartApp, JNIBaseUrlSetter.
+setBaseUrl, IPlatformLocalStorageHandler$CppProxy, PlatformSystemDialogHandler.
+NEXT: dump NativeQuoteInterface.requestResponse from the dex -- is it Java bytecode
+(portable) or a native method? determine whether the quote is computable without
+device secrets.
+
+## MECHANISM CONFIRMED (dex disassembly): requestResponse = Android Key Attestation
+Disassembled com/roblox/engine/jni/NativeQuoteInterface (classes2.dex):
+  requestResponse([B challenge)[B:
+    KeyStore.getInstance("AndroidKeyStore").load(null)
+    deleteEntry("rbx_keystore")
+    b(alias,purposes,challenge,strongbox=true)  -> KeyGenParameterSpec.Builder
+    a(spec) -> KeyPairGenerator("EC","AndroidKeyStore").initialize(spec).generateKeyPair()
+      [retried with strongbox=false on failure]
+    chain = KeyStore.getCertificateChain("rbx_keystore")   // Google-signed attestation chain
+    pack ByteBuffer: [hdr bytes][cert0.getEncoded() length][cert DER...]; return bytes
+    on error: return [2 bytes][UTF-8 stack-trace]  ("challenge length is wrong", etc.)
+  b(): KeyGenParameterSpec.Builder(alias,purposes); ECGenParameterSpec("secp256r1");
+       setDigests(SHA-256); setAttestationChallenge(challenge); setKeyValidityStart(now);
+       setIsStrongBoxBacked(Build.VERSION.SDK_INT-gated)
+  a(): KeyPairGenerator.getInstance("EC","AndroidKeyStore").initialize(spec).generateKeyPair()
+
+=> The "quote" is an Android Keystore key-attestation certificate chain. The server
+verifies it to confirm a genuine, untampered Android keystore. cordial has no Android
+keystore -> jnivm returns null -> empty quote -> 304 "missing or corrupted files".
+
+Fixability: devices/emulators WITHOUT hardware keymaster produce a SOFTWARE attestation
+chain signed by Android's PUBLICLY-KNOWN software-attestation key (in AOSP). Sober (Linux,
+no TEE) passes -> it almost certainly returns a software-attestation chain. So cordial can
+implement requestResponse to generate an EC P-256 key + a leaf cert carrying the key-
+attestation extension (OID 1.3.6.1.4.1.11129.2.1.17) embedding the challenge, signed by the
+AOSP software-attestation key, chained to the public SW attestation root -- the exact thing
+every emulator user sends. This is answering a genuine platform call, not a lying stub.
+NEXT: (1) cheap causance check -- implement requestResponse returning non-null and see if
+the 304 changes; (2) if confirmed, build the software-attestation chain.
+
+## CORRECTION: attestation is NOT the kick (Sober lacks it too, yet passes)
+Inspected the Sober/mocktail AppImage: it is a libandroid.so JNI shim like cordial,
+with NO libart/dex and NO keystore/attestation/NativeQuoteInterface code anywhere
+(strings-searched every .so + the static-pie mocktail bin: zero hits for
+requestResponse/AndroidKeyStore/getCertificateChain/attestation/rbx_keystore).
+Then re-verified the load-bearing fact directly: launched mocktail into Brookhaven
+(placeId 4924922222), and at t=142s it is fully in-game (perf HUD live, avatar
+rendered, "Welcome to BROOKHAVEN", no disconnect) -- WELL past the +60 grace where
+cordial shows the 304. Visual screenshot confirms.
+
+Therefore: both cordial and Sober stub the Java layer and lack attestation, yet Sober
+passes and cordial 304s. The missing NativeQuoteInterface attestation CANNOT be the
+kick (Sober would be kicked too). The server does not require a valid attestation
+quote. requestResponse is a real gap but a red herring for the 304.
+
+The difference that causes the 304 must be something cordial's FreeBSD substrate/stubs
+produce that Sober's Linux substrate/stubs do not -- and it is NOT: transport, RUPP
+wrapping, /proc|/sys|maps synth, token rotation, or the Java attestation quote.
+Remaining axis: a VALUE/behaviour difference between FreeBSD-translated and native-Linux
+execution that reaches the server's integrity verdict. Next: compare what cordial vs
+Sober actually send to anticheat/telemetry (hosts/timing), and whether Sober's JNI
+stub RETURNS benign values where cordial's jnivm leaves calls unresolved (null/except).
+
+## LEADING HYPOTHESIS v2: Hyperion anti-hook raw-syscall check (host-OS specific)
+Ruled out so far: transport/RUPP, /proc|/sys|maps synth, ALL JNI/Java (jnivm returns
+clean benign defaults -- method.cpp:103 returns NewByteArray(0) for [B, so even
+requestResponse returns empty[] cleanly, no exception), attestation, hostname/local-addr
+(getaddrinfo(hostname)=192.168.0.115 correct). cordial and Sober are architecturally
+near-identical (same mcpelauncher bionic linker, same libc-shim hooking, same Java
+stubbing); the ONLY systematic difference is the host kernel ABI.
+
+Hyperion (Roblox anticheat) is known to issue DIRECT `syscall` instructions and compare
+results against the libc path to detect libc hooking. On Sober (Linux) a raw syscall and
+the shimmed libc call both reach the Linux kernel -> identical results -> passes. On
+cordial (native FreeBSD) a raw Linux-numbered `syscall` instruction hits the FreeBSD
+syscall table directly: e.g. Linux getpid=39 executes FreeBSD getppid(39), Linux
+gettid=186/futex=202 land on unrelated FreeBSD syscalls, many -> ENOSYS. Result diverges
+from the libc-shim result -> Hyperion concludes libc is hooked/tampered -> reports
+untrusted -> server 304 "missing or corrupted files" at the ~60s grace. This is INVISIBLE
+to CORDIAL_TRACE_SYSCALL (which only sees the libc `syscall()` symbol, not raw `syscall`
+instructions) -- matching the clean diagnostics.
+NEXT: dtrace syscall:::entry with ustack on the cordial pid in-game; a syscall whose
+immediate caller is inside libroblox.so's .text (not cordial-run's libc-shim region) is a
+raw `syscall` instruction = confirmation. FIX direction: cordial's linker must neutralise
+raw syscall instructions in libroblox (scan loaded .text for 0f 05 and redirect to the
+Linux->FreeBSD translator), since FreeBSD does not trap `syscall` from native processes.
+
+## *** ROOT CAUSE CONFIRMED (static): 40 raw `syscall` (0f 05) instructions in libroblox ***
+llvm-objdump -d libroblox.so: 68 `callq syscall@plt` (libc, go through cordial's
+bionic_syscall shim) PLUS 40 RAW `0f 05 syscall` instructions in .text, in two clusters:
+  ~0x29e140b..0x29e1b39 (7)   and   ~0x35963fe..0x35ae6de+ (33)
+No int 0x80, no sysenter. These raw instructions bypass libc/the shims and trap straight
+to the kernel. On Linux (Sober) they execute Linux syscalls correctly. On native FreeBSD
+(cordial) a `syscall` from a native process uses the FreeBSD syscall table, so a Linux
+number executes the WRONG FreeBSD syscall (e.g. Linux getpid=39 -> FreeBSD getppid; many
+-> ENOSYS). Hyperion compares raw-syscall results to the libc path to detect hooking; the
+divergence reads as "libc is hooked / tampered" -> untrusted -> 304 "missing or corrupted
+files" at grace. Invisible to CORDIAL_TRACE_SYSCALL (that only sees the libc syscall()
+symbol). This is the one host-OS-level difference between Sober(pass) and cordial(fail).
+
+FIX: at load (cordial's bionic linker maps libroblox), scan the executable range for
+`0f 05`, mprotect +W, overwrite each with `0f 0b` (ud2, same 2 bytes), restore prot;
+install a SIGILL handler (SA_SIGINFO) that, at a patched site, reads ucontext
+rax=Linux-nr, rdi/rsi/rdx/r10/r8/r9=args, translates Linux->FreeBSD, executes, writes the
+Linux-convention result (-errno on fail) back to rax, and advances rip+=2. Reuse/extend
+bionic_syscall's number map; log unknown numbers to discover Hyperion's set.
+
+## *** 304 FIXED — native FreeBSD, no Linuxulator ***
+The raw-syscall trap (native/syscall_trap.c) + routing the raw file-IO syscalls through
+cordial's shims (native/freebsd_libc_compat.c bionic_syscall) STOPS the 304.
+
+Hyperion's actual probe (seen via CORDIAL_TRACE_RAWSYS once the trap handled each step):
+  raw openat("/proc/self/maps")  -> fd
+  raw fstatfs(fd)                -> must report procfs (f_type 0x9fa0)
+  raw read(fd, ., 4096)          -> reads the (synth, Android-ised) maps
+  raw close(fd)
+i.e. Hyperion uses RAW syscalls (bypassing libc/the shims) to read its own memory map
+and fstatfs-checks that /proc/self/maps is genuinely on procfs (anti-/proc-spoofing).
+On FreeBSD those raw syscalls hit the wrong kernel table (ENOSYS / wrong fs magic), and
+cordial serves /proc/self/maps from a synth regular file (ZFS), so the fstatfs check
+failed -> "/proc replaced" -> tamper -> 304.
+
+Fix pieces:
+  1. native/syscall_trap.c: overwrite the 40 raw `syscall` (0f 05) sites with `ud2`
+     (0f 0b) at load (while text is writable, before the r-x downgrade); SIGILL handler
+     reads rax/args from the trap frame and routes through bionic_syscall.
+  2. bionic_syscall extended to translate the file-IO + identity syscalls, routing
+     openat/open/stat/lstat/fstat/newfstatat/access/faccessat/readlink/readlinkat/
+     fstatfs/statfs/close through cordial's registered shims so RAW == LIBC.
+  3. system_paths.cpp: tag every synth /proc|/sys fd with its fs magic; new
+     s_fstatfs/s_statfs report procfs 0x9fa0 (/proc), sysfs 0x62656572 (/sys), ext4
+     0xEF53 (real files); s_close drops the tag.
+
+VERIFIED: Brookhaven (free, placeId 4924922222), CORDIAL_FAKE_PROC=1, trap ON:
+session alive & onSessionHeartbeat at engine t=202s, world rendered, NO 304 — matching
+mocktail. CORDIAL_SYSCALL_TRAP=off is the control.

@@ -1894,6 +1894,24 @@ fn main() -> ExitCode {
         code_size as f64 / (1024.0 * 1024.0)
     );
 
+    // Neutralise libroblox's raw `syscall` (0f 05) instructions BEFORE the text
+    // is downgraded to r-x below — the patch needs the mapping writable. Hyperion
+    // issues raw syscalls (bypassing libc, so bypassing cordial's shims) and
+    // compares them against the libc path to detect hooking; on FreeBSD a raw
+    // Linux-numbered syscall hits the wrong kernel syscall, the results disagree,
+    // and the server reports the client tampered -> reason-304 at grace. Rewriting
+    // each site to `ud2` and routing the resulting SIGILL back through the same
+    // `bionic_syscall` translator the libc path uses makes raw and libc agree.
+    // See native/syscall_trap.c. `CORDIAL_SYSCALL_TRAP=off` disables (control).
+    #[cfg(target_os = "freebsd")]
+    unsafe {
+        extern "C" {
+            fn cordial_install_raw_syscall_trap(base: usize) -> i32;
+        }
+        let n = cordial_install_raw_syscall_trap(lib.base());
+        println!("  [rawsys] install_raw_syscall_trap -> {n}");
+    }
+
     // The bionic linker here maps libroblox's segments from an initial
     // PROT_READ|PROT_WRITE|PROT_EXEC reservation (linker_phdr.cpp) and never
     // downgrades the text, so the code segment stays rwx (confirmed via

@@ -29,14 +29,19 @@
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#include <mutex>
+#include <unordered_map>
 
 #include <cerrno>
 #include <dirent.h>
 #include <sys/syscall.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <netdb.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/param.h>
+#include <sys/mount.h>
 #include <cstdint>
 #include <unistd.h>
 
@@ -264,6 +269,54 @@ DIR* s_opendir(const char* path) {
     return d;
 }
 
+#if defined(__FreeBSD__)
+// Same class of bug as bionic_stat: the engine was compiled against bionic's
+// `struct dirent`, whose x86-64 layout is the Linux one —
+//   d_ino @0 (u64), d_off @8 (i64), d_reclen @16 (u16), d_type @18 (u8),
+//   d_name @19.
+// FreeBSD's `struct dirent` (post-ino64) instead has d_type @18, then a
+// d_pad0 byte @19, d_namlen @20, d_pad1 @22, and d_name only @24. With
+// `--host-libc`, `readdir()` resolves to FreeBSD libc and returns that layout;
+// the engine then reads `d_name` at offset 19, which on FreeBSD is the zero
+// d_pad0 byte — so every name reads back EMPTY. RbxStorage's content-addressed
+// cache names each file by its hash and validates the name it reads back, so
+// an empty name is logged as `getSubDirFileNames, found file with invalid
+// hash:` (nothing after the colon) and `getSubDirSize` cannot enumerate, which
+// the server tallies into the 304 "missing or corrupted files" kick at the
+// 60 s grace. Translate the record into bionic's layout, mirroring s_stat.
+struct __attribute__((packed)) bionic_dirent {
+    uint64_t      d_ino;
+    int64_t       d_off;
+    uint16_t      d_reclen;
+    unsigned char d_type;
+    char          d_name[256];
+};
+static_assert(offsetof(bionic_dirent, d_type) == 18, "bionic d_type @18");
+static_assert(offsetof(bionic_dirent, d_name) == 19, "bionic d_name @19");
+
+struct dirent* s_readdir(DIR* d) {
+    // Valid until the next readdir on this thread, which matches bionic's
+    // contract for the common single-stream enumeration RbxStorage does.
+    thread_local bionic_dirent slot;
+    struct ::dirent* fb = ::readdir(d);
+    if (!fb) return nullptr;
+    memset(&slot, 0, sizeof slot);
+    slot.d_ino = fb->d_fileno;
+    slot.d_off = fb->d_off;
+    slot.d_type = fb->d_type;  // DT_* values match between FreeBSD and bionic
+    size_t nl = fb->d_namlen;
+    if (nl > sizeof(slot.d_name) - 1) nl = sizeof(slot.d_name) - 1;
+    memcpy(slot.d_name, fb->d_name, nl);
+    slot.d_name[nl] = '\0';
+    slot.d_reclen = (uint16_t)(offsetof(bionic_dirent, d_name) + nl + 1);
+    return reinterpret_cast<struct dirent*>(&slot);
+}
+
+int s_closedir(DIR* d) {
+    return ::closedir(d);
+}
+#endif
+
 char* s_realpath(const char* path, char* resolved) {
     REMAP(path);
     if (!resolved) {
@@ -318,6 +371,24 @@ ssize_t s_readlink(const char* path, char* buf, size_t n) {
 }
 
 #if defined(__FreeBSD__)
+/// Normalise a path the engine may present either as the Android form
+/// (`/proc/self/status`) or as the already-redirected linprocfs form
+/// (`/compat/linux/proc/self/status`) — the latter happens when the engine's
+/// anti-cheat `realpath()`s the node first and then opens the resolved path, which
+/// otherwise slips past every `/proc`/`/sys` synth matcher below and reads the raw
+/// FreeBSD linprocfs (full of ZFS mounts, FreeBSD status fields, host map paths).
+/// Returns the `/proc…`/`/sys…` suffix in that case, else the path unchanged.
+static const char* strip_compat_prefix(const char* path) {
+    static const char kPfx[] = "/compat/linux";
+    const size_t kLen = sizeof(kPfx) - 1;
+    if (path && std::strncmp(path, kPfx, kLen) == 0 &&
+        (std::strncmp(path + kLen, "/proc", 5) == 0 ||
+         std::strncmp(path + kLen, "/sys", 4) == 0)) {
+        return path + kLen;
+    }
+    return path;
+}
+
 /// A synthetic Android `/proc/self/mounts`, served ONLY when `CORDIAL_FAKE_PROC`
 /// is set. The engine's anti-tamper reads `/proc/self/mounts` (confirmed by
 /// `CORDIAL_TRACE_PATHS`), and the real FreeBSD ZFS mount table -- `zroot/ROOT
@@ -330,6 +401,7 @@ static const char* synth_proc_content(const char* path) {
     if (std::getenv("CORDIAL_FAKE_PROC") == nullptr) {
         return nullptr;
     }
+    path = strip_compat_prefix(path);
     // The process cmdline. On Android a Roblox process's cmdline is its package
     // name, "com.roblox.client"; cordial's real cmdline is "cordial-run ...",
     // and the engine reads /proc/<pid>/cmdline (seen in CORDIAL_TRACE_PATHS as
@@ -465,6 +537,7 @@ static const char* synth_sys_content(const char* path) {
     if (path == nullptr || std::getenv("CORDIAL_FAKE_PROC") == nullptr) {
         return nullptr;
     }
+    path = strip_compat_prefix(path);
     if (std::strncmp(path, "/sys/devices/system/cpu/", 24) == 0) {
         if (std::strstr(path, "/cpufreq/") != nullptr) {
             if (std::strstr(path, "time_in_state") != nullptr) {
@@ -656,6 +729,132 @@ static int fd_from_bytes(const char* data, size_t len) {
     ::lseek(fd, 0, SEEK_SET);
     return fd;
 }
+
+/// Serve synthetic `/proc` or `/sys` content as a readable fd for ANY read-only
+/// open/openat that reaches a path we Android-ise — `open("/proc/self/maps")`,
+/// but also `openat(dirfd, "/proc/self/maps", …)` with a real dirfd, which the
+/// engine's anti-cheat uses and which otherwise skipped the synth and read the
+/// real linprocfs map (full of `/home/.cache`, `cordial-run`, `dconf` tells).
+/// `path` is the original request (pre-remap); `host_flags` are post-translation
+/// FreeBSD open flags. Returns a ready fd, or -1 to fall through to a real open.
+// Linux filesystem magics. A synthetic `/proc` or `/sys` fd is a plain regular
+// file (fd_from_bytes mkstemps one), so fstatfs() on it would report the host's
+// filesystem (ZFS) — and Roblox's anti-cheat opens `/proc/self/maps` with a RAW
+// openat and fstatfs()es the fd precisely to check it is really on procfs. A
+// mismatch reads as "/proc was replaced" -> tamper -> 304. Tag every synth fd
+// with the magic it must report, and answer fstatfs()/statfs() from the tag.
+#define CORDIAL_PROC_SUPER_MAGIC 0x9fa0UL
+#define CORDIAL_SYSFS_MAGIC      0x62656572UL
+
+static std::mutex g_synthfd_mu;
+static std::unordered_map<int, unsigned long>& synthfd_map() {
+    static std::unordered_map<int, unsigned long> m;
+    return m;
+}
+static void synthfd_tag(int fd, unsigned long magic) {
+    if (fd < 0) return;
+    std::lock_guard<std::mutex> lk(g_synthfd_mu);
+    synthfd_map()[fd] = magic;
+}
+static void synthfd_forget(int fd) {
+    if (fd < 0) return;
+    std::lock_guard<std::mutex> lk(g_synthfd_mu);
+    synthfd_map().erase(fd);
+}
+// 1 + *magic if `fd` is a tagged synth fd; 0 otherwise.
+extern "C" int cordial_synth_fd_magic(int fd, unsigned long* magic) {
+    std::lock_guard<std::mutex> lk(g_synthfd_mu);
+    auto it = synthfd_map().find(fd);
+    if (it == synthfd_map().end()) return 0;
+    if (magic) *magic = it->second;
+    return 1;
+}
+
+static int try_synth_fd(const char* path, int host_flags) {
+    if ((host_flags & (O_WRONLY | O_RDWR | O_CREAT)) != 0) {
+        return -1;
+    }
+    if (const char* synth = synth_proc_content(path)) {
+        int fd = fd_from_bytes(synth, std::strlen(synth));
+        synthfd_tag(fd, CORDIAL_PROC_SUPER_MAGIC);
+        return fd;
+    }
+    if (const char* ssynth = synth_sys_content(path)) {
+        int fd = fd_from_bytes(ssynth, std::strlen(ssynth));
+        synthfd_tag(fd, CORDIAL_SYSFS_MAGIC);
+        return fd;
+    }
+    if (std::getenv("CORDIAL_FAKE_PROC") != nullptr &&
+        std::strcmp(strip_compat_prefix(path), "/proc/self/maps") == 0) {
+        char _mb[PATH_MAX];
+        const char* mreal = remap(strip_compat_prefix(path), _mb, sizeof _mb);
+        std::string m = build_synth_maps(mreal ? mreal : path);
+        if (!m.empty()) {
+            int fd = fd_from_bytes(m.data(), m.size());
+            synthfd_tag(fd, CORDIAL_PROC_SUPER_MAGIC);
+            return fd;
+        }
+    }
+    return -1;
+}
+
+// Fill a bionic/Linux `struct statfs` (120 bytes) for a synth fd so the anti-cheat
+// sees procfs/sysfs, or for a real fd from the host statfs with an ext4 magic (a
+// genuine /data value, never ZFS). Shared by the libc `fstatfs`/`statfs` shims and
+// the raw-syscall trap so both paths agree.
+extern "C" int cordial_fill_linux_statfs(unsigned long magic, const struct ::statfs* host,
+                                         void* out120) {
+    unsigned long* o = static_cast<unsigned long*>(out120);
+    std::memset(o, 0, 120);
+    o[0]  = magic;                          // f_type
+    o[1]  = host ? host->f_bsize : 4096;    // f_bsize
+    o[2]  = host ? host->f_blocks : 0;      // f_blocks
+    o[3]  = host ? host->f_bfree : 0;       // f_bfree
+    o[4]  = host ? host->f_bavail : 0;      // f_bavail
+    o[5]  = host ? host->f_files : 0;       // f_files
+    o[6]  = host ? host->f_ffree : 0;       // f_ffree
+    // o[7] = f_fsid (left zero)
+    o[8]  = 255;                            // f_namelen
+    o[9]  = host ? host->f_bsize : 4096;    // f_frsize
+    o[10] = 0;                              // f_flags
+    return 0;
+}
+
+int s_fstatfs(int fd, void* out) {
+    unsigned long magic = 0;
+    if (cordial_synth_fd_magic(fd, &magic)) {
+        return cordial_fill_linux_statfs(magic, nullptr, out);
+    }
+    struct ::statfs host{};
+    if (::fstatfs(fd, &host) != 0) {
+        cordial_fbsd_errno_to_linux();
+        return -1;
+    }
+    return cordial_fill_linux_statfs(0xEF53UL, &host, out);  // EXT4_SUPER_MAGIC
+}
+
+int s_statfs(const char* path, void* out) {
+    const char* sp = strip_compat_prefix(path);
+    if (std::strncmp(sp, "/proc", 5) == 0)
+        return cordial_fill_linux_statfs(CORDIAL_PROC_SUPER_MAGIC, nullptr, out);
+    if (std::strncmp(sp, "/sys", 4) == 0)
+        return cordial_fill_linux_statfs(CORDIAL_SYSFS_MAGIC, nullptr, out);
+    char _b[PATH_MAX];
+    const char* real = remap(sp, _b, sizeof _b);
+    struct ::statfs host{};
+    if (::statfs(real ? real : path, &host) != 0) {
+        cordial_fbsd_errno_to_linux();
+        return -1;
+    }
+    return cordial_fill_linux_statfs(0xEF53UL, &host, out);
+}
+
+// Close shim: drop any synth-fd tag so a later reuse of the fd number does not
+// inherit a stale procfs/sysfs magic, then close for real.
+int s_close(int fd) {
+    synthfd_forget(fd);
+    return ::close(fd);
+}
 #endif
 
 FILE* s_fopen(const char* path, const char* mode) {
@@ -670,9 +869,9 @@ FILE* s_fopen(const char* path, const char* mode) {
         return ::fmemopen(const_cast<char*>(ssynth), std::strlen(ssynth), "r");
     }
     if (std::getenv("CORDIAL_FAKE_PROC") != nullptr &&
-        std::strcmp(path, "/proc/self/maps") == 0) {
+        std::strcmp(strip_compat_prefix(path), "/proc/self/maps") == 0) {
         char _mb[PATH_MAX];
-        const char* mreal = remap(path, _mb, sizeof _mb);
+        const char* mreal = remap(strip_compat_prefix(path), _mb, sizeof _mb);
         if (FILE* f = synth_maps(mreal ? mreal : path)) {
             trace("fopen", path, "synth-maps");
             return f;
@@ -721,33 +920,11 @@ int s_open(const char* path, int flags, ...) {
     // with open()+read() instead of fopen() otherwise gets the real FreeBSD
     // procfs here (full of /compat/linux, ~/.cache, cordial-run tells). Only the
     // read path is synthesised; a writing/creating open falls through.
-    if ((flags & (O_WRONLY | O_RDWR | O_CREAT)) == 0) {
-        if (const char* synth = synth_proc_content(path)) {
-            int sfd = fd_from_bytes(synth, std::strlen(synth));
-            if (sfd >= 0) {
-                trace_i("open", path, sfd);
-                return sfd;
-            }
-        }
-        if (const char* ssynth = synth_sys_content(path)) {
-            int sfd = fd_from_bytes(ssynth, std::strlen(ssynth));
-            if (sfd >= 0) {
-                trace_i("open", path, sfd);
-                return sfd;
-            }
-        }
-        if (std::getenv("CORDIAL_FAKE_PROC") != nullptr &&
-            std::strcmp(path, "/proc/self/maps") == 0) {
-            char _mb[PATH_MAX];
-            const char* mreal = remap(path, _mb, sizeof _mb);
-            std::string m = build_synth_maps(mreal ? mreal : path);
-            if (!m.empty()) {
-                int sfd = fd_from_bytes(m.data(), m.size());
-                if (sfd >= 0) {
-                    trace_i("open", path, sfd);
-                    return sfd;
-                }
-            }
+    {
+        int sfd = try_synth_fd(path, flags);
+        if (sfd >= 0) {
+            trace_i("open", path, sfd);
+            return sfd;
         }
     }
 #endif
@@ -849,14 +1026,25 @@ int s_openat(int dirfd, const char* path, int flags, ...) {
     if (dirfd == CORDIAL_AT_FDCWD) {
         return has_mode ? s_open(path, flags, mode) : s_open(path, flags);
     }
-    REMAP(path);
 #if defined(__FreeBSD__)
     int host_flags;
     if (cordial_fbsd_open_flags(flags, &host_flags) != 0) {
         return -1;
     }
     flags = host_flags;
+    // Serve synth /proc even with a real dirfd and an absolute path: the engine's
+    // anti-cheat reads /proc/self/maps via openat(dirfd, "/proc/self/maps", …),
+    // which never reached the AT_FDCWD→s_open synth above and so got the real
+    // host-leaking linprocfs map. Check the original (pre-remap) path.
+    {
+        int sfd = try_synth_fd(path, flags);
+        if (sfd >= 0) {
+            trace_i("openat", path, sfd);
+            return sfd;
+        }
+    }
 #endif
+    REMAP(path);
     int r = has_mode ? ::openat(dirfd, real, flags, mode) : ::openat(dirfd, real, flags);
     trace_i("openat", real, r);
     return r;
@@ -962,10 +1150,17 @@ extern "C" const CordialSystemSymbol* cordial_system_symbols(size_t* count) {
         {"faccessat", (void*)&s_faccessat},
         {"openat", (void*)&s_openat},
         {"opendir", (void*)&s_opendir},
+#if defined(__FreeBSD__)
+        {"readdir", (void*)&s_readdir},
+        {"closedir", (void*)&s_closedir},
+#endif
         {"realpath", (void*)&s_realpath},
         {"readlink", (void*)&s_readlink},
         {"fopen", (void*)&s_fopen},
         {"statvfs", (void*)&s_statvfs},
+        {"fstatfs", (void*)&s_fstatfs},
+        {"statfs", (void*)&s_statfs},
+        {"close", (void*)&s_close},
         {"open", (void*)&s_open},
     };
     *count = sizeof(table) / sizeof(table[0]);
