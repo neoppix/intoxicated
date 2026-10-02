@@ -55,25 +55,34 @@ makes any of the rest matter.
 ## Get it running
 
 This is a **build-from-source hobby port** on FreeBSD. It is tested on FreeBSD
-14.4-RELEASE with an NVIDIA GPU (RTX 40-series), native X11, and the linuxulator
-enabled for the engine's Linux-side graphics libraries.
+14.4-RELEASE with an NVIDIA GPU (RTX 40-series), native X11, and native Vulkan.
+
+Everything runs native: the `cordial-run` binary, the Vulkan/GLES graphics, the
+X11 input, and `libroblox.so` itself — loaded by cordial's own bionic linker as
+native FreeBSD code. **No linuxulator executes any Roblox code; no emulator, VM
+or Wine is involved.** The single Linux-compat dependency is `linprocfs`, a
+FreeBSD *kernel filesystem* that presents the kernel's own stats in Linux `/proc`
+format, because the engine reads `/proc/meminfo` and a few siblings. That is a
+mounted filesystem the engine reads from, not the Linux ABI running programs.
 
 **1. Prerequisites** (as root):
 
 ```sh
-# Rust toolchain + native X11 client libraries
-pkg install rust libX11 libXi libXinerama
+# Rust, native X11, native Vulkan loader
+pkg install rust libX11 libXi libXinerama vulkan-loader
 
-# Linux ABI compat, for the engine's Linux-side GL/Vulkan libraries
-pkg install linux_base-rl9 linux-nvidia-libs    # NVIDIA; use the mesa variant for AMD/Intel
-sysrc linux_enable="YES"
-sysrc kld_list+="linux64 nvidia-modeset"
-service linux start && kldload linux64 nvidia-modeset
+# Native GPU driver (this is what provides the real Vulkan ICD)
+pkg install nvidia-driver          # NVIDIA; use the Mesa drivers for AMD/Intel
+sysrc kld_list+="nvidia-modeset" && kldload nvidia-modeset
+
+# linprocfs: Linux-format /proc the engine reads. The filesystem only, not the
+# linuxulator ABI.
+kldload linprocfs
+mkdir -p /compat/linux/proc
+mount -t linprocfs linproc /compat/linux/proc    # add to /etc/fstab to persist
 ```
 
-You also need a working **native FreeBSD Vulkan** setup for `cordial-run` itself
-(the `nvidia-driver` package and `nvidia-modeset` kld on NVIDIA, Mesa on
-AMD/Intel) and an X11 session.
+You also need a running X11 session.
 
 **2. Build:**
 
