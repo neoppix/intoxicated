@@ -34,6 +34,9 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#if defined(__FreeBSD__)
+#include <sys/sysctl.h>
+#endif
 #include <memory>
 #include <map>
 #include <mutex>
@@ -393,6 +396,21 @@ static std::string build_user_agent() {
         }
         fclose(f);
     }
+#if defined(__FreeBSD__)
+    // Fall back to the real installed RAM when `/proc/meminfo` gave nothing. On
+    // FreeBSD that read can miss (no linprocfs mount, or it runs before the
+    // synthetic `/proc` is wired), and a `0MB` User-Agent tells Roblox's asset
+    // service this is the lowest-end device there is -- which serves bottom-tier
+    // textures and meshes. `hw.physmem` is the authoritative number and is
+    // always available.
+    if (ram_mb <= 0) {
+        unsigned long physmem = 0;
+        size_t len = sizeof physmem;
+        if (sysctlbyname("hw.physmem", &physmem, &len, nullptr, 0) == 0 && physmem > 0) {
+            ram_mb = static_cast<long>(physmem / (1024UL * 1024UL));
+        }
+    }
+#endif
 
     // The engine build is four parts (2.730.0.790); the app version the real
     // client puts in its User-Agent is three (2.732.1043 for engine

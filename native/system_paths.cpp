@@ -44,6 +44,9 @@
 #include <sys/mount.h>
 #include <cstdint>
 #include <unistd.h>
+#if defined(__FreeBSD__)
+#include <sys/sysctl.h>
+#endif
 
 namespace {
 
@@ -511,6 +514,107 @@ static const char* synth_proc_content(const char* path) {
             status_filled = true;
         }
         return status_buf;
+    }
+    // /proc/meminfo. The engine sizes memory from `MemTotal` (its allocator
+    // arenas and the texture-streaming budget) and `build_user_agent` reports it
+    // as the device's RAM. linprocfs would answer this; synthesising it from
+    // `hw.physmem` is what lets the port need no `/compat/linux` mount at all,
+    // and it fixes the `0MB` the User-Agent reported when the linprocfs read was
+    // missed. Real numbers, filled once: installed RAM does not change mid-run.
+    if (std::strcmp(path, "/proc/meminfo") == 0) {
+        static char meminfo_buf[512];
+        static bool meminfo_filled = false;
+        if (!meminfo_filled) {
+            unsigned long physmem = 0;
+            size_t len = sizeof physmem;
+            if (sysctlbyname("hw.physmem", &physmem, &len, nullptr, 0) != 0) {
+                physmem = 0;
+            }
+            long pagesize = sysconf(_SC_PAGESIZE);
+            if (pagesize <= 0) {
+                pagesize = 4096;
+            }
+            unsigned int free_pages = 0;
+            len = sizeof free_pages;
+            sysctlbyname("vm.stats.vm.v_free_count", &free_pages, &len, nullptr, 0);
+            unsigned int inactive_pages = 0;
+            len = sizeof inactive_pages;
+            sysctlbyname("vm.stats.vm.v_inactive_count", &inactive_pages, &len, nullptr, 0);
+            long total_kb = static_cast<long>(physmem / 1024);
+            long free_kb =
+                static_cast<long>(static_cast<unsigned long>(free_pages) *
+                                  static_cast<unsigned long>(pagesize) / 1024);
+            long cached_kb =
+                static_cast<long>(static_cast<unsigned long>(inactive_pages) *
+                                  static_cast<unsigned long>(pagesize) / 1024);
+            // Linux "available" counts reclaimable (here, inactive) pages too.
+            long avail_kb = free_kb + cached_kb;
+            if (total_kb > 0 && avail_kb > total_kb) {
+                avail_kb = total_kb;
+            }
+            std::snprintf(meminfo_buf, sizeof meminfo_buf,
+                "MemTotal:       %ld kB\n"
+                "MemFree:        %ld kB\n"
+                "MemAvailable:   %ld kB\n"
+                "Buffers:        0 kB\n"
+                "Cached:         %ld kB\n"
+                "SwapCached:     0 kB\n"
+                "SwapTotal:      0 kB\n"
+                "SwapFree:       0 kB\n",
+                total_kb, free_kb, avail_kb, cached_kb);
+            meminfo_filled = true;
+        }
+        return meminfo_buf;
+    }
+    // /proc/cpuinfo. The engine counts `processor` blocks to size its worker
+    // pool and reads the flags line; real codepath feature selection is CPUID,
+    // not this text, so a baseline x86-64 flag set is safe. One block per
+    // `hw.ncpu`, model and vendor from `hw.model`. Filled once.
+    if (std::strcmp(path, "/proc/cpuinfo") == 0) {
+        static std::string cpuinfo;
+        static bool cpuinfo_filled = false;
+        if (!cpuinfo_filled) {
+            int ncpu = 0;
+            size_t len = sizeof ncpu;
+            if (sysctlbyname("hw.ncpu", &ncpu, &len, nullptr, 0) != 0 || ncpu <= 0) {
+                ncpu = 1;
+            }
+            char model[256] = "x86_64 Processor";
+            len = sizeof model;
+            sysctlbyname("hw.model", model, &len, nullptr, 0);
+            int mhz = 0;
+            len = sizeof mhz;
+            sysctlbyname("hw.clockrate", &mhz, &len, nullptr, 0);
+            const char* vendor = std::strstr(model, "AMD") ? "AuthenticAMD"
+                                                           : "GenuineIntel";
+            for (int i = 0; i < ncpu; ++i) {
+                char block[1024];
+                std::snprintf(block, sizeof block,
+                    "processor\t: %d\n"
+                    "vendor_id\t: %s\n"
+                    "cpu family\t: 6\n"
+                    "model\t\t: 1\n"
+                    "model name\t: %s\n"
+                    "stepping\t: 0\n"
+                    "cpu MHz\t\t: %d.000\n"
+                    "cache size\t: 1024 KB\n"
+                    "physical id\t: 0\n"
+                    "siblings\t: %d\n"
+                    "core id\t\t: %d\n"
+                    "cpu cores\t: %d\n"
+                    "fpu\t\t: yes\n"
+                    "flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr "
+                    "pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ss ht "
+                    "syscall nx lm constant_tsc rep_good nopl pni pclmulqdq "
+                    "ssse3 fma cx16 sse4_1 sse4_2 movbe popcnt aes xsave avx "
+                    "f16c rdrand lahf_lm abm bmi1 avx2 bmi2 rdseed adx "
+                    "clflushopt\n\n",
+                    i, vendor, model, mhz, ncpu, i, ncpu);
+                cpuinfo += block;
+            }
+            cpuinfo_filled = true;
+        }
+        return cpuinfo.c_str();
     }
     return nullptr;
 }
