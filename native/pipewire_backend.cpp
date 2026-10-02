@@ -152,13 +152,25 @@ bool load_library() {
         {"pw_stream_update_params", reinterpret_cast<void**>(&g_lib.stream_update_params)},
         {"pw_proxy_destroy", reinterpret_cast<void**>(&g_lib.proxy_destroy)},
     };
+    // pipewire 1.6 renamed the two library-global entry points: `pw_init` ->
+    // `pipewire_init`, `pw_deinit` -> `pipewire_deinit` (every other symbol keeps
+    // its `pw_` prefix). Fall back to the new names so a modern libpipewire is
+    // not written off as "missing pw_init"; the error that spelled out was a real
+    // one on a host that has pipewire 1.6 and no pulse. Everything else is
+    // required under its only name.
+    auto resolve = [&](const char* name) -> void* {
+        if (void* p = dlsym(handle, name)) return p;
+        if (std::strcmp(name, "pw_init") == 0) return dlsym(handle, "pipewire_init");
+        if (std::strcmp(name, "pw_deinit") == 0) return dlsym(handle, "pipewire_deinit");
+        return nullptr;
+    };
     for (const Entry& e : entries) {
-        *e.slot = dlsym(handle, e.name);
+        *e.slot = resolve(e.name);
         if (!*e.slot) {
             std::fprintf(stderr,
-                "E/Cordial-Audio           libpipewire-0.3 is missing '%s'; treating the "
-                "whole library as unusable rather than calling through a null pointer. "
-                "No audio output.\n", e.name);
+                "E/Cordial-Audio           libpipewire-0.3 is missing '%s' (tried the "
+                "pipewire 1.6 name too); treating the whole library as unusable rather "
+                "than calling through a null pointer. No audio output.\n", e.name);
             dlclose(handle);
             return false;
         }
