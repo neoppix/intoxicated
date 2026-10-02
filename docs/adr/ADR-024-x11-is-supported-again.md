@@ -116,3 +116,36 @@ If X11 users disappear, or if XWayland becomes good enough that a Wayland-only
 Cordial serves them, this reverts to ADR-011 and `window.rs` goes. The trigger
 that would justify that is evidence about users, since that is the evidence that
 justified reversing it — not an appeal to how much simpler one backend is.
+
+## Addendum, 2026-10-02: X11 edits text and has a clipboard before it has the editor
+
+The editor widget has not come to X11, and this does not bring it. It closes the
+part of the gap that needs no widget: Ctrl+A/C/X/V, Shift+arrows and a host
+clipboard, which on X11 had all silently done nothing.
+
+**The selection lives in `input.rs`'s shared `TextField`, not in `window.rs`.**
+"Two backends may not mean two editors" above is the reason. Wayland never sets
+the anchor, because its `gtk::Text` owns selection, so its behaviour is
+unchanged; when the editor does come to X11, the X11 key path stops editing the
+buffer exactly as Wayland's did and the anchor goes unused there too.
+
+**The clipboard is ICCCM on `window.rs`'s own Xlib connection
+(`android/x11_clipboard.rs`), not GDK.** GDK would mean initialising GTK on X11
+for its clipboard alone: a second display connection and a second main loop,
+which is a large part of the cost this document lists for the editor, paid for a
+handful of requests. Only Xlib and `poll(2)` are used, because one X11 user runs
+a native FreeBSD build. A paste waits up to the same 400 ms the GDK path does,
+by non-blocking checks for the one `SelectionNotify` that leave every other
+event queued in order; making it asynchronous would let keys typed after Ctrl+V
+land before the paste.
+
+**What it deliberately does not do.** Copy with nothing selected leaves the
+clipboard alone rather than copying the whole box (GTK's behaviour, and
+replacing what somebody had copied with a field they never selected destroys
+it); copy and cut refuse a masked box, where GTK would copy mask characters.
+No PRIMARY selection, no `INCR` and no `MULTIPLE`: a transfer is capped at 64 KiB
+by `clipboard.rs`, which fits one request on any server.
+
+**Still true:** nothing on X11 draws the focused box's text, so a selection is as
+invisible as the text it selects, and `tools/text-input-e2e.py` has still not
+run on X11. This backend remains unsupported by the standard this document sets.

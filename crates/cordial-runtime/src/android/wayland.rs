@@ -2323,7 +2323,7 @@ impl WaylandWindow {
             // Slot 10 is `textInputType`, named on 2026-09-04; the three
             // values are the ones observed on boxes that masked their text.
             // Roblox's own enum, not Android's `InputType` -- see the field.
-            password: matches!(info.text_input_type, 5 | 9 | 10),
+            password: super::input::is_masked_input_type(info.text_input_type),
             // Passed through and, for now, only *reported*. See `TextOverlay`.
             multiline: info.multiline != 0,
             // Only the placed bar draws its own chrome. An editor held at the

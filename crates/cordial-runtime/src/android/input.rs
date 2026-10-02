@@ -2249,6 +2249,64 @@ pub fn is_paste_shortcut(keysym: c_ulong, meta: i32) -> bool {
     ctrl_only && (keysym == 'v' as c_ulong || keysym == 'V' as c_ulong)
 }
 
+/// A text-editing shortcut a field without its own editor widget has to
+/// implement itself. The X11 path is that field (ADR-024): on Wayland a real
+/// `gtk::Text` binds all of these through GTK's own key bindings.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TextShortcut {
+    SelectAll,
+    Copy,
+    Cut,
+    Paste,
+}
+
+/// Which [`TextShortcut`] this key press is, if any.
+///
+/// The set GTK binds on a `gtk::Text`, so the two backends agree: Ctrl+A/C/X/V
+/// and the older Ctrl+Insert, Shift+Insert and Shift+Delete that X11 users
+/// still reach for. Ctrl with Shift or Alt is none of them -- the same line
+/// [`is_paste_shortcut`] draws, for the same reasons. Letters are matched by
+/// keysym, so they follow the layout, and in either case, so Caps Lock does not
+/// turn them off.
+pub fn text_shortcut(keysym: c_ulong, meta: i32) -> Option<TextShortcut> {
+    const XK_INSERT: c_ulong = 0xff63;
+    const XK_DELETE: c_ulong = 0xffff;
+    let ctrl = meta & META_CTRL_ON != 0;
+    let shift = meta & META_SHIFT_ON != 0;
+    let alt = meta & META_ALT_ON != 0;
+    if alt {
+        return None;
+    }
+    let letter = char::from_u32(keysym as u32).map(|c| c.to_ascii_lowercase());
+    match (ctrl, shift, keysym, letter) {
+        (true, false, _, Some('a')) => Some(TextShortcut::SelectAll),
+        (true, false, _, Some('c')) => Some(TextShortcut::Copy),
+        (true, false, _, Some('x')) => Some(TextShortcut::Cut),
+        (true, false, _, Some('v')) => Some(TextShortcut::Paste),
+        (true, false, XK_INSERT, _) => Some(TextShortcut::Copy),
+        (false, true, XK_INSERT, _) => Some(TextShortcut::Paste),
+        (false, true, XK_DELETE, _) => Some(TextShortcut::Cut),
+        _ => None,
+    }
+}
+
+/// Whether Roblox's own `textInputType` (slot 10 of `NativeTextBoxInfo`) is
+/// one of the values observed on boxes that mask their text. Shared with the
+/// Wayland overlay, which hides the editor's characters on the same test.
+pub fn is_masked_input_type(text_input_type: i32) -> bool {
+    matches!(text_input_type, 5 | 9 | 10)
+}
+
+/// Tell the engine a field's new state through every call a keystroke makes:
+/// GameTextInput's state (with the selection, when there is one), Roblox's own
+/// `syncTextboxTextAndCursorPosition2`, and a redraw.
+pub fn deliver_field_state(handle: i64, which: i64, state: &FieldState) {
+    let (start, end) = state.game_text_input_span();
+    let _ = cordial_linker_sys::game_activity::text_input(handle, &state.text, start, end);
+    pass_text(which, &state.text, state.caret);
+    deliver_surface_redraw(handle);
+}
+
 // ------------------------------------------------------------------ text entry
 
 static TEXT_BUFFER: Mutex<TextField> = Mutex::new(TextField::new());
@@ -2270,14 +2328,61 @@ static TEXT_BUFFER: Mutex<TextField> = Mutex::new(TextField::new());
 /// committed text and caret movements (`Edit`), which is exactly the vocabulary
 /// `zwp_text_input_v3` hands over on Wayland and `XLookupString` approximates
 /// on X11. Neither backend needs its own copy.
+///
+/// `anchor` is the other end of a selection, and only the X11 path ever sets
+/// it. On Wayland a real `gtk::Text` owns selection along with everything
+/// else, so this buffer is a mirror there and never holds one; on X11 there is
+/// no widget (ADR-024), so without it Ctrl+A, Shift+arrows and Ctrl+C/X had
+/// nothing to act on and did nothing at all. `None` and `Some(caret)` mean the
+/// same thing -- no selection -- and [`TextField::selection`] treats them so.
 struct TextField {
     text: String,
     caret: usize,
+    anchor: Option<usize>,
 }
 
 impl TextField {
     const fn new() -> Self {
-        TextField { text: String::new(), caret: 0 }
+        TextField { text: String::new(), caret: 0, anchor: None }
+    }
+
+    /// Byte offset of a character index, for slicing.
+    fn byte_at(&self, chars: usize) -> usize {
+        self.text.char_indices().nth(chars).map(|(i, _)| i).unwrap_or(self.text.len())
+    }
+
+    /// The selected range as `(start, end)` in characters, ordered, or `None`
+    /// when nothing is selected.
+    fn selection(&self) -> Option<(usize, usize)> {
+        let a = self.anchor?;
+        (a != self.caret).then(|| (a.min(self.caret), a.max(self.caret)))
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection()?;
+        Some(self.text[self.byte_at(start)..self.byte_at(end)].to_owned())
+    }
+
+    /// Remove the selected text and leave the caret where it began. False when
+    /// nothing was selected.
+    fn delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection() else {
+            self.anchor = None;
+            return false;
+        };
+        let (from, to) = (self.byte_at(start), self.byte_at(end));
+        self.text.replace_range(from..to, "");
+        self.caret = start;
+        self.anchor = None;
+        true
+    }
+
+    fn select_all(&mut self) -> bool {
+        let len = self.len_chars();
+        let changed = self.selection() != (len > 0).then_some((0, len));
+        self.anchor = Some(0);
+        self.caret = len;
+        changed
     }
 
     /// Byte offset of the caret, for slicing.
@@ -2295,6 +2400,7 @@ impl TextField {
 
     fn seed(&mut self, text: String) {
         self.caret = text.chars().count();
+        self.anchor = None;
         self.text = text;
     }
 
@@ -2310,10 +2416,15 @@ impl TextField {
         if self.caret > len {
             self.caret = len;
         }
+        self.anchor = None;
         self.text = text;
     }
 
+    /// Insert at the caret, replacing the selection if there is one -- which
+    /// is what makes select-all followed by typing overtype the field rather
+    /// than append to it.
     fn insert(&mut self, s: &str) {
+        self.delete_selection();
         let at = self.byte_offset();
         self.text.insert_str(at, s);
         self.caret += s.chars().count();
@@ -2322,6 +2433,9 @@ impl TextField {
     /// Delete the character before the caret. False when there is nothing to
     /// delete, so the caller can avoid sending an unchanged state.
     fn backspace(&mut self) -> bool {
+        if self.delete_selection() {
+            return true;
+        }
         if self.caret == 0 {
             return false;
         }
@@ -2335,6 +2449,9 @@ impl TextField {
     /// backspace. Without it, correcting a typo means deleting everything after
     /// it too.
     fn delete(&mut self) -> bool {
+        if self.delete_selection() {
+            return true;
+        }
         if self.caret >= self.len_chars() {
             return false;
         }
@@ -2345,7 +2462,22 @@ impl TextField {
 
     /// Move the caret. Returns whether it moved, so a Left at position zero
     /// does not resend identical state.
+    ///
+    /// With a selection, Left and Right collapse it to the end they point at
+    /// rather than stepping from the caret, which is what every desktop text
+    /// field does and what a person pressing Left on a selected word expects.
     fn move_caret(&mut self, to: Caret) -> bool {
+        if let Some((start, end)) = self.selection() {
+            self.anchor = None;
+            self.caret = match to {
+                Caret::Left => start,
+                Caret::Right => end,
+                Caret::Home => 0,
+                Caret::End => self.len_chars(),
+            };
+            return true;
+        }
+        self.anchor = None;
         let before = self.caret;
         self.caret = match to {
             Caret::Left => self.caret.saturating_sub(1),
@@ -2353,6 +2485,23 @@ impl TextField {
             Caret::Home => 0,
             Caret::End => self.len_chars(),
         };
+        self.caret != before
+    }
+
+    /// Shift+arrow: move the caret and keep the anchor where it was, starting
+    /// a selection if there was none.
+    fn extend_selection(&mut self, to: Caret) -> bool {
+        let anchor = *self.anchor.get_or_insert(self.caret);
+        let before = self.caret;
+        self.caret = match to {
+            Caret::Left => self.caret.saturating_sub(1),
+            Caret::Right => (self.caret + 1).min(self.len_chars()),
+            Caret::Home => 0,
+            Caret::End => self.len_chars(),
+        };
+        if self.caret == anchor {
+            self.anchor = None;
+        }
         self.caret != before
     }
 
@@ -2367,6 +2516,10 @@ impl TextField {
     /// at or before the requested byte offset, which only ever deletes less
     /// than asked, never more and never a partial codepoint.
     fn delete_surrounding(&mut self, before: usize, after: usize) -> bool {
+        // Byte counts relative to the caret have no sensible meaning against
+        // a selection, and only an input method sends this; it never arrives
+        // on X11, which is the only path that makes one.
+        self.anchor = None;
         let caret_byte = self.byte_offset();
 
         let start = if before == 0 {
@@ -2428,7 +2581,15 @@ pub enum Edit<'a> {
     Insert(&'a str),
     Backspace,
     Delete,
+    /// Move the caret, collapsing any selection.
     Move(Caret),
+    /// Shift+arrow: move the caret and grow or shrink the selection.
+    Extend(Caret),
+    /// Ctrl+A.
+    SelectAll,
+    /// Remove the selection and nothing else -- the second half of a cut,
+    /// applied only once the first half (the copy) has succeeded.
+    DeleteSelection,
     /// `zwp_text_input_v3.delete_surrounding_text` — byte counts, not chars.
     /// See [`TextField::delete_surrounding`] for why that distinction is
     /// handled inside the buffer rather than by the caller pre-converting.
@@ -2503,10 +2664,68 @@ fn reseed_if_needed(buf: &mut TextField) {
 /// resending identical state on every arrow key at the end of a field makes the
 /// engine redraw for no reason.
 pub fn edit_text_buffer(edit: Edit<'_>) -> Option<(String, i32)> {
+    edit_text_field(edit).map(|state| (state.text, state.caret))
+}
+
+/// A field's state after an edit, with the selection the plain
+/// `(contents, caret)` pair of [`edit_text_buffer`] leaves out.
+pub struct FieldState {
+    pub text: String,
+    pub caret: i32,
+    /// `(anchor, caret)` in characters when something is selected, in Android's
+    /// order rather than sorted: `Selection.getSelectionStart` is the anchor
+    /// and `getSelectionEnd` the caret, so the end is where typing goes. That
+    /// is the same reading [`reseed_if_needed`] already takes of the engine's
+    /// own `selectionEnd`. `None` means the selection is collapsed at `caret`.
+    pub selection: Option<(i32, i32)>,
+}
+
+impl FieldState {
+    /// The `(start, end)` pair GameTextInput's state wants: the selection when
+    /// there is one, the caret twice when there is not.
+    pub fn game_text_input_span(&self) -> (i32, i32) {
+        self.selection.unwrap_or((self.caret, self.caret))
+    }
+}
+
+/// [`edit_text_buffer`], returning the selection as well. The X11 path uses
+/// this so that GameTextInput is told the range a Ctrl+A or Shift+arrow made;
+/// the Wayland path does not need it, because its buffer never holds one.
+pub fn edit_text_field(edit: Edit<'_>) -> Option<FieldState> {
     let mut buf = TEXT_BUFFER.lock().unwrap_or_else(|e| e.into_inner());
     reseed_if_needed(&mut buf);
+    let changed = apply_edit(&mut buf, edit);
+    changed.then(|| {
+        TEXT_REVISION.fetch_add(1, Ordering::Relaxed);
+        field_state(&buf)
+    })
+}
 
-    let changed = match edit {
+fn field_state(buf: &TextField) -> FieldState {
+    FieldState {
+        text: buf.text.clone(),
+        caret: buf.caret as i32,
+        selection: buf
+            .anchor
+            .filter(|&a| a != buf.caret)
+            .map(|a| (a as i32, buf.caret as i32)),
+    }
+}
+
+/// The focused field's selected text, or `None` when nothing is selected.
+/// Reseeds first, as an edit would: a selection made in a box that has since
+/// lost focus is not one.
+pub fn text_buffer_selected_text() -> Option<String> {
+    let mut buf = TEXT_BUFFER.lock().unwrap_or_else(|e| e.into_inner());
+    reseed_if_needed(&mut buf);
+    buf.selected_text()
+}
+
+/// One edit against one field, and whether it changed anything. Separate from
+/// the global buffer so the whole vocabulary can be tested on a throwaway
+/// [`TextField`].
+fn apply_edit(buf: &mut TextField, edit: Edit<'_>) -> bool {
+    match edit {
         Edit::Insert(s) => {
             // Control characters are not text. A field receives what a person
             // typed, not every key they pressed.
@@ -2520,15 +2739,13 @@ pub fn edit_text_buffer(edit: Edit<'_>) -> Option<(String, i32)> {
         Edit::Backspace => buf.backspace(),
         Edit::Delete => buf.delete(),
         Edit::Move(to) => buf.move_caret(to),
+        Edit::Extend(to) => buf.extend_selection(to),
+        Edit::SelectAll => buf.select_all(),
+        Edit::DeleteSelection => buf.delete_selection(),
         Edit::DeleteSurrounding { before_bytes, after_bytes } => {
             buf.delete_surrounding(before_bytes, after_bytes)
         }
-    };
-
-    changed.then(|| {
-        TEXT_REVISION.fetch_add(1, Ordering::Relaxed);
-        (buf.text.clone(), buf.caret as i32)
-    })
+    }
 }
 
 /// Cheap invalidation key for consumers which only need a fresh snapshot
@@ -2591,6 +2808,7 @@ pub fn adopt_editor_text(text: &str, caret: i32) {
     }
     buf.text = text.to_owned();
     buf.caret = caret;
+    buf.anchor = None;
     *TEXT_GENERATION.lock().unwrap_or_else(|e| e.into_inner()) =
         Some(cordial_linker_sys::game_activity::textbox_generation());
     TEXT_REVISION.fetch_add(1, Ordering::Relaxed);
@@ -2801,6 +3019,141 @@ mod tests {
         // the behaviour it has always had rather than throttling itself.
         assert!(keepalive_wanted(Visible, None, None));
         assert!(keepalive_wanted(Unfocused, None, None));
+    }
+
+    #[test]
+    fn the_editing_shortcuts_are_the_ones_gtk_binds() {
+        use TextShortcut::*;
+        assert_eq!(text_shortcut('a' as c_ulong, META_CTRL_ON), Some(SelectAll));
+        assert_eq!(text_shortcut('A' as c_ulong, META_CTRL_ON | META_CAPS_LOCK_ON), Some(SelectAll));
+        assert_eq!(text_shortcut('c' as c_ulong, META_CTRL_ON), Some(Copy));
+        assert_eq!(text_shortcut('x' as c_ulong, META_CTRL_ON), Some(Cut));
+        assert_eq!(text_shortcut('v' as c_ulong, META_CTRL_ON), Some(Paste));
+        assert_eq!(text_shortcut(0xff63, META_CTRL_ON), Some(Copy));
+        assert_eq!(text_shortcut(0xff63, META_SHIFT_ON), Some(Paste));
+        assert_eq!(text_shortcut(0xffff, META_SHIFT_ON), Some(Cut));
+        // Not these: a plain letter, Ctrl+Shift, Alt, plain Delete/Insert.
+        assert_eq!(text_shortcut('a' as c_ulong, 0), None);
+        assert_eq!(text_shortcut('v' as c_ulong, META_CTRL_ON | META_SHIFT_ON), None);
+        assert_eq!(text_shortcut('c' as c_ulong, META_CTRL_ON | META_ALT_ON), None);
+        assert_eq!(text_shortcut(0xffff, 0), None);
+        assert_eq!(text_shortcut(0xff63, 0), None);
+        assert_eq!(text_shortcut('z' as c_ulong, META_CTRL_ON), None);
+    }
+
+    fn field(text: &str, caret: usize) -> TextField {
+        let mut f = TextField::new();
+        f.seed_with_caret(text.to_owned(), caret as i32);
+        f
+    }
+
+    #[test]
+    fn select_all_then_typing_overtypes() {
+        let mut f = field("hello", 2);
+        assert!(apply_edit(&mut f, Edit::SelectAll));
+        assert_eq!(f.selected_text().as_deref(), Some("hello"));
+        // Selecting what is already selected changes nothing.
+        assert!(!apply_edit(&mut f, Edit::SelectAll));
+        assert!(apply_edit(&mut f, Edit::Insert("é")));
+        assert_eq!((f.text.as_str(), f.caret, f.selection()), ("é", 1, None));
+    }
+
+    #[test]
+    fn select_all_in_an_empty_field_selects_nothing() {
+        let mut f = field("", 0);
+        assert!(!apply_edit(&mut f, Edit::SelectAll));
+        assert_eq!(f.selected_text(), None);
+    }
+
+    #[test]
+    fn backspace_and_delete_remove_the_selection_only() {
+        let mut f = field("abcdef", 1);
+        apply_edit(&mut f, Edit::Extend(Caret::Right));
+        apply_edit(&mut f, Edit::Extend(Caret::Right));
+        assert_eq!(f.selected_text().as_deref(), Some("bc"));
+        assert!(apply_edit(&mut f, Edit::Backspace));
+        assert_eq!((f.text.as_str(), f.caret), ("adef", 1));
+
+        let mut f = field("abcdef", 4);
+        apply_edit(&mut f, Edit::Extend(Caret::Left));
+        assert!(apply_edit(&mut f, Edit::Delete));
+        assert_eq!((f.text.as_str(), f.caret), ("abcef", 3));
+    }
+
+    #[test]
+    fn shift_home_and_end_extend_from_the_anchor() {
+        let mut f = field("hello world", 5);
+        apply_edit(&mut f, Edit::Extend(Caret::End));
+        assert_eq!(f.selected_text().as_deref(), Some(" world"));
+        // The anchor stays at 5, so Shift+Home now selects the other side.
+        apply_edit(&mut f, Edit::Extend(Caret::Home));
+        assert_eq!(f.selected_text().as_deref(), Some("hello"));
+        assert_eq!(field_state(&f).selection, Some((5, 0)));
+    }
+
+    #[test]
+    fn extending_back_onto_the_anchor_clears_the_selection() {
+        let mut f = field("abc", 1);
+        apply_edit(&mut f, Edit::Extend(Caret::Right));
+        apply_edit(&mut f, Edit::Extend(Caret::Left));
+        assert_eq!(f.selection(), None);
+        assert_eq!(field_state(&f).game_text_input_span(), (1, 1));
+    }
+
+    #[test]
+    fn an_arrow_collapses_a_selection_to_the_end_it_points_at() {
+        let mut f = field("abcdef", 2);
+        apply_edit(&mut f, Edit::Extend(Caret::Right));
+        apply_edit(&mut f, Edit::Extend(Caret::Right));
+        assert!(apply_edit(&mut f, Edit::Move(Caret::Left)));
+        assert_eq!((f.caret, f.selection()), (2, None));
+
+        let mut f = field("abcdef", 4);
+        apply_edit(&mut f, Edit::Extend(Caret::Left));
+        assert!(apply_edit(&mut f, Edit::Move(Caret::Right)));
+        assert_eq!((f.caret, f.selection()), (4, None));
+    }
+
+    #[test]
+    fn delete_selection_is_a_no_op_without_one() {
+        let mut f = field("abc", 1);
+        assert!(!apply_edit(&mut f, Edit::DeleteSelection));
+        apply_edit(&mut f, Edit::SelectAll);
+        assert!(apply_edit(&mut f, Edit::DeleteSelection));
+        assert_eq!((f.text.as_str(), f.caret), ("", 0));
+    }
+
+    /// The selection is in characters, so a multi-byte character inside it
+    /// must neither panic the slicing nor be cut in half.
+    #[test]
+    fn selections_count_characters_not_bytes() {
+        let mut f = field("añb✓c", 1);
+        apply_edit(&mut f, Edit::Extend(Caret::Right));
+        apply_edit(&mut f, Edit::Extend(Caret::Right));
+        apply_edit(&mut f, Edit::Extend(Caret::Right));
+        assert_eq!(f.selected_text().as_deref(), Some("ñb✓"));
+        apply_edit(&mut f, Edit::Insert("-"));
+        assert_eq!((f.text.as_str(), f.caret), ("a-c", 2));
+    }
+
+    #[test]
+    fn a_reseed_drops_the_selection() {
+        let mut f = field("abc", 0);
+        apply_edit(&mut f, Edit::SelectAll);
+        f.seed("other".into());
+        assert_eq!(f.selection(), None);
+    }
+
+    /// GameTextInput is told the anchor first and the caret second, Android's
+    /// order, and the caret twice when nothing is selected.
+    #[test]
+    fn game_text_input_gets_the_selection_or_the_caret() {
+        let mut f = field("abcd", 3);
+        assert_eq!(field_state(&f).game_text_input_span(), (3, 3));
+        apply_edit(&mut f, Edit::Extend(Caret::Left));
+        apply_edit(&mut f, Edit::Extend(Caret::Left));
+        let s = field_state(&f);
+        assert_eq!((s.caret, s.game_text_input_span()), (1, (3, 1)));
     }
 
     #[test]

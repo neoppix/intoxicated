@@ -1908,6 +1908,7 @@ const BUTTON_RELEASE: c_int = 5;
 const EXPOSE: c_int = 12;
 const CONFIGURE_NOTIFY: c_int = 22;
 const CLIENT_MESSAGE: c_int = 33;
+use super::x11_clipboard::{SELECTION_CLEAR, SELECTION_REQUEST};
 
 /// `XConfigureEvent`. Another distinct layout: it carries the window's new
 /// geometry rather than a damaged rectangle.
@@ -1983,9 +1984,9 @@ fn android_meta_state(x11_state: c_uint) -> i32 {
 // why the keysym table in particular carries over unchanged: X11 keysyms and
 // XKB keysyms are the same numbering.
 use super::input::{
-    deliver_key, deliver_surface_redraw, deliver_mouse, edit_text_buffer, keysym_to_android,
-    pass_key_event, pass_mouse_button, pass_mouse_move, pass_text, report_keyboard_state, Caret,
-    Edit, ACTION_BUTTON_PRESS, ACTION_BUTTON_RELEASE, ACTION_DOWN, ACTION_HOVER_MOVE, ACTION_MOVE,
+    deliver_field_state, deliver_key, deliver_surface_redraw, deliver_mouse, edit_text_field,
+    keysym_to_android, pass_key_event, pass_mouse_button, pass_mouse_move, report_keyboard_state,
+    Caret, Edit, ACTION_BUTTON_PRESS, ACTION_BUTTON_RELEASE, ACTION_DOWN, ACTION_HOVER_MOVE, ACTION_MOVE,
     ACTION_UP, BUTTON_BACK, BUTTON_FORWARD, BUTTON_PRIMARY, BUTTON_SECONDARY, BUTTON_TERTIARY,
 };
 
@@ -2621,6 +2622,9 @@ impl HostWindow {
         // exactly what the login form did before this. Only on key-down: a
         // release would deliver the same state twice.
         if down {
+            // The timestamp ICCCM wants on a selection claim or conversion;
+            // see `x11_clipboard::USER_TIME`.
+            super::x11_clipboard::note_user_time(ev.time);
             // Only when the engine has told us a box is focused, via
             // `showKeyboard`. Sending text with no focused box means sending it
             // to handle 0, which is not a box — the engine drops it, silently,
@@ -2628,42 +2632,50 @@ impl HostWindow {
             let Some(which) = cordial_linker_sys::game_activity::focused_textbox() else {
                 return;
             };
-            // Ctrl+V, before anything reads the character.
+            // Ctrl+A/C/X/V, before anything reads the character.
             //
             // There is no engine call to look for here and that is correct
             // rather than missing: on Android the `EditText` over the GL
-            // surface handles the paste itself and the engine only ever sees
-            // text arrive through `gametextinput`. Cordial is that editor, so
-            // a paste is an insert through this same path — see
-            // `clipboard::paste_into_engine`, which does exactly what the loop
-            // below does with a typed character.
-            if super::input::is_paste_shortcut(keysym, meta) {
-                if let Err(e) = super::clipboard::paste_into_engine(handle) {
-                    super::trace(format_args!("clipboard paste failed: {e}"));
-                }
+            // surface handles these itself and the engine only ever sees text
+            // arrive through `gametextinput`. On Wayland a `gtk::Text` is that
+            // editor; on X11 there is none (ADR-024), so this is. Before it was
+            // here, `XLookupString`'s control characters for Ctrl+A and Ctrl+C
+            // reached `Edit::Insert`, which drops control characters, and the
+            // shortcuts did nothing at all.
+            //
+            // The key itself has already gone to the engine above, exactly as
+            // on Wayland: `pass_key_event` withholds the letter while a box is
+            // focused and forwards Ctrl as a modifier, and AGDK's
+            // `onKeyDownNative` hears both, on both backends.
+            if let Some(shortcut) = super::input::text_shortcut(keysym, meta) {
+                super::clipboard::run_text_shortcut(handle, which, shortcut);
                 return;
             }
             let typed = typed_text;
             // Editing keys, before text: an IME consumes these itself rather
             // than committing them, and `XLookupString` reports nothing for
-            // them anyway. Keysyms from keysymdef.h.
-            let edit = match keysym {
-                0xff08 => Edit::Backspace,           // XK_BackSpace
-                0xffff => Edit::Delete,              // XK_Delete
-                0xff51 => Edit::Move(Caret::Left),   // XK_Left
-                0xff53 => Edit::Move(Caret::Right),  // XK_Right
-                0xff50 => Edit::Move(Caret::Home),   // XK_Home
-                0xff57 => Edit::Move(Caret::End),    // XK_End
+            // them anyway. Keysyms from keysymdef.h. Shift turns a caret move
+            // into a selection, as in any desktop field.
+            let caret_key = match keysym {
+                0xff51 => Some(Caret::Left),  // XK_Left
+                0xff53 => Some(Caret::Right), // XK_Right
+                0xff50 => Some(Caret::Home),  // XK_Home
+                0xff57 => Some(Caret::End),   // XK_End
+                _ => None,
+            };
+            let extend = meta & META_SHIFT_ON != 0;
+            let edit = match (keysym, caret_key) {
+                (_, Some(to)) if extend => Edit::Extend(to),
+                (_, Some(to)) => Edit::Move(to),
+                (0xff08, _) => Edit::Backspace, // XK_BackSpace
+                (0xffff, _) => Edit::Delete,    // XK_Delete
                 _ => Edit::Insert(typed),
             };
-            if let Some((contents, caret)) = edit_text_buffer(edit) {
+            if let Some(state) = edit_text_field(edit) {
                 // AGDK's GameTextInput path, and Roblox's own. Both are driven
                 // for the same reason as the mouse: the first is the documented
                 // contract, the second is what the interface reads.
-                let _ =
-                    cordial_linker_sys::game_activity::text_input(handle, &contents, caret, caret);
-                pass_text(which, &contents, caret);
-                deliver_surface_redraw(handle);
+                deliver_field_state(handle, which, &state);
             }
         }
     }
@@ -2760,6 +2772,11 @@ impl HostWindow {
                     // the `XConfigureEvent` member of Xlib's union.
                     let ev = unsafe { &*(buf.as_ptr() as *const XConfigureEvent) };
                     self.dispatch_configure(handle, ev.width, ev.height);
+                }
+                SELECTION_REQUEST | SELECTION_CLEAR => {
+                    // Another client asking for what Cordial copied, or taking
+                    // the clipboard over. See `x11_clipboard`.
+                    super::x11_clipboard::handle_event(&buf);
                 }
                 CLIENT_MESSAGE => {
                     // `WM_DELETE_WINDOW` arrives as a ClientMessage whose

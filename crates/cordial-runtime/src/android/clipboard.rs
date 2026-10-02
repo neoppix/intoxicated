@@ -35,6 +35,11 @@
 //! verbosity, behind any flag. `crate::deeplink` sets the same rule for URLs and
 //! for the same reason.
 //!
+//! **Which host clipboard.** On Wayland it is GDK's, on the display GTK
+//! opened. On X11 GTK is never initialised, so it is the `CLIPBOARD` selection
+//! spoken directly on `window.rs`'s Xlib connection -- see
+//! [`super::x11_clipboard`] for why, and for what it does and does not serve.
+//!
 //! `CORDIAL_SKIP_CLIPBOARD=1` is the control: the Java classes are still
 //! registered and the subscription is still made, so a run with it set differs
 //! from one without in exactly whether anything acts on a message.
@@ -227,7 +232,9 @@ fn member_names(object: &serde_json::Map<String, serde_json::Value>) -> String {
 // The engine publishes on whichever thread the copy happened on. GTK is not
 // that thread and never is, so nothing here touches GDK: the sink parks the
 // text and the looper thread — the one that ran `gtk_init`, and the one every
-// other native call in this process is made from — picks it up. That is the
+// other native call in this process is made from — picks it up. On X11 the
+// same thread is the one that drains the X connection, so the reason carries
+// over unchanged. That is the
 // same split `cordial_app_ready_set_sink` describes in
 // `native/android_classes.cpp`, made for the same reason.
 
@@ -274,8 +281,9 @@ extern "C" fn on_payload(json: *const c_char) {
 
 /// Hand anything the engine published to the host clipboard.
 ///
-/// **Must be called on the thread that ran `gtk_init`.** [`super::looper::pump`]
-/// is that thread; nothing else in this process may call it.
+/// **Must be called on the thread that ran `gtk_init`** (on X11, the one that
+/// drains the X connection). [`super::looper::pump`] is that thread; nothing
+/// else in this process may call it.
 pub fn pump_pending() {
     let Some(extracted) = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take() else {
         return;
@@ -298,12 +306,21 @@ pub fn pump_pending() {
 /// clipboard, not a second view of one.
 fn host_clipboard() -> Result<gtk4::gdk::Clipboard, String> {
     use gtk4::prelude::DisplayExt;
+    // X11 is routed before this is reached, so a missing display here means
+    // neither backend has a window open yet.
     let display = gtk4::gdk::Display::default()
-        .ok_or_else(|| "GTK has no display open (is this the X11 backend?)".to_string())?;
+        .ok_or_else(|| "no window is open yet, so there is no clipboard to reach".to_string())?;
     Ok(display.clipboard())
 }
 
 fn set_host_text(text: &str) -> Result<(), String> {
+    // **X11 first, and its error is final.** Falling through to GDK on an X11
+    // failure would report "no display" instead of what actually went wrong,
+    // and that misleading line is the one this backend printed for every copy
+    // until the X11 selection existed.
+    if let Some(x11) = super::x11_clipboard::current() {
+        return x11?.set_text(text);
+    }
     host_clipboard()?.set_text(text);
     Ok(())
 }
@@ -327,6 +344,12 @@ fn host_text(timeout: std::time::Duration) -> Result<String, String> {
     use gtk4::glib;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    // The X11 read has the same shape and the same budget: non-blocking checks
+    // for the one answer, a short wait on the connection between them.
+    if let Some(x11) = super::x11_clipboard::current() {
+        return x11?.read_text(timeout, MAX_BYTES);
+    }
 
     let clipboard = host_clipboard()?;
     let answer: Rc<RefCell<Option<Result<String, String>>>> = Rc::new(RefCell::new(None));
@@ -380,6 +403,12 @@ pub fn paste_into_engine(handle: i64) -> Result<usize, String> {
         return Err("the clipboard bridge is off (CORDIAL_SKIP_CLIPBOARD)".into());
     }
     let text = host_text(std::time::Duration::from_millis(400))?;
+    insert_into_focused(handle, &text)
+}
+
+/// The second half of [`paste_into_engine`]: put `text` into the focused box at
+/// the caret, replacing the selection if one is held.
+fn insert_into_focused(handle: i64, text: &str) -> Result<usize, String> {
     if text.len() > MAX_BYTES {
         return Err(format!(
             "the host clipboard holds {} bytes and the limit is {MAX_BYTES}",
@@ -401,18 +430,84 @@ pub fn paste_into_engine(handle: i64) -> Result<usize, String> {
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
-    let Some((contents, caret)) = super::input::edit_text_buffer(super::input::Edit::Insert(&flattened))
-    else {
+    let Some(state) = super::input::edit_text_field(super::input::Edit::Insert(&flattened)) else {
         return Err("the field refused the insert".into());
     };
-    let _ = linker::game_activity::text_input(handle, &contents, caret, caret);
-    super::input::pass_text(which, &contents, caret);
-    super::input::deliver_surface_redraw(handle);
+    super::input::deliver_field_state(handle, which, &state);
     let n = flattened.chars().count();
     if trace() {
         eprintln!("[clipboard] host -> engine: {n} characters into the focused box");
     }
     Ok(n)
+}
+
+/// Ctrl+A, Ctrl+C, Ctrl+X and Ctrl+V for a focused box with no editor widget
+/// over it, which is the X11 backend (ADR-024). Called only with a box focused.
+///
+/// **Copy with nothing selected copies nothing and leaves the clipboard
+/// alone.** That is what the `gtk::Text` on the Wayland backend does, and what
+/// every desktop text field does; replacing somebody's clipboard with a whole
+/// field they never selected would destroy what they had copied. Roblox's own
+/// desktop TextBox is `INFERRED` to agree -- no Windows client was run here.
+/// A line is printed instead, because a Ctrl+C that silently does nothing is
+/// the very report this exists to answer.
+///
+/// **A masked field is never copied or cut from.** GTK copies a password
+/// entry's mask characters rather than its text; with no widget here the
+/// honest equivalent is to refuse, and say so. Paste into one is allowed.
+///
+/// Every failure is printed, not traced: an X11 user has no other way to learn
+/// that a paste did not happen, and that silence is what was reported.
+pub fn run_text_shortcut(handle: i64, which: i64, shortcut: super::input::TextShortcut) {
+    use super::input::{Edit, TextShortcut};
+    match shortcut {
+        TextShortcut::SelectAll => {
+            if let Some(state) = super::input::edit_text_field(Edit::SelectAll) {
+                super::input::deliver_field_state(handle, which, &state);
+            }
+        }
+        TextShortcut::Paste => match paste_into_engine(handle) {
+            Ok(n) if trace() => eprintln!("[clipboard] pasted {n} characters"),
+            Ok(_) => {}
+            Err(e) => println!("[clipboard] paste failed: {e}"),
+        },
+        TextShortcut::Copy | TextShortcut::Cut => {
+            let verb = if shortcut == TextShortcut::Copy { "copy" } else { "cut" };
+            if !enabled() {
+                println!("[clipboard] {verb} not done: the clipboard bridge is off (CORDIAL_SKIP_CLIPBOARD)");
+                return;
+            }
+            let masked = linker::game_activity::focused_textbox_info()
+                .is_some_and(|i| super::input::is_masked_input_type(i.text_input_type));
+            if masked {
+                println!("[clipboard] {verb} refused: the focused box masks its text");
+                return;
+            }
+            let Some(text) = super::input::text_buffer_selected_text() else {
+                println!(
+                    "[clipboard] {verb}: nothing is selected, so the clipboard is unchanged \
+                     (Ctrl+A selects the whole box)"
+                );
+                return;
+            };
+            if text.len() > MAX_BYTES {
+                println!("[clipboard] {verb} refused: {} bytes; the limit is {MAX_BYTES}", text.len());
+                return;
+            }
+            if let Err(e) = set_host_text(&text) {
+                // The selection stays put on a failed cut. Deleting text whose
+                // copy never landed would lose it.
+                println!("[clipboard] {verb} failed: {e}");
+                return;
+            }
+            println!("[clipboard] {verb}: {} bytes onto the host clipboard", text.len());
+            if shortcut == TextShortcut::Cut {
+                if let Some(state) = super::input::edit_text_field(Edit::DeleteSelection) {
+                    super::input::deliver_field_state(handle, which, &state);
+                }
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------- arming

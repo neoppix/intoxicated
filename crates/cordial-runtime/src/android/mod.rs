@@ -28,6 +28,7 @@ pub mod system;
 pub mod vulkan;
 pub mod wayland;
 pub mod window;
+pub mod x11_clipboard;
 
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
