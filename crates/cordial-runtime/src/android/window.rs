@@ -56,6 +56,10 @@ struct Xlib {
     set_wm_hints: unsafe extern "C" fn(Display, Window, *mut XWMHints) -> c_int,
     move_window: unsafe extern "C" fn(Display, Window, c_int, c_int) -> c_int,
     intern_atom: unsafe extern "C" fn(Display, *const c_char, c_int) -> c_ulong,
+    set_wm_protocols: unsafe extern "C" fn(Display, Window, *mut c_ulong, c_int) -> c_int,
+    change_property: unsafe extern "C" fn(
+        Display, Window, c_ulong, c_ulong, c_int, c_int, *const u8, c_int,
+    ) -> c_int,
     send_event: unsafe extern "C" fn(Display, Window, c_int, c_long, *mut c_void) -> c_int,
     sync: unsafe extern "C" fn(Display, c_int) -> c_int,
     store_name: unsafe extern "C" fn(Display, Window, *const c_char) -> c_int,
@@ -96,6 +100,21 @@ struct Xlib {
     ) -> c_ulong,
     define_cursor: unsafe extern "C" fn(Display, Window, c_ulong) -> c_int,
     free_pixmap: unsafe extern "C" fn(Display, c_ulong) -> c_int,
+    // ---- focus and grab bookkeeping ----
+    /// `XQueryKeymap`: which keys are physically down right now, as a 256-bit
+    /// vector indexed by X keycode. Read when another client's keyboard grab
+    /// ends, so a key released while the grab had the keyboard is let go of
+    /// here too -- see the `FOCUS_IN` arm.
+    query_keymap: unsafe extern "C" fn(Display, *mut c_char) -> c_int,
+    /// `XQueryExtension`, for the XInputExtension's major opcode: a
+    /// `GenericEvent` names its extension by opcode and nothing else.
+    query_extension: unsafe extern "C" fn(
+        Display, *const c_char, *mut c_int, *mut c_int, *mut c_int,
+    ) -> c_int,
+    /// `XEventsQueued`, only ever with `QueuedAlready`: events Xlib has
+    /// already read off the socket, counted without any I/O. See
+    /// `pump_input_events` for why the socket alone is not enough to ask.
+    events_queued: unsafe extern "C" fn(Display, c_int) -> c_int,
 }
 
 /// `XColor`. Only the pixel/RGB prefix is read by `XCreatePixmapCursor`, but the
@@ -149,6 +168,8 @@ impl Xlib {
             set_wm_hints: sym!("XSetWMHints"),
             move_window: sym!("XMoveWindow"),
             intern_atom: sym!("XInternAtom"),
+            set_wm_protocols: sym!("XSetWMProtocols"),
+            change_property: sym!("XChangeProperty"),
             send_event: sym!("XSendEvent"),
             sync: sym!("XSync"),
             connection_number: sym!("XConnectionNumber"),
@@ -163,7 +184,353 @@ impl Xlib {
             create_pixmap_cursor: sym!("XCreatePixmapCursor"),
             define_cursor: sym!("XDefineCursor"),
             free_pixmap: sym!("XFreePixmap"),
+            query_keymap: sym!("XQueryKeymap"),
+            query_extension: sym!("XQueryExtension"),
+            events_queued: sym!("XEventsQueued"),
         })
+    }
+}
+
+/// XInput2, for unaccelerated relative motion while the pointer is locked
+/// (ADR-028).
+///
+/// **Core X11 cannot say what the mouse did, only where the server put the
+/// pointer afterwards.** A `MotionNotify` position has already been through the
+/// server's acceleration curve, so the warp-to-centre lock that preceded this
+/// could only ever hand the camera an accelerated delta, whatever
+/// `CORDIAL_POINTER_ACCEL` or the settings row said. `XI_RawMotion` carries
+/// both numbers -- `raw_values` before acceleration and `valuators` after --
+/// which is exactly the pair `zwp_relative_pointer_v1` hands the Wayland
+/// backend, so the two backends now make the same choice from the same kind
+/// of source.
+///
+/// Loaded by `dlopen` like libX11 and for the same reason: a missing libXi is
+/// a runtime condition, not a link failure. The soname is `libXi.so.6` on
+/// every system this has to run on -- Rocky's `/usr/lib64` and FreeBSD's
+/// `/usr/local/lib` both ship it under that name, the same way both ship
+/// `libX11.so.6`, which this file already opens by bare soname.
+/// `XGetEventData`/`XFreeEventData` are libX11's (1.3 and later), resolved
+/// here rather than in [`Xlib`] so a libX11 too old to have them costs the raw
+/// path and not the whole window.
+struct Xi {
+    /// The XInputExtension's major opcode; a `GenericEvent` carries it in
+    /// `extension` and nothing else identifies whose event it is.
+    opcode: c_int,
+    /// The version the server agreed to, for the startup line and the
+    /// `pointerlock` report.
+    version: (c_int, c_int),
+    select_events: unsafe extern "C" fn(Display, Window, *mut XIEventMask, c_int) -> c_int,
+    query_device: unsafe extern "C" fn(Display, c_int, *mut c_int) -> *mut XIDeviceInfo,
+    free_device_info: unsafe extern "C" fn(*mut XIDeviceInfo),
+    get_event_data: unsafe extern "C" fn(Display, *mut XGenericEventCookie) -> c_int,
+    free_event_data: unsafe extern "C" fn(Display, *mut XGenericEventCookie),
+}
+
+/// `XIEventMask`, from XI2.h.
+#[repr(C)]
+struct XIEventMask {
+    deviceid: c_int,
+    mask_len: c_int,
+    mask: *mut u8,
+}
+
+/// `XGenericEventCookie`, from Xlib.h. The `data` pointer is valid only
+/// between `XGetEventData` and `XFreeEventData` -- nothing in the type says
+/// so, which is the trap ADR-028 names, and why [`HostWindow::dispatch_generic`]
+/// copies everything it needs out before freeing.
+#[repr(C)]
+struct XGenericEventCookie {
+    type_: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: Display,
+    extension: c_int,
+    evtype: c_int,
+    cookie: c_uint,
+    data: *mut c_void,
+}
+
+/// `XIRawEvent`, from XI2.h. `valuators` is the post-acceleration set and
+/// `raw_values` the device's own report; both are packed, one double per bit
+/// set in `valuators.mask`, which is what [`raw_motion_axes`] unpacks.
+#[repr(C)]
+struct XIRawEvent {
+    type_: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: Display,
+    extension: c_int,
+    evtype: c_int,
+    time: c_ulong,
+    deviceid: c_int,
+    sourceid: c_int,
+    detail: c_int,
+    flags: c_int,
+    valuators_mask_len: c_int,
+    valuators_mask: *const u8,
+    valuators_values: *const f64,
+    raw_values: *const f64,
+}
+
+/// `XIDeviceInfo`, from XI2.h -- read only to find out whether a device's
+/// first valuator is relative or absolute.
+#[repr(C)]
+struct XIDeviceInfo {
+    deviceid: c_int,
+    name: *mut c_char,
+    use_: c_int,
+    attachment: c_int,
+    enabled: c_int,
+    num_classes: c_int,
+    classes: *mut *mut XIValuatorClassInfo,
+}
+
+/// `XIValuatorClassInfo`; its leading `type` is shared with every other class
+/// (`XIAnyClassInfo`), so it is safe to read through this for any class and
+/// check `type_` first.
+#[repr(C)]
+struct XIValuatorClassInfo {
+    type_: c_int,
+    sourceid: c_int,
+    number: c_int,
+    label: c_ulong,
+    min: f64,
+    max: f64,
+    value: f64,
+    resolution: c_int,
+    mode: c_int,
+}
+
+const GENERIC_EVENT: c_int = 35;
+const XI_RAW_MOTION: c_int = 17;
+const XI_ALL_MASTER_DEVICES: c_int = 1;
+const XI_VALUATOR_CLASS: c_int = 2;
+const XI_MODE_ABSOLUTE: c_int = 1;
+
+impl Xi {
+    /// Negotiate XI2 on `display`, or say why not. `CORDIAL_NO_XI2=1` refuses
+    /// on purpose: ADR-028 requires the warp fallback to be exercised "with XI2
+    /// forced off, in the same session", and a switch is the only way to do
+    /// that on a server that has XI2.
+    fn init(xlib: &Xlib, display: Display) -> Result<Self, String> {
+        if std::env::var_os("CORDIAL_NO_XI2").is_some() {
+            return Err("turned off by CORDIAL_NO_XI2".into());
+        }
+        // SAFETY: literal sonames; handles are never closed. dlopen of an
+        // already-loaded libX11 returns the existing handle.
+        let (xi_lib, x11_lib) = unsafe {
+            (dlopen(c"libXi.so.6".as_ptr(), RTLD_NOW), dlopen(c"libX11.so.6".as_ptr(), RTLD_NOW))
+        };
+        if xi_lib.is_null() {
+            return Err("libXi.so.6 is not available".into());
+        }
+        if x11_lib.is_null() {
+            return Err("libX11.so.6 could not be reopened".into());
+        }
+        macro_rules! sym {
+            ($lib:expr, $name:literal) => {{
+                let name = CString::new($name).unwrap();
+                // SAFETY: the handle is open and the names are documented
+                // exports whose signatures are the ones declared on `Xi`.
+                let p = unsafe { dlsym($lib, name.as_ptr()) };
+                if p.is_null() {
+                    return Err(format!("no {} exported", $name));
+                }
+                unsafe { std::mem::transmute(p) }
+            }};
+        }
+        let query_version: unsafe extern "C" fn(Display, *mut c_int, *mut c_int) -> c_int =
+            sym!(xi_lib, "XIQueryVersion");
+        let (mut opcode, mut first_event, mut first_error) = (0, 0, 0);
+        // SAFETY: `display` is open; the out-pointers are live locals.
+        let present = unsafe {
+            (xlib.query_extension)(
+                display,
+                c"XInputExtension".as_ptr(),
+                &mut opcode,
+                &mut first_event,
+                &mut first_error,
+            )
+        };
+        if present == 0 {
+            return Err("the X server has no XInputExtension".into());
+        }
+        // 2.2 asked for, 2.0 required: raw events are 2.0, and asking for
+        // more costs nothing on a server that has it while leaving touch
+        // (2.2) negotiable later without a second handshake.
+        let (mut major, mut minor) = (2, 2);
+        // SAFETY: as above.
+        let status = unsafe { query_version(display, &mut major, &mut minor) };
+        if status != 0 || major < 2 {
+            return Err(format!("the server offers XInput {major}.{minor}, and 2.0 is needed"));
+        }
+        Ok(Xi {
+            opcode,
+            version: (major, minor),
+            select_events: sym!(xi_lib, "XISelectEvents"),
+            query_device: sym!(xi_lib, "XIQueryDevice"),
+            free_device_info: sym!(xi_lib, "XIFreeDeviceInfo"),
+            get_event_data: sym!(x11_lib, "XGetEventData"),
+            free_event_data: sym!(x11_lib, "XFreeEventData"),
+        })
+    }
+
+    /// Subscribe to raw motion on the root window, or (`on == false`) stop.
+    ///
+    /// **Only while the lock is held.** Raw events on the root window report
+    /// the mouse whatever has focus, so a standing subscription would have
+    /// Cordial receiving the user's pointer movement across their whole
+    /// session -- ADR-028 calls that a privacy failure, not merely a bug.
+    /// Selecting on lock and deselecting on release means the server does not
+    /// send them at all otherwise; `dispatch_generic` additionally drops any
+    /// that were already in flight when the lock went.
+    fn select_raw_motion(&self, display: Display, root: Window, on: bool) {
+        let mut bits = [0u8; 4];
+        if on {
+            bits[(XI_RAW_MOTION >> 3) as usize] |= 1 << (XI_RAW_MOTION & 7);
+        }
+        let mut mask = XIEventMask {
+            deviceid: XI_ALL_MASTER_DEVICES,
+            mask_len: bits.len() as c_int,
+            mask: bits.as_mut_ptr(),
+        };
+        // SAFETY: `mask` and `bits` outlive the call, which copies them into
+        // the request.
+        unsafe { (self.select_events)(display, root, &mut mask, 1) };
+    }
+
+    /// Whether `deviceid`'s first valuator is absolute -- a tablet, or the
+    /// "tablet" pointer most virtual machines present. Such a device's raw
+    /// values are positions, not movements, and reading them as deltas would
+    /// spin the camera by the pointer's distance from the origin every event.
+    fn device_is_absolute(&self, display: Display, deviceid: c_int) -> bool {
+        let mut n = 0;
+        // SAFETY: `display` is open; the returned array is `n` long and freed
+        // below, and each class is read only after checking its shared `type`.
+        unsafe {
+            let info = (self.query_device)(display, deviceid, &mut n);
+            if info.is_null() {
+                return false;
+            }
+            let mut absolute = false;
+            if n > 0 {
+                let dev = &*info;
+                for i in 0..dev.num_classes.max(0) as usize {
+                    let class = *dev.classes.add(i);
+                    if class.is_null() || (*class).type_ != XI_VALUATOR_CLASS {
+                        continue;
+                    }
+                    if (*class).number == 0 {
+                        absolute = (*class).mode == XI_MODE_ABSOLUTE;
+                        break;
+                    }
+                }
+            }
+            (self.free_device_info)(info);
+            absolute
+        }
+    }
+}
+
+/// The X and Y movement in one `XI_RawMotion`, as `(accelerated, raw)`.
+///
+/// Both arrays are packed: there is one value per bit set in `mask`, in bit
+/// order, so the value for valuator 1 is at index 1 only if valuator 0 also
+/// moved. A purely vertical movement sets bit 1 alone and its Y is at index 0
+/// -- which is exactly the mistake an unpacked read makes, sending vertical
+/// motion to the horizontal axis. Valuators above 1 (a wheel exposed as an
+/// axis, a tablet's pressure) are skipped, not misread as motion.
+fn raw_motion_axes(mask: &[u8], accelerated: &[f64], raw: &[f64]) -> ((f64, f64), (f64, f64)) {
+    let (mut acc, mut unacc) = ((0.0, 0.0), (0.0, 0.0));
+    let mut packed = 0;
+    for axis in 0..mask.len() * 8 {
+        if mask[axis / 8] & (1 << (axis % 8)) == 0 {
+            continue;
+        }
+        let (a, r) = (
+            accelerated.get(packed).copied().unwrap_or(0.0),
+            raw.get(packed).copied().unwrap_or(0.0),
+        );
+        match axis {
+            0 => {
+                acc.0 = a;
+                unacc.0 = r;
+            }
+            1 => {
+                acc.1 = a;
+                unacc.1 = r;
+            }
+            _ => {}
+        }
+        packed += 1;
+    }
+    (acc, unacc)
+}
+
+/// Which of the two deltas the camera gets, the same choice and the same
+/// setting as Wayland's `relative_pointer_motion`: `accelerated` is
+/// `CORDIAL_POINTER_ACCEL` (or the live settings row) not saying "unlocked".
+fn choose_camera_delta(accelerated: bool, acc: (f64, f64), raw: (f64, f64)) -> (f64, f64) {
+    if accelerated {
+        acc
+    } else {
+        raw
+    }
+}
+
+/// What identifies one physical raw sample: server time, master and source
+/// device, and the unaccelerated X and Y. See [`is_duplicate_raw`].
+type RawSampleKey = (c_ulong, c_int, c_int, f64, f64);
+
+/// Whether `cur` is the same raw sample as `prev`, delivered a second time.
+///
+/// **While this client holds a pointer grab, the X server delivers each
+/// `XI_RawMotion` twice** -- once through the grab and once through the root
+/// window selection. Measured on Xvfb (FreeBSD xorg-vfbserver), driving the
+/// XTEST pointer with `xdotool mousemove_relative -- 7 -3`: with no grab,
+/// `xinput test-xi2 --root` shows one RawMotion per move; under Cordial's grab
+/// the trace showed two per move with identical serial, time, device, source
+/// and values (`serial=4078 time=114255876 device=2 source=4`, twice). Summed
+/// unfiltered, that is a camera turning at exactly double the mouse, which is
+/// precisely "does not feel normal". SDL drops the same duplicate by the same
+/// test, time plus values.
+///
+/// The cost is that two *genuine* samples from one device inside the same
+/// millisecond with bit-identical deltas would lose one of them: one count of
+/// a 1000 Hz mouse, never more than one in a row.
+fn is_duplicate_raw(prev: Option<RawSampleKey>, cur: RawSampleKey) -> bool {
+    prev == Some(cur)
+}
+
+/// Raw movement summed across one drain of the event queue, delivered to the
+/// engine once at the end of it rather than per event.
+///
+/// One call per drain rather than per event because a 1000 Hz mouse produces
+/// a thousand `XI_RawMotion` a second, each a JNI round trip into the engine,
+/// while the engine samples the delta once a frame anyway. Summing is
+/// lossless for a camera -- rotation is linear in the delta -- and the
+/// fractional parts of high-resolution devices are kept rather than rounded
+/// away per event, which is what an integer warp delta could not do.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct RawMotionAccumulator {
+    dx: f64,
+    dy: f64,
+    events: u32,
+}
+
+impl RawMotionAccumulator {
+    fn add(&mut self, d: (f64, f64)) {
+        self.dx += d.0;
+        self.dy += d.1;
+        self.events += 1;
+    }
+
+    /// The total so far, leaving the accumulator empty. `None` when nothing
+    /// moved, so a drain of zero-length samples does not wake the engine.
+    fn take(&mut self) -> Option<(f64, f64)> {
+        let out = (self.dx, self.dy);
+        *self = Self::default();
+        (out != (0.0, 0.0)).then_some(out)
     }
 }
 
@@ -177,6 +544,10 @@ pub struct HostWindow {
     /// ever calling into Xlib when there is nothing queued, which is what keeps
     /// it from blocking the render loop (see `pump_input_events`, below).
     conn_fd: c_int,
+    /// The two atoms a window manager's close request is spelled in, kept so
+    /// the event pump can recognise one without a round trip to the server.
+    wm_protocols: c_ulong,
+    wm_delete_window: c_ulong,
     /// Dimensions the engine asked for via `ANativeWindow_setBuffersGeometry`,
     /// which override the window's own size in every query. Android reports the
     /// buffer geometry, not the surface geometry, and the engine sizes its
@@ -185,6 +556,13 @@ pub struct HostWindow {
     input: Mutex<InputState>,
     pointer_lock: Mutex<PointerLockState>,
     fullscreen: AtomicBool,
+    /// XInput2 when the server negotiated it, `None` for the warp fallback.
+    /// See [`Xi`] and ADR-028.
+    xi: Option<Xi>,
+    /// Keyboard focus as the last *real* `FocusIn`/`FocusOut` left it: 0 not
+    /// yet known, 1 focused, 2 not. See [`focus_change_is_real`] for which
+    /// focus events count, and `sync_pointer_lock` for what reads it.
+    focused: std::sync::atomic::AtomicU8,
 }
 
 /// Buttons and timing carried across calls to `pump_input_events`, the way a
@@ -198,29 +576,93 @@ struct InputState {
     /// exact meaning: constant across a MOVE/UP sequence, not per-event.
     down_time_ms: i64,
     clock: std::time::Instant,
+    /// Keys the engine has been told are down and not yet told are up, as
+    /// (Android keycode, X keycode). See the `FOCUS_OUT` arm.
+    held_keys: Vec<(i32, i32)>,
+    /// Where the pointer last was in window coordinates, from the last core
+    /// button or motion event. A button release Cordial has to synthesise --
+    /// on a real focus loss, or after another client's grab swallowed the
+    /// real one -- has no event of its own to take a position from.
+    last_pos: (f32, f32),
+}
+
+/// Record that `key` went down or up, so a focus loss can release whatever is
+/// still down. A repeat of a key already held is not held twice: auto-repeat
+/// sends KeyPress over and over, and one release per press would send the
+/// engine releases for a key it was only ever pressed once.
+fn track_held_key(held: &mut Vec<(i32, i32)>, down: bool, key: (i32, i32)) {
+    if down {
+        if !held.contains(&key) {
+            held.push(key);
+        }
+    } else {
+        held.retain(|k| *k != key);
+    }
 }
 
 /// X11 pointer capture state.
 ///
-/// X11 has no Wayland relative-pointer protocol in this backend, so the first
-/// implementation uses XGrabPointer + XWarpPointer and derives dx/dy from
-/// MotionNotify events around a fixed centre.
+/// The lock is an `XGrabPointer` confined to this window either way. Where the
+/// camera's movement comes from depends on the server: `XI_RawMotion` when
+/// XInput2 is there ([`Xi`], ADR-028), and otherwise the original mechanism --
+/// warp the pointer to a fixed centre and read each core `MotionNotify` as a
+/// distance from it.
 struct PointerLockState {
     locked: bool,
-    suppressed: bool,
     ignore_next_warp: bool,
+    /// Consecutive locked `MotionNotify` events discarded while waiting for
+    /// the confirmed echo of the last recentring warp. See
+    /// [`locked_pointer_delta`] for why a single check on the very next event
+    /// was not enough, and [`MAX_WARP_ECHO_WAIT`] for the bound.
+    warp_echo_wait: u8,
+    /// Where the hidden pointer is held while locked, in window coordinates,
+    /// and the absolute position the engine is told throughout. The window's
+    /// centre for the warp fallback and whenever the engine itself asked for a
+    /// centred lock; on the raw path, a camera drag is held where the button
+    /// went down instead -- see `lock_pointer`.
     centre: (i32, i32),
     saved_root: Option<(i32, i32)>,
+    /// Raw movement not yet handed to the engine. See
+    /// [`RawMotionAccumulator`].
+    raw: RawMotionAccumulator,
+    /// Whether this lock has seen `XI_RawMotion` from a relative device. Until
+    /// it has, core motion is still read the warp way, which is what keeps an
+    /// absolute-only pointer (a tablet, most VM pointers) working under XI2:
+    /// its raw values are positions and are refused, so nothing else would
+    /// move the camera. See [`Xi::device_is_absolute`].
+    raw_relative_seen: bool,
+    /// Devices already asked whether they are absolute, this lock. Cleared on
+    /// every lock rather than kept for the session because X reuses device
+    /// ids across hot-plugs, and one `XIQueryDevice` per device per lock is
+    /// nothing.
+    absolute_devices: Vec<(c_int, bool)>,
+    /// Totals since the window opened, for the `pointerlock` report: raw
+    /// events taken, raw events refused as absolute, and drains delivered.
+    raw_events: u64,
+    raw_refused: u64,
+    raw_deliveries: u64,
+    /// The last raw sample taken, and how many second deliveries of one were
+    /// dropped. See [`is_duplicate_raw`].
+    last_raw: Option<RawSampleKey>,
+    raw_duplicates: u64,
 }
 
 impl PointerLockState {
     fn new() -> Self {
         Self {
             locked: false,
-            suppressed: false,
             ignore_next_warp: false,
+            warp_echo_wait: 0,
             centre: (0, 0),
             saved_root: None,
+            raw: RawMotionAccumulator::default(),
+            raw_relative_seen: false,
+            absolute_devices: Vec::new(),
+            raw_events: 0,
+            raw_refused: 0,
+            raw_deliveries: 0,
+            last_raw: None,
+            raw_duplicates: 0,
         }
     }
 }
@@ -237,6 +679,12 @@ unsafe impl Send for HostWindow {}
 unsafe impl Sync for HostWindow {}
 
 static WINDOW: OnceLock<HostWindow> = OnceLock::new();
+
+/// Set when the window manager delivers `WM_DELETE_WINDOW`, and only read by
+/// `looper::asked_to_stop` through `android::window_closed`. A flag rather
+/// than a call into the pump, so `CORDIAL_NO_CLOSE_EXIT` gates an X11 close
+/// exactly as it gates a Wayland one.
+static WINDOW_CLOSED: AtomicBool = AtomicBool::new(false);
 
 
 /// `XSizeHints`. Only the leading fields matter here, but the struct has to be
@@ -447,7 +895,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
     // corner of the screen.
     let (width, height) = (place.width as u32, place.height as u32);
 
-    let (window, conn_fd) = unsafe {
+    let (window, conn_fd, wm_protocols, wm_delete_window) = unsafe {
         let root = (xlib.default_root_window)(display);
         let w = (xlib.create_simple_window)(display, root, ox, oy, width, height, 0, 0, 0);
         // XStoreName sets WM_NAME, which is XA_STRING — Latin-1, not UTF-8.
@@ -492,6 +940,17 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
             icon_mask: 0, window_group: 0,
         };
         (xlib.set_wm_hints)(display, w, &mut wm);
+
+        // Advertise `WM_DELETE_WINDOW`, so the window manager asks us to close
+        // rather than severing the connection. Without it a close button ends
+        // the client in Xlib's fatal I/O handler with status 1, skipping the
+        // lifecycle teardown every other way out goes through.
+        let wm_protocols = (xlib.intern_atom)(display, c"WM_PROTOCOLS".as_ptr(), 0);
+        let wm_delete_window = (xlib.intern_atom)(display, c"WM_DELETE_WINDOW".as_ptr(), 0);
+        if wm_protocols != 0 && wm_delete_window != 0 {
+            let mut protocol = wm_delete_window;
+            (xlib.set_wm_protocols)(display, w, &mut protocol, 1);
+        }
 
         // WM_CLASS, so the window is addressable by rule in a tiling or
         // scripted setup rather than only by title. It is also how a capture
@@ -587,6 +1046,7 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
         };
 
         if place.fullscreen {
+            set_compositor_bypass(&xlib, display, w, true);
             // Name the monitor outright. `_NET_WM_STATE_FULLSCREEN` alone
             // fullscreens onto whichever monitor the window manager believes
             // the window occupies, which is the thing that was wrong.
@@ -608,7 +1068,34 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
         (xlib.flush)(display);
         (xlib.sync)(display, 0);
 
-        (w, (xlib.connection_number)(display))
+        (w, (xlib.connection_number)(display), wm_protocols, wm_delete_window)
+    };
+
+    // Once, on stdout, unconditionally: which of ADR-028's two mechanisms
+    // this session's camera runs on is the first thing a report about how the
+    // mouse feels on X11 needs, and it differs by server, not by build.
+    let xi = match Xi::init(&xlib, display) {
+        Ok(xi) => {
+            println!(
+                "[android] X11 pointer lock: XInput {}.{} raw motion (camera {})",
+                xi.version.0,
+                xi.version.1,
+                if super::wayland::current_pointer_acceleration() {
+                    "accelerated by the X server's pointer settings"
+                } else {
+                    "unaccelerated: CORDIAL_POINTER_ACCEL=unlocked"
+                },
+            );
+            Some(xi)
+        }
+        Err(why) => {
+            println!(
+                "[android] X11 pointer lock: no XInput2 ({why}); falling back to \
+                 warp-to-centre, whose deltas the X server has already accelerated, \
+                 so CORDIAL_POINTER_ACCEL=unlocked cannot be honoured"
+            );
+            None
+        }
     };
 
     let host = HostWindow {
@@ -616,6 +1103,8 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
         display,
         window,
         conn_fd,
+        wm_protocols,
+        wm_delete_window,
         buffers: Mutex::new(Geometry {
             width: width as i32,
             height: height as i32,
@@ -625,13 +1114,19 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
             buttons: 0,
             down_time_ms: 0,
             clock: std::time::Instant::now(),
+            held_keys: Vec::new(),
+            last_pos: (0.0, 0.0),
         }),
         pointer_lock: Mutex::new(PointerLockState::new()),
         fullscreen: AtomicBool::new(place.fullscreen),
+        xi,
+        focused: std::sync::atomic::AtomicU8::new(0),
     };
     // No touchscreen, and that is a statement about this backend rather than
-    // about the machine: X11 core input has no touch at all, XInput2's is a
-    // separate extension nothing here binds, and so a touchscreen on this host
+    // about the machine: X11 core input has no touch at all, and XInput2 --
+    // which this backend now binds, but only for `XI_RawMotion` -- carries
+    // touch only in `XI_TouchBegin`/`Update`/`End`, which nothing here selects.
+    // So a touchscreen on this host
     // could not reach Cordial through this path however present it is. Saying
     // false is therefore true of what the client can actually receive, which is
     // what `isTouchDevice` is for. A user on a touchscreen who wants the mobile
@@ -640,40 +1135,252 @@ pub fn open(width: u32, height: u32, title: &str) -> Result<&'static HostWindow,
     Ok(WINDOW.get_or_init(|| host))
 }
 
-/// Whether the pointer lock should be held, and what the Escape-suppression
-/// latch should become, given one pump's inputs.
+/// Whether the pointer lock should be held, given one pump's inputs, or `None`
+/// for "decide nothing".
 ///
 /// Pulled out of `sync_pointer_lock` so the three independent reasons to want
 /// the lock — the engine's own request, a camera-button drag, and the forced
-/// override — and the latch that keeps Escape from being immediately undone by
-/// a button still held down the same frame are unit-testable without a live X
-/// server, the same reason [`is_final_expose`] and `input.rs`'s
+/// override — and the focus gate are unit-testable without a live X server,
+/// the same reason [`is_final_expose`] and `input.rs`'s
 /// `resolve_mouse_delta`/`touchscreen_reported` take their inputs as plain
-/// values rather than reading global state themselves. A ~260-line addition
-/// with no unit test would otherwise be a first for this file.
+/// values rather than reading global state themselves.
 ///
-/// The latch clears itself the first pump nothing is asking for the lock —
-/// `previously_suppressed` carried forward unchanged only while `asked` stays
-/// true — which is what lets a released Escape be re-armed by the next camera
-/// drag rather than staying suppressed for the rest of the session.
+/// **There is no Escape latch any more.** This used to take a
+/// `previously_suppressed` flag that Escape set, so a focused window could be
+/// told to lock by the engine and decline -- and in shift lock or first person
+/// the engine never stops asking, so one Escape left the camera dead until the
+/// player toggled out of it. Wayland removed the same latch in `d440c4f` on a
+/// measurement that applies here unchanged, since it is a fact about the
+/// engine and not the compositor: Escape is Roblox's own menu key, it reaches
+/// the engine, and opening the menu drops the engine's request by itself --
+/// `engine=true` before, `false` with the menu open, `true` again on closing
+/// it, measured 2026-09-04. The latch duplicated a decision the engine already
+/// makes, and made it worse.
+///
+/// **`focused == Some(false)` decides nothing**, as `wayland.rs` does. A real
+/// focus loss has already released the lock (the `FOCUS_OUT` arm), and without
+/// this gate the very next pump would take it straight back if the engine was
+/// still asking -- grabbing the pointer of a window that does not have the
+/// keyboard, with the user now typing somewhere else. `None` (no focus event
+/// seen yet) behaves as focused, because a window manager that never sends
+/// one must not freeze the lock forever.
 fn pointer_lock_decision(
     engine_wants: bool,
     buttons: i32,
     no_drag_lock: bool,
     force: bool,
-    previously_suppressed: bool,
-) -> (bool, bool) {
+    focused: Option<bool>,
+) -> Option<bool> {
+    if focused == Some(false) {
+        return None;
+    }
     const CAMERA_BUTTONS: i32 = super::input::BUTTON_SECONDARY | super::input::BUTTON_TERTIARY;
     let dragging = !no_drag_lock && (buttons & CAMERA_BUTTONS) != 0;
-    let asked = engine_wants || dragging || force;
-    let suppressed = asked && previously_suppressed;
-    (asked && !suppressed, suppressed)
+    Some(engine_wants || dragging || force)
 }
 
-/// The relative motion implied by one `MotionNotify` while the pointer is
-/// locked, or `None` if the event is the synthetic echo of this backend's own
-/// `XWarpPointer` call back to the centre and must be swallowed rather than
-/// reported as movement.
+// `XFocusChangeEvent.mode` and `.detail`, from X.h.
+// `NotifyGrab` (1) is the mode that is deliberately *not* named here: it is the
+// one this backend now ignores.
+const NOTIFY_NORMAL: c_int = 0;
+const NOTIFY_UNGRAB: c_int = 2;
+const NOTIFY_WHILE_GRABBED: c_int = 3;
+const NOTIFY_INFERIOR: c_int = 2;
+
+/// Whether a `FocusIn`/`FocusOut` is the window actually gaining or losing the
+/// keyboard, as opposed to a keyboard grab starting or ending around it.
+///
+/// Xlib's four modes mean different things and this backend used to act on all
+/// of them alike. `NotifyGrab` and `NotifyUngrab` are sent when *some client*
+/// activates or releases a keyboard grab -- a window manager's key binding
+/// (i3's `$mod` combinations are passive `XGrabKey`s), a media-key daemon, a
+/// global hotkey -- and the focused window is told so even though focus never
+/// moved: it is the same window before and after, and the keyboard comes back
+/// to it when the grab ends. `docs/analysis/x11-pointer-lock-review.md` traced
+/// the reported "media keys jerk the camera and spam right-click" to exactly
+/// this: each such key ungrabbed, warped the pointer across the screen,
+/// re-grabbed and warped again, and zeroed the button state with the right
+/// button still down.
+///
+/// `NotifyNormal` is an ordinary focus change. `NotifyWhileGrabbed` is a focus
+/// change that happened *while* a keyboard grab was active -- the window
+/// manager moving focus during its own binding, say -- and is just as real: the
+/// focus did move, only the moment it was reported at differs. So both count.
+///
+/// `detail == NotifyInferior` is focus moving between this window and one of
+/// its own children, which never leaves the window; Cordial creates no
+/// children, so it is excluded for correctness rather than because it is
+/// expected.
+fn focus_change_is_real(mode: c_int, detail: c_int) -> bool {
+    matches!(mode, NOTIFY_NORMAL | NOTIFY_WHILE_GRABBED) && detail != NOTIFY_INFERIOR
+}
+
+/// The Android button bits in `buttons`, one at a time, in the order a
+/// synthesised release delivers them -- the same order as Wayland's
+/// `release_held_buttons`.
+fn held_button_bits(buttons: i32) -> Vec<i32> {
+    [BUTTON_PRIMARY, BUTTON_SECONDARY, BUTTON_TERTIARY, BUTTON_BACK, BUTTON_FORWARD]
+        .into_iter()
+        .filter(|b| buttons & b != 0)
+        .collect()
+}
+
+/// Of the buttons Cordial believes are down, those the server says are not --
+/// a release that went to another client's grab rather than to this window.
+///
+/// `x_state` is the button mask `XQueryPointer` returns (`Button1Mask` is
+/// `1 << 8`). The core protocol has masks for buttons 1-5 only, so the side
+/// buttons (Android's back/forward, X's 8/9) cannot be checked this way and are
+/// left as they are rather than released on a guess.
+fn buttons_released_elsewhere(held: i32, x_state: c_uint) -> Vec<i32> {
+    const BUTTON1_MASK: c_uint = 1 << 8;
+    const BUTTON2_MASK: c_uint = 1 << 9;
+    const BUTTON3_MASK: c_uint = 1 << 10;
+    [
+        (BUTTON_PRIMARY, BUTTON1_MASK),
+        (BUTTON_SECONDARY, BUTTON3_MASK),
+        (BUTTON_TERTIARY, BUTTON2_MASK),
+    ]
+    .into_iter()
+    .filter(|(android, x)| held & android != 0 && x_state & x == 0)
+    .map(|(android, _)| android)
+    .collect()
+}
+
+/// Of the keys Cordial believes are down, those `XQueryKeymap` says are up --
+/// released while another client's keyboard grab had the keyboard, so the
+/// release went to it and not here. `keymap` is the 256-bit vector indexed by X
+/// keycode that `XQueryKeymap` fills.
+fn keys_released_elsewhere(held: &[(i32, i32)], keymap: &[u8; 32]) -> Vec<(i32, i32)> {
+    held.iter()
+        .copied()
+        .filter(|&(_, x_keycode)| {
+            let k = x_keycode as usize;
+            k >= 256 || keymap[k / 8] & (1 << (k % 8)) == 0
+        })
+        .collect()
+}
+
+/// The Android meta bit a modifier key's own event has to have corrected.
+///
+/// **An X key event's `state` is the modifier mask from before the event.** So
+/// Shift's own press arrives with Shift *not* in `state`, and its release with
+/// Shift still set -- every modifier's own event one step behind, in both
+/// directions. Wayland measured exactly this shape on its backend (see the
+/// `self_bit` comment in `wayland.rs`'s key handler: "down SHIFT -> 0x1002
+/// shift missing / up SHIFT -> 0x1003 shift still set") and corrects the one bit
+/// belonging to the key in hand; this is the same correction for X11, where
+/// the cause is the protocol's definition of `state` rather than event order.
+/// It matters for shift lock in particular, which is the engine reading a Shift
+/// key event: Android's own `KeyEvent` for a Shift press carries
+/// `META_SHIFT_ON`, and the release does not.
+fn modifier_self_meta(keysym: c_ulong) -> i32 {
+    match keysym {
+        0xffe1 | 0xffe2 => META_SHIFT_ON, // Shift_L, Shift_R
+        0xffe3 | 0xffe4 => META_CTRL_ON,  // Control_L, Control_R
+        0xffe9 | 0xffea => META_ALT_ON,   // Alt_L, Alt_R
+        _ => 0,
+    }
+}
+
+/// Where a lock holds the pointer, in window coordinates.
+///
+/// The warp fallback always uses the centre: it measures each movement as a
+/// distance from where it put the pointer, and needs room on every side.
+/// The raw path measures nothing from the position, so it is free to do what
+/// desktop Roblox does with a right-button drag -- leave the cursor where the
+/// button went down, so that when the drag ends the engine's cursor is still
+/// where the player was pointing rather than jumping to the middle of the
+/// window. The engine's own request (first person, shift lock) is
+/// `nativeGetMainWindowIsMouseLockedCenter` -- *centre* is in the name -- and
+/// gets the centre on both paths, as does the forced override.
+fn lock_anchor(
+    centred: bool,
+    raw_path: bool,
+    pointer: Option<(i32, i32)>,
+    size: (i32, i32),
+) -> (i32, i32) {
+    let centre = (size.0 / 2, size.1 / 2);
+    match pointer {
+        Some((x, y)) if raw_path && !centred => {
+            (x.clamp(0, (size.0 - 1).max(0)), y.clamp(0, (size.1 - 1).max(0)))
+        }
+        _ => centre,
+    }
+}
+
+/// How close to the window's edge the hidden pointer may drift on the raw path
+/// before it is put back at its anchor.
+///
+/// The raw path does not need the pointer anywhere in particular -- raw
+/// motion is reported before the server clamps the pointer to the confining
+/// window, so a pointer pinned against an edge still turns the camera. The warp
+/// back exists only so the hidden pointer is never left on the boundary of the
+/// confinement, where any lapse in it -- an unmap, a resize mid-grab -- puts it
+/// straight onto whatever is next to the window. One warp per excursion to the
+/// edge, not one per event, and `XWarpPointer` produces no raw event, so it
+/// cannot be counted as movement.
+const RAW_EDGE_MARGIN: i32 = 16;
+
+fn near_edge(pos: (i32, i32), size: (i32, i32)) -> bool {
+    pos.0 < RAW_EDGE_MARGIN
+        || pos.1 < RAW_EDGE_MARGIN
+        || pos.0 >= size.0 - RAW_EDGE_MARGIN
+        || pos.1 >= size.1 - RAW_EDGE_MARGIN
+}
+
+/// Bound on how many consecutive locked `MotionNotify` events
+/// [`locked_pointer_delta`] discards while waiting for the confirmed echo of
+/// a recentring warp, before giving up and trusting the next one regardless.
+///
+/// It exists because `XWarpPointer` onto a pixel the pointer already
+/// occupies generates no `MotionNotify` at all -- X does not report a
+/// position that did not change -- so there is no unbounded wait that is
+/// safe: without this, that one coincidence would discard camera input for
+/// the rest of the lock. Four is arbitrary but generous: the steady-state
+/// case (nothing else moved the mouse in between) confirms on the very next
+/// event, so this bound is only ever exercised by the pathological case it
+/// guards against, not by ordinary play.
+const MAX_WARP_ECHO_WAIT: u8 = 4;
+
+/// What [`locked_pointer_delta`] decided about one locked `MotionNotify`.
+#[derive(Debug, PartialEq, Eq)]
+enum LockedMotion {
+    /// The confirmed echo of the recentring warp, or an event that
+    /// coincidentally lands exactly on `centre` -- either way its delta is
+    /// zero, so the two cases need not be told apart. Clears the wait latch.
+    Echo,
+    /// Not the echo, and still within [`MAX_WARP_ECHO_WAIT`] of the warp that
+    /// is being waited for, so discarded rather than trusted.
+    Waiting,
+    /// A real relative motion to report.
+    Real(i32, i32),
+}
+
+/// What one `MotionNotify` means while the pointer is locked, or whether it
+/// must be discarded instead of reported as camera movement.
+///
+/// Two different things get discarded here, and conflating them was the
+/// X11-180 bug in #41. One is the literal echo of this backend's own
+/// `XWarpPointer` call landing back on `centre`. The other is anything still
+/// arriving from *before* the lock was taken: the pointer is free-roaming
+/// right up to the instant a camera-drag button or the engine's own
+/// `SetMouseBehavior(LockCenter)` engages the lock, and X11 guarantees event
+/// ordering on one connection -- a `MotionNotify` generated before this
+/// backend's `XGrabPointer`+`XWarpPointer` request is necessarily delivered
+/// no later than that request's own echo, never after it. The version of
+/// this function that shipped only ever checked the *immediate* next event:
+/// if a stray in-flight motion sample arrived first, it was read as real
+/// motion relative to `centre` rather than discarded, and a pointer that
+/// happened to be sitting near a window edge -- exactly where a free cursor
+/// tends to be right when the user has just clicked something there -- at
+/// the instant the lock engaged reported that stale absolute position as a
+/// multi-hundred-pixel relative delta in one frame: a one-shot spin, worst
+/// at the edges, which is the shape #41 reports and the discriminator its
+/// reporter offered.
+///
+/// `waiting` is how many consecutive events this lock has already discarded
+/// looking for the echo; see [`MAX_WARP_ECHO_WAIT`] for why that is bounded.
 ///
 /// Separate from [`HostWindow::dispatch_motion`] for the same reason as
 /// [`pointer_lock_decision`] above: the centre-relative arithmetic and the
@@ -683,11 +1390,15 @@ fn locked_pointer_delta(
     event_pos: (i32, i32),
     centre: (i32, i32),
     ignore_next_warp: bool,
-) -> Option<(i32, i32)> {
-    if ignore_next_warp && event_pos == centre {
-        return None;
+    waiting: u8,
+) -> LockedMotion {
+    if event_pos == centre {
+        return LockedMotion::Echo;
     }
-    Some((event_pos.0 - centre.0, event_pos.1 - centre.1))
+    if ignore_next_warp && waiting < MAX_WARP_ECHO_WAIT {
+        return LockedMotion::Waiting;
+    }
+    LockedMotion::Real(event_pos.0 - centre.0, event_pos.1 - centre.1)
 }
 
 impl HostWindow {
@@ -763,43 +1474,35 @@ impl HostWindow {
                 msg.as_mut_ptr() as *mut c_void,
             );
             (xlib.flush)(self.display);
+            set_compositor_bypass(xlib, self.display, self.window, on);
         }
         self.fullscreen.store(on, Ordering::Relaxed);
     }
 
+    /// The focus as the last real focus event left it; `None` before any.
+    fn focused(&self) -> Option<bool> {
+        match self.focused.load(Ordering::Acquire) {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        }
+    }
+
     /// Take or release the pointer to match what the engine and the mouse are
-    /// currently asking for. Called at both ends of `pump_input_events`, so a
-    /// button released mid-drain still ungrabs before the next frame rather
-    /// than a whole pump late.
+    /// currently asking for. Called at both ends of `pump_input_events`, and
+    /// straight after a camera button goes down, so a drag is captured before
+    /// a fast pointer can leave the window rather than up to a pump later.
     ///
-    /// This duplicates Wayland's own `sync_pointer_lock` (`wayland.rs:3622`)
-    /// rather than sharing it with it, which is exactly the thing ADR-024
-    /// asks not to happen to logic common to both backends. Not shared here
-    /// on purpose, for now: the two currently compute genuinely different
-    /// things from different primitives. Wayland reasons about a
-    /// pre-/post-acceleration delta pair handed to it by
-    /// `zwp_relative_pointer_v1`; this backend reasons about warping the
-    /// pointer back to a fixed centre and filtering out the synthetic
-    /// `MotionNotify` that warp itself produces. A shared function today
-    /// would be a wrapper over two unlike mechanisms, not one mechanism
-    /// written once.
-    ///
-    /// ADR-028 records the actual plan and should be read rather than
-    /// inferred from this comment: X11 input moves to XInput2, taking its
-    /// motion from `XI_RawMotion` instead of core `MotionNotify`. That
-    /// event's `raw_values` (pre-acceleration) and `valuators`
-    /// (post-acceleration) are exactly the pair Wayland already has, and once
-    /// both backends compute the same pair from the same kind of source, the
-    /// module ADR-024 asks for is a real refactor rather than a wrapper.
-    /// **This warp path does not go away once that lands.** ADR-028 keeps it
-    /// as the fallback for a server that refuses `XIQueryVersion` (older than
-    /// X.Org 1.7): core X11's `MotionNotify` has already been through the
-    /// server's own acceleration curve by the time it is reported, and no
-    /// core request recovers what the device actually sent, so the warp
-    /// cannot be the default but stays as the only thing that works when XI2
-    /// is not there to ask. Landing XI2 is sequenced after this change, not
-    /// inside it — see ADR-028's "Sequencing" — so `pointer_lock_decision`
-    /// and `locked_pointer_delta` above are not where that work belongs.
+    /// Still a separate function from Wayland's `sync_pointer_lock`, which
+    /// ADR-024 would rather it were not. The decision is now the same shape on
+    /// both -- the engine's word, a camera drag, the forced override, a focus
+    /// gate and no Escape latch -- and the motion source is now the same kind
+    /// of thing (a pre/post-acceleration pair, from `XI_RawMotion` here and
+    /// `zwp_relative_pointer_v1` there), which is what ADR-028 said would make
+    /// sharing a real refactor rather than a wrapper. What still differs is
+    /// everything around the decision: Wayland's right-drag latch, dialogs
+    /// and constraint objects have no X11 counterpart yet, so the shared
+    /// function is left for when they do rather than written around them.
     fn sync_pointer_lock(&self) {
         let engine_wants = super::input::engine_wants_pointer_lock() == Some(true);
 
@@ -817,32 +1520,38 @@ impl HostWindow {
             return;
         }
 
-        let mut state = self
+        let Some(want) =
+            pointer_lock_decision(engine_wants, buttons, no_drag_lock, force, self.focused())
+        else {
+            return;
+        };
+        let held = self
             .pointer_lock
             .lock()
-            .unwrap_or_else(|e| e.into_inner());
-
-        let (want, suppressed) =
-            pointer_lock_decision(engine_wants, buttons, no_drag_lock, force, state.suppressed);
-        state.suppressed = suppressed;
-        let held = state.locked;
-        drop(state);
+            .unwrap_or_else(|e| e.into_inner())
+            .locked;
 
         if want && !held {
-            self.lock_pointer();
+            self.lock_pointer(engine_wants || force);
         } else if !want && held {
             self.release_pointer_lock();
+        } else if want && held && (engine_wants || force) {
+            // A drag lock held where the button went down, and the engine has
+            // since asked for a centred one -- shift lock toggled mid-drag, or
+            // the camera scrolled into first person while the button was
+            // held. Move the anchor rather than keep reporting the drag's
+            // position as the locked centre.
+            self.recentre_lock();
         }
     }
 
-    fn lock_pointer(&self) {
+    fn lock_pointer(&self, centred: bool) {
         let (width, height, _) = self.geometry();
 
         if width <= 0 || height <= 0 {
             return;
         }
 
-        let centre = (width / 2, height / 2);
         let root =
             unsafe { (self.xlib.default_root_window)(self.display) };
 
@@ -854,10 +1563,13 @@ impl HostWindow {
         let mut win_y = 0;
         let mut mask = 0;
 
+        // Relative to this window, so `win_x`/`win_y` are where the pointer
+        // is over the canvas (the drag anchor) and `root_x`/`root_y` where to
+        // put it back on release.
         let queried = unsafe {
             (self.xlib.query_pointer)(
                 self.display,
-                root,
+                self.window,
                 &mut root_return,
                 &mut child_return,
                 &mut root_x,
@@ -870,6 +1582,12 @@ impl HostWindow {
 
         let saved_root =
             if queried != 0 { Some((root_x, root_y)) } else { None };
+        let centre = lock_anchor(
+            centred,
+            self.xi.is_some(),
+            (queried != 0).then_some((win_x, win_y)),
+            (width, height),
+        );
 
         // X11 CurrentTime is 0.
         // owner_events = True
@@ -908,8 +1626,17 @@ impl HostWindow {
 
             state.locked = true;
             state.ignore_next_warp = true;
+            state.warp_echo_wait = 0;
             state.centre = centre;
             state.saved_root = saved_root;
+            state.raw = RawMotionAccumulator::default();
+            state.raw_relative_seen = false;
+            state.absolute_devices.clear();
+            state.last_raw = None;
+        }
+
+        if let Some(xi) = &self.xi {
+            xi.select_raw_motion(self.display, root, true);
         }
 
         unsafe {
@@ -933,18 +1660,37 @@ impl HostWindow {
         // X11 path currently writes `PENDING_UNLOCKED_DELTA` (only
         // `wayland.rs`'s `relative_pointer_motion` does), so there is never
         // anything here to forget. Called anyway so the doc's claim stays
-        // true rather than true of Wayland only, and so a lock taken right
-        // as the pointer crosses into the canvas does not carry a stray
-        // sample forward if this backend ever grows a relative-motion source
-        // of its own.
+        // true rather than true of Wayland only.
         super::input::forget_pending_unlocked_delta();
 
         if super::input::trace_mouse() {
             eprintln!(
-                "[cordial] X11 pointer lock acquired at ({}, {})",
+                "[cordial] X11 pointer lock acquired at ({}, {}) via {}",
                 centre.0,
-                centre.1
+                centre.1,
+                if self.xi.is_some() { "XI_RawMotion" } else { "warp" },
             );
+        }
+    }
+
+    /// Move a held lock's anchor to the window centre. See the last arm of
+    /// `sync_pointer_lock`.
+    fn recentre_lock(&self) {
+        let (width, height, _) = self.geometry();
+        let centre = (width / 2, height / 2);
+        {
+            let mut state = self.pointer_lock.lock().unwrap_or_else(|e| e.into_inner());
+            if !state.locked || state.centre == centre {
+                return;
+            }
+            state.centre = centre;
+            state.ignore_next_warp = true;
+            state.warp_echo_wait = 0;
+        }
+        // SAFETY: this struct's own live handles.
+        unsafe {
+            (self.xlib.warp_pointer)(self.display, 0, self.window, 0, 0, 0, 0, centre.0, centre.1);
+            (self.xlib.flush)(self.display);
         }
     }
 
@@ -961,6 +1707,10 @@ impl HostWindow {
             state.locked = false;
             state.ignore_next_warp = false;
             state.centre = (0, 0);
+            // Movement summed this drain and not yet delivered belongs to a
+            // lock that no longer exists; delivering it after the release
+            // would turn the camera with the cursor already free.
+            state.raw = RawMotionAccumulator::default();
 
             (was_locked, saved_root)
         };
@@ -970,6 +1720,11 @@ impl HostWindow {
         }
 
         unsafe {
+            if let Some(xi) = &self.xi {
+                let root = (self.xlib.default_root_window)(self.display);
+                xi.select_raw_motion(self.display, root, false);
+            }
+
             // X11 CurrentTime is 0.
             (self.xlib.ungrab_pointer)(self.display, 0);
 
@@ -1002,26 +1757,6 @@ impl HostWindow {
         }
     }
 
-    fn escape_pointer_lock(&self) -> bool {
-        let held = self
-            .pointer_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .locked;
-
-        if !held {
-            return false;
-        }
-
-        self.pointer_lock
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .suppressed = true;
-
-        self.release_pointer_lock();
-        true
-    }
-
     pub fn close(&self) {
         // SAFETY: both handles came from this struct's own creation calls.
         unsafe {
@@ -1033,6 +1768,89 @@ impl HostWindow {
 
 pub fn current() -> Option<&'static HostWindow> {
     WINDOW.get()
+}
+
+/// Every input to the X11 pointer-lock decision, for the control socket's
+/// `pointerlock` verb -- the X11 counterpart of `wayland::pointer_lock_report`,
+/// with the same leading fields so one harness reads both.
+///
+/// `requested` and `confirmed` are the same value here, and that is a fact
+/// about X11 rather than a shortcut: `XGrabPointer` either succeeds or returns
+/// an error synchronously, so there is no window in which Cordial has asked and
+/// the server has not yet answered. `motion` says which of ADR-028's two
+/// mechanisms this session runs on, and the `raw_*` counters are what tell a
+/// lock that is receiving raw events from one that is not -- which a
+/// screenshot cannot.
+pub(crate) fn pointer_lock_report() -> String {
+    let engine = match super::input::engine_wants_pointer_lock() {
+        Some(v) => if v { "true" } else { "false" },
+        None => "unavailable",
+    };
+    let Some(w) = current() else {
+        return "err no X11 window".into();
+    };
+    let buttons = w.input.lock().unwrap_or_else(|e| e.into_inner()).buttons;
+    let state = w.pointer_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let motion = match &w.xi {
+        Some(xi) => format!("xi{}.{}", xi.version.0, xi.version.1),
+        None => "warp".to_string(),
+    };
+    format!(
+        "ok requested={locked} confirmed={locked} focused={} engine={engine} buttons={buttons} \
+         motion={motion} anchor={},{} raw_relative={} raw_events={} raw_duplicates={} \
+         raw_refused={} raw_deliveries={} accel={}",
+        match w.focused() {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "unknown",
+        },
+        state.centre.0,
+        state.centre.1,
+        state.raw_relative_seen,
+        state.raw_events,
+        state.raw_duplicates,
+        state.raw_refused,
+        state.raw_deliveries,
+        if super::wayland::current_pointer_acceleration() { "accelerated" } else { "raw" },
+        locked = state.locked,
+    )
+}
+
+/// Whether the window manager has asked this window to close.
+pub fn window_closed() -> bool {
+    WINDOW_CLOSED.load(Ordering::Acquire)
+}
+
+/// `_NET_WM_BYPASS_COMPOSITOR`, only when `CORDIAL_COMPOSITOR_BYPASS=1`.
+///
+/// Opt-in because nothing about it has been measured here: it is a hint an
+/// Xorg compositor may use to unredirect a fullscreen window, and whether that
+/// saves a copy or a frame of latency on any given desktop is unknown. Cleared
+/// again on leaving fullscreen, so a compositor that caches the property does
+/// not go on treating a windowed client as a scanout candidate.
+///
+/// SAFETY: `display` and `window` must be live handles from `xlib`.
+unsafe fn set_compositor_bypass(xlib: &Xlib, display: Display, window: Window, on: bool) {
+    static OPTED_IN: OnceLock<bool> = OnceLock::new();
+    if !*OPTED_IN.get_or_init(|| std::env::var("CORDIAL_COMPOSITOR_BYPASS").as_deref() == Ok("1")) {
+        return;
+    }
+    // SAFETY: `display` and `window` are live handles per this function's own
+    // contract, stated above; the rest are ordinary xlib calls on them.
+    unsafe {
+        let property = (xlib.intern_atom)(display, c"_NET_WM_BYPASS_COMPOSITOR".as_ptr(), 0);
+        let cardinal = (xlib.intern_atom)(display, c"CARDINAL".as_ptr(), 0);
+        if property == 0 || cardinal == 0 {
+            return;
+        }
+        // Format 32 takes a C `long` per item, whatever the platform's width.
+        let value: c_ulong = on as c_ulong;
+        (xlib.change_property)(
+            display, window, property, cardinal, 32, 0, // PropModeReplace
+            (&value as *const c_ulong).cast(), 1,
+        );
+        (xlib.flush)(display);
+    }
 }
 
 // ------------------------------------------------------------- input pump
@@ -1083,11 +1901,13 @@ struct XInputEvent {
 const KEY_PRESS: c_int = 2;
 const KEY_RELEASE: c_int = 3;
 const MOTION_NOTIFY: c_int = 6;
+const FOCUS_IN: c_int = 9;
 const FOCUS_OUT: c_int = 10;
 const BUTTON_PRESS: c_int = 4;
 const BUTTON_RELEASE: c_int = 5;
 const EXPOSE: c_int = 12;
 const CONFIGURE_NOTIFY: c_int = 22;
+const CLIENT_MESSAGE: c_int = 33;
 
 /// `XConfigureEvent`. Another distinct layout: it carries the window's new
 /// geometry rather than a damaged rectangle.
@@ -1250,9 +2070,35 @@ impl HostWindow {
         let Some(android_button) = x11_button_to_android(ev.detail) else {
             return;
         };
-        let (x, y) = (ev.x as f32, ev.y as f32);
+        // While locked the engine has been told the pointer is at the anchor
+        // all along, and a click has to land there too. On the raw path the
+        // hidden pointer drifts away from the anchor between edge warps, so
+        // the event's own position would put the release of a camera drag
+        // somewhere the player never saw the cursor.
+        let (x, y) = {
+            let lock = self.pointer_lock.lock().unwrap_or_else(|e| e.into_inner());
+            if lock.locked {
+                (lock.centre.0 as f32, lock.centre.1 as f32)
+            } else {
+                (ev.x as f32, ev.y as f32)
+            }
+        };
+        self.dispatch_button_bit(handle, android_button, x, y, press);
+    }
 
+    /// One button going down or up, to both input paths. Separate from
+    /// [`Self::dispatch_button`] so a release Cordial synthesises -- a real
+    /// focus loss, or a release another client's grab swallowed -- tells the
+    /// engine exactly what a real one would, rather than only clearing the
+    /// shadow bitmask and leaving the engine believing the button is down.
+    fn dispatch_button_bit(&self, handle: i64, android_button: i32, x: f32, y: f32, press: bool) {
         let mut state = self.input.lock().unwrap_or_else(|e| e.into_inner());
+        if !press && state.buttons & android_button == 0 {
+            // Already up as far as the engine knows: a second release would
+            // be a release of a button it was never told is down.
+            return;
+        }
+        state.last_pos = (x, y);
         let now = state.clock.elapsed().as_millis() as i64;
 
         if press {
@@ -1292,57 +2138,76 @@ impl HostWindow {
             if state.locked {
                 let centre = state.centre;
 
-                let Some((dx, dy)) =
-                    locked_pointer_delta((ev.x, ev.y), centre, state.ignore_next_warp)
-                else {
-                    state.ignore_next_warp = false;
+                // **On the raw path a core motion is not a measurement.** Once
+                // this lock has seen relative `XI_RawMotion`, the camera's
+                // movement comes from there (see `dispatch_generic`), and
+                // reading this event as well would count the same movement
+                // twice -- once unaccelerated, once as the server's
+                // accelerated pointer position. All it is used for is keeping
+                // the hidden pointer off the confinement's edge; see
+                // `RAW_EDGE_MARGIN`.
+                if self.xi.is_some() && state.raw_relative_seen {
+                    let (w, h, _) = self.geometry();
+                    if (ev.x, ev.y) != centre && near_edge((ev.x, ev.y), (w, h)) {
+                        drop(state);
+                        // SAFETY: this struct's own live handles.
+                        unsafe {
+                            (self.xlib.warp_pointer)(
+                                self.display, 0, self.window, 0, 0, 0, 0, centre.0, centre.1,
+                            );
+                            (self.xlib.flush)(self.display);
+                        }
+                    }
                     return;
+                }
+
+                let (dx, dy) = match locked_pointer_delta(
+                    (ev.x, ev.y),
+                    centre,
+                    state.ignore_next_warp,
+                    state.warp_echo_wait,
+                ) {
+                    LockedMotion::Echo => {
+                        if super::input::trace_mouse() && state.warp_echo_wait > 0 {
+                            eprintln!(
+                                "[cordial] X11 pointer lock: warp echo confirmed at ({}, {}) after discarding {} stale event(s)",
+                                ev.x, ev.y, state.warp_echo_wait
+                            );
+                        }
+                        state.ignore_next_warp = false;
+                        state.warp_echo_wait = 0;
+                        return;
+                    }
+                    LockedMotion::Waiting => {
+                        state.warp_echo_wait += 1;
+                        if super::input::trace_mouse() {
+                            eprintln!(
+                                "[cordial] X11 pointer lock: discarding stale motion at ({}, {}), waiting for warp echo at ({}, {}) (wait={})",
+                                ev.x, ev.y, centre.0, centre.1, state.warp_echo_wait
+                            );
+                        }
+                        return;
+                    }
+                    LockedMotion::Real(dx, dy) => {
+                        // Either the ordinary case (no warp outstanding) or
+                        // `MAX_WARP_ECHO_WAIT` was reached, in which case the
+                        // wait is abandoned here rather than left stuck at
+                        // the bound forever.
+                        state.warp_echo_wait = 0;
+                        (dx, dy)
+                    }
                 };
                 let (cx, cy) = centre;
+                drop(state);
+                self.deliver_locked_delta(handle, centre, dx as f32, dy as f32);
 
-                // Preserve the existing Android/AGDK motion path while the
-                // pointer is captured. The absolute position remains the
-                // capture centre, but Roblox still sees the same MotionEvent
-                // sequence it saw before pointer locking was introduced.
-                let input = self
-                    .input
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-
-                let buttons = input.buttons;
-                let down_time = input.down_time_ms;
-                let now = input.clock.elapsed().as_millis() as i64;
-                drop(input);
-
-                let action =
-                    if buttons != 0 {
-                        ACTION_MOVE
-                    } else {
-                        ACTION_HOVER_MOVE
-                    };
-
-                deliver_mouse(
-                    handle,
-                    action,
-                    cx as f32,
-                    cy as f32,
-                    buttons,
-                    0,
-                    now,
-                    down_time,
-                );
-
-                // The relative delta is still delivered through Roblox's
-                // NativeInputInterface path for camera rotation.
                 if dx != 0 || dy != 0 {
-                    drop(state);
-
-                    super::input::pass_mouse_move_delta(
-                        cx as f32,
-                        cy as f32,
-                        dx as f32,
-                        dy as f32,
-                    );
+                    if super::input::trace_mouse() {
+                        eprintln!(
+                            "[cordial] X11 pointer lock: motion at ({}, {}) -> delta ({dx}, {dy}), re-warping to ({cx}, {cy})",
+                            ev.x, ev.y
+                        );
+                    }
 
                     let mut state = self
                         .pointer_lock
@@ -1373,10 +2238,11 @@ impl HostWindow {
         }
 
         let (x, y) = (ev.x as f32, ev.y as f32);
-        let state = self
+        let mut state = self
             .input
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        state.last_pos = (x, y);
         let now = state.clock.elapsed().as_millis() as i64;
         let (buttons, down_time) = (state.buttons, state.down_time_ms);
         drop(state);
@@ -1390,6 +2256,269 @@ impl HostWindow {
         // real and the engine consumes it, it is simply not what hit-tests the
         // Lua UI.
         pass_mouse_move(x, y);
+    }
+
+    /// One locked movement, to both input paths: AGDK sees a move at the
+    /// anchor (the absolute position does not change while locked) and
+    /// `nativePassMouseMove` carries the delta the camera turns by. Shared by
+    /// the warp fallback, which calls it per core event, and the raw path,
+    /// which calls it once per drain.
+    fn deliver_locked_delta(&self, handle: i64, anchor: (i32, i32), dx: f32, dy: f32) {
+        let input = self.input.lock().unwrap_or_else(|e| e.into_inner());
+        let buttons = input.buttons;
+        let down_time = input.down_time_ms;
+        let now = input.clock.elapsed().as_millis() as i64;
+        drop(input);
+        let action = if buttons != 0 { ACTION_MOVE } else { ACTION_HOVER_MOVE };
+        let (cx, cy) = (anchor.0 as f32, anchor.1 as f32);
+        deliver_mouse(handle, action, cx, cy, buttons, 0, now, down_time);
+        if dx != 0.0 || dy != 0.0 {
+            super::input::pass_mouse_move_delta(cx, cy, dx, dy);
+        }
+    }
+
+    /// An XInput2 `GenericEvent`. Only `XI_RawMotion` is selected, and only
+    /// while locked; anything else, or anything arriving after the lock went,
+    /// is freed and dropped.
+    fn dispatch_generic(&self, buf: &mut [u8; 256]) {
+        let Some(xi) = &self.xi else { return };
+        let cookie = buf.as_mut_ptr() as *mut XGenericEventCookie;
+        // SAFETY: `XNextEvent` filled `buf` with a `GenericEvent`, whose
+        // `XEvent` member is `XGenericEventCookie`; `buf` is 256 bytes, larger
+        // than the union. `XGetEventData` fills `data`, which is freed below on
+        // every path that got it, and nothing read through it outlives that.
+        unsafe {
+            if (*cookie).extension != xi.opcode || (xi.get_event_data)(self.display, cookie) == 0 {
+                return;
+            }
+            if (*cookie).evtype == XI_RAW_MOTION && !(*cookie).data.is_null() {
+                let raw = &*((*cookie).data as *const XIRawEvent);
+                let mask_len = raw.valuators_mask_len.max(0) as usize;
+                let mask: &[u8] = if raw.valuators_mask.is_null() || mask_len == 0 {
+                    &[]
+                } else {
+                    std::slice::from_raw_parts(raw.valuators_mask, mask_len)
+                };
+                let n: usize = mask.iter().map(|b| b.count_ones() as usize).sum();
+                let acc: &[f64] = if raw.valuators_values.is_null() {
+                    &[]
+                } else {
+                    std::slice::from_raw_parts(raw.valuators_values, n)
+                };
+                let unacc: &[f64] = if raw.raw_values.is_null() {
+                    &[]
+                } else {
+                    std::slice::from_raw_parts(raw.raw_values, n)
+                };
+                let (acc, unacc) = raw_motion_axes(mask, acc, unacc);
+                let key: RawSampleKey = (raw.time, raw.deviceid, raw.sourceid, unacc.0, unacc.1);
+                self.take_raw_motion(xi, key, acc, unacc);
+            }
+            (xi.free_event_data)(self.display, cookie);
+        }
+    }
+
+    /// Fold one raw sample into this drain's total, if the lock is held and
+    /// the device is relative.
+    fn take_raw_motion(&self, xi: &Xi, key: RawSampleKey, acc: (f64, f64), unacc: (f64, f64)) {
+        let source = key.2;
+        let mut state = self.pointer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.locked {
+            // In flight when the lock was released and the subscription
+            // dropped. See `Xi::select_raw_motion`: movement outside a lock is
+            // not Cordial's to read.
+            return;
+        }
+        if is_duplicate_raw(state.last_raw, key) {
+            state.raw_duplicates += 1;
+            return;
+        }
+        state.last_raw = Some(key);
+        let absolute = match state.absolute_devices.iter().find(|(id, _)| *id == source) {
+            Some(&(_, a)) => a,
+            None => {
+                let a = xi.device_is_absolute(self.display, source);
+                state.absolute_devices.push((source, a));
+                if a {
+                    eprintln!(
+                        "[cordial] X11 pointer lock: device {source} reports absolute positions; \
+                         its raw motion is ignored and the camera follows it by warping instead"
+                    );
+                }
+                a
+            }
+        };
+        if absolute {
+            state.raw_refused += 1;
+            return;
+        }
+        state.raw_relative_seen = true;
+        state.raw_events += 1;
+        let d = choose_camera_delta(super::wayland::current_pointer_acceleration(), acc, unacc);
+        state.raw.add(d);
+        if super::input::trace_mouse() {
+            eprintln!(
+                "[cordial] X11 raw motion: time={} device={source} accelerated=({:.3}, {:.3}) raw=({:.3}, {:.3}) -> ({:.3}, {:.3})",
+                key.0, acc.0, acc.1, unacc.0, unacc.1, d.0, d.1
+            );
+        }
+    }
+
+    /// Hand the drain's summed raw movement to the engine.
+    fn flush_raw_motion(&self, handle: i64) {
+        let (anchor, total) = {
+            let mut state = self.pointer_lock.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(total) = state.raw.take() else { return };
+            if !state.locked {
+                return;
+            }
+            state.raw_deliveries += 1;
+            (state.centre, total)
+        };
+        self.deliver_locked_delta(handle, anchor, total.0 as f32, total.1 as f32);
+    }
+
+    /// A `FocusIn` or `FocusOut`. See [`focus_change_is_real`] for which ones
+    /// mean anything.
+    fn dispatch_focus(&self, handle: i64, buf: &[u8; 256], focus_in: bool) {
+        // SAFETY: `XFocusChangeEvent` is `{type, serial, send_event, display,
+        // window, mode, detail}`; `mode` and `detail` sit at 40 and 44 on
+        // LP64, where `XInputEvent::root` would be -- which is why the review
+        // of the original patch noted this event needs its own view rather than
+        // the shared one. Read unaligned since `buf` is a byte array.
+        let (mode, detail) = unsafe {
+            (
+                std::ptr::read_unaligned(buf.as_ptr().add(40) as *const c_int),
+                std::ptr::read_unaligned(buf.as_ptr().add(44) as *const c_int),
+            )
+        };
+        // Every focus event, with its mode, under the mouse trace: the review
+        // asked for exactly this log to tell one desktop's focus behaviour
+        // from another's, and without it "the camera jerks on media keys" is
+        // unattributable.
+        if super::input::trace_mouse() || super::input::trace_text() {
+            eprintln!(
+                "[cordial] X11 Focus{} mode={mode} detail={detail} ({})",
+                if focus_in { "In" } else { "Out" },
+                if focus_change_is_real(mode, detail) { "acted on" } else { "a grab; ignored" },
+            );
+        }
+        if focus_change_is_real(mode, detail) {
+            if focus_in {
+                self.focused.store(1, Ordering::Release);
+            } else {
+                self.focused.store(2, Ordering::Release);
+                self.lose_focus(handle);
+            }
+        } else if focus_in && mode == NOTIFY_UNGRAB {
+            // Another client's keyboard grab has ended and the keyboard is
+            // back. Nothing about the lock changes -- it was never released --
+            // but anything released *during* the grab went to the grabber, so
+            // the engine may still be holding a key or button that is up.
+            self.release_what_the_grab_swallowed(handle);
+        }
+        // `FocusOut` with `NotifyGrab`: deliberately nothing. The window has
+        // not lost focus; a key binding fired. Releasing the lock here is what
+        // warped the pointer twice per media key.
+    }
+
+    /// The window really lost the keyboard: give the pointer back, and tell
+    /// the engine every button and key it still believes is down is up.
+    fn lose_focus(&self, handle: i64) {
+        self.release_pointer_lock();
+
+        let (buttons, (x, y), stranded) = {
+            let mut state = self.input.lock().unwrap_or_else(|e| e.into_inner());
+            (state.buttons, state.last_pos, std::mem::take(&mut state.held_keys))
+        };
+
+        // **Releases, not a cleared bitmask.** This used to set `buttons = 0`,
+        // which changed Cordial's own record and told the engine nothing: it
+        // had seen the press, never saw a release, and went on treating the
+        // right button as held -- a camera drag that would not end, or a
+        // button state that disagreed with Cordial's until the next press.
+        // Wayland's `pointer_leave` had the same fault and the same fix.
+        for b in held_button_bits(buttons) {
+            if super::input::trace_mouse() {
+                eprintln!("[cordial] X11 focus out holding button {b}; releasing it");
+            }
+            self.dispatch_button_bit(handle, b, x, y, false);
+        }
+
+        // **Let go of every key the engine still thinks is down.**
+        // X only sends key events to the focused client, so a key
+        // released while another window has focus never produces a
+        // KeyRelease here, and the engine goes on walking in the
+        // direction it was last told. Issue #41 describes exactly
+        // that on X11: movement continuing in the previous
+        // direction for about five seconds after the camera's
+        // warp/grab cycle, which releases the grab through this
+        // arm. The Wayland backend has done this on
+        // `wl_keyboard.leave` for some time; this backend kept no
+        // held-key set to do it with. `INFERRED` that this is the
+        // whole of #41's second symptom -- no X11 session was run
+        // here -- but a release for a key that is up is harmless,
+        // and a missing one is the reported bug's shape.
+        if !stranded.is_empty() {
+            let now = self.now_ms();
+            for (keycode, x_keycode) in stranded {
+                deliver_key(handle, false, keycode, x_keycode, 0, 0, 0, now, now);
+                pass_key_event(false, x_keycode - 8, 0);
+            }
+            if super::input::trace_mouse() || super::input::trace_text() {
+                eprintln!("[cordial] X11 focus out: released keys still held");
+            }
+        }
+    }
+
+    /// After another client's keyboard grab: release whatever went up while it
+    /// had the input, asking the server what is physically down rather than
+    /// guessing. A key still held through the grab -- W held across a volume
+    /// key, the usual case -- is left alone, which is the difference from
+    /// treating the grab as a focus loss: that released W and the player
+    /// stopped walking with the key still down.
+    ///
+    /// The keymap is read when this event is processed, which can be after
+    /// the grab ended, so a key let go *after* the grab can be released here
+    /// and then again by its own `KeyRelease` still queued behind. Seen with
+    /// `xdotool key alt+x` against an i3 binding: Alt was released here and
+    /// then arrived. A second release of a key that is up is harmless -- the
+    /// `FOCUS_OUT` path has always relied on that -- where a missing one is a
+    /// key the engine believes is held for good.
+    fn release_what_the_grab_swallowed(&self, handle: i64) {
+        let mut keymap = [0u8; 32];
+        let (mut root, mut child, mut rx, mut ry, mut wx, mut wy, mut mask) =
+            (0, 0, 0, 0, 0, 0, 0);
+        // SAFETY: this struct's own live display and window; `keymap` is the
+        // 32 bytes `XQueryKeymap` writes, and the rest are live locals.
+        let pointer_known = unsafe {
+            (self.xlib.query_keymap)(self.display, keymap.as_mut_ptr() as *mut c_char);
+            (self.xlib.query_pointer)(
+                self.display, self.window, &mut root, &mut child, &mut rx, &mut ry, &mut wx,
+                &mut wy, &mut mask,
+            ) != 0
+        };
+        let (buttons, (x, y), keys_up) = {
+            let mut state = self.input.lock().unwrap_or_else(|e| e.into_inner());
+            let up = keys_released_elsewhere(&state.held_keys, &keymap);
+            state.held_keys.retain(|k| !up.contains(k));
+            (state.buttons, state.last_pos, up)
+        };
+        if pointer_known {
+            for b in buttons_released_elsewhere(buttons, mask) {
+                self.dispatch_button_bit(handle, b, x, y, false);
+            }
+        }
+        if !keys_up.is_empty() {
+            let now = self.now_ms();
+            for (keycode, x_keycode) in keys_up {
+                deliver_key(handle, false, keycode, x_keycode, 0, 0, 0, now, now);
+                pass_key_event(false, x_keycode - 8, 0);
+            }
+            if super::input::trace_mouse() || super::input::trace_text() {
+                eprintln!("[cordial] X11 keyboard grab ended: released keys let go during it");
+            }
+        }
     }
 
     fn dispatch_key(&self, handle: i64, buf: &mut [u8; 256], down: bool) {
@@ -1410,13 +2539,36 @@ impl HostWindow {
             )
         };
         let ev = unsafe { &*(buf.as_ptr() as *const XInputEvent) };
-        let unicode = if n > 0 { text[0] as i32 } else { 0 };
-        let meta = android_meta_state(ev.state);
+        let fallback = keysym_text_fallback(n, ev.state, keysym);
+        let mut fallback_buf = [0u8; 4];
+        let typed_text: &str = match fallback {
+            Some(ch) => ch.encode_utf8(&mut fallback_buf),
+            None => std::str::from_utf8(&text[..n.max(0) as usize]).unwrap_or(""),
+        };
+        let unicode = match fallback {
+            Some(ch) => ch as i32,
+            None if n > 0 => text[0] as i32,
+            None => 0,
+        };
+        // See `modifier_self_meta`: a modifier key's own event carries the
+        // mask from before it, so Shift's press would otherwise reach the
+        // engine without `META_SHIFT_ON` and its release with it.
+        let meta = {
+            let m = android_meta_state(ev.state);
+            let own = modifier_self_meta(keysym);
+            if down { m | own } else { m & !own }
+        };
         let now = self.now_ms();
 
-        if down && keysym == 0xff1b && self.escape_pointer_lock() {
-            return;
-        }
+        // **Escape is not special here any more.** It used to release the
+        // lock and set a latch that kept it released while the engine went on
+        // asking, and swallow the key so Roblox never saw it -- so in shift
+        // lock one Escape disabled the camera until shift lock was toggled,
+        // and the menu Escape is meant to open never opened. It now reaches
+        // the engine like any other key; Roblox opens its menu and drops its
+        // own lock request, and the lock follows on the next pump. See
+        // `pointer_lock_decision` for the measurement, and Wayland's `d440c4f`
+        // for the same change there.
 
         // XK_F11. Like the Wayland game window, this backend is not the GTK
         // launcher and therefore cannot inherit its `win.fullscreen` action.
@@ -1433,9 +2585,7 @@ impl HostWindow {
             eprintln!(
                 "[cordial] key {} keysym={keysym:#x} text={} keycode={:?} focus={:?}",
                 if down { "down" } else { "up" },
-                super::input::redacted(
-                    std::str::from_utf8(&text[..n.max(0) as usize]).unwrap_or("")
-                ),
+                super::input::redacted(typed_text),
                 keysym_to_android(keysym),
                 cordial_linker_sys::game_activity::focused_textbox(),
             );
@@ -1453,6 +2603,10 @@ impl HostWindow {
         // AKEYCODE has a name for it, and an email address is unusable without
         // it. So this is now a branch rather than an exit.
         if let Some(keycode) = keysym_to_android(keysym) {
+            {
+                let mut input = self.input.lock().unwrap_or_else(|e| e.into_inner());
+                track_held_key(&mut input.held_keys, down, (keycode, ev.detail as i32));
+            }
             deliver_key(handle, down, keycode, ev.detail as i32, meta, 0, unicode, now, now);
             // The evdev code, not the Android keycode. X11 keycodes are evdev
             // offset by 8 -- XKB reserves the low 8 for historical reasons every
@@ -1489,11 +2643,7 @@ impl HostWindow {
                 }
                 return;
             }
-            let typed = if n > 0 {
-                std::str::from_utf8(&text[..n as usize]).unwrap_or("")
-            } else {
-                ""
-            };
+            let typed = typed_text;
             // Editing keys, before text: an IME consumes these itself rather
             // than committing them, and `XLookupString` reports nothing for
             // them anyway. Keysyms from keysymdef.h.
@@ -1535,7 +2685,17 @@ impl HostWindow {
         // SAFETY: `pfd` is a live array of length 1; a 0ms timeout makes this a
         // pure non-blocking check.
         let ready = unsafe { poll(&mut pfd as *mut PollFd as *mut c_void, 1, 0) };
-        if ready <= 0 {
+        // **The socket is not the whole queue.** A drain stops at
+        // `MAX_EVENTS_PER_DRAIN`, and whatever Xlib had already read past that
+        // sits in its own buffer, where `poll` cannot see it -- so the rest of
+        // a burst waited for the next unrelated byte on the wire. Raw motion
+        // makes bursts routine (a 1000 Hz mouse is a thousand events a second
+        // before the core ones), which is what turned this from theoretical
+        // into a camera that stutters. `QueuedAlready` (0) counts that buffer
+        // without reading anything, so it cannot block.
+        // SAFETY: `self.display` is open.
+        let buffered = unsafe { (self.xlib.events_queued)(self.display, 0) };
+        if ready <= 0 && buffered <= 0 {
             return;
         }
 
@@ -1561,6 +2721,14 @@ impl HostWindow {
                 BUTTON_PRESS | BUTTON_RELEASE => {
                     let ev = unsafe { &*(buf.as_ptr() as *const XInputEvent) };
                     self.dispatch_button(handle, ev, event_type == BUTTON_PRESS);
+                    // A camera button is captured now rather than at the end
+                    // of the drain, the same reasoning as Wayland's
+                    // `dispatch_pointer_button`: a drain can hold sixty-odd
+                    // events, and the drag anchor is meant to be where the
+                    // button went down, not wherever the pointer had got to.
+                    if event_type == BUTTON_PRESS && matches!(ev.detail, 2 | 3) {
+                        self.sync_pointer_lock();
+                    }
                 }
                 MOTION_NOTIFY => {
                     let ev = unsafe { &*(buf.as_ptr() as *const XInputEvent) };
@@ -1569,15 +2737,11 @@ impl HostWindow {
                 KEY_PRESS | KEY_RELEASE => {
                     self.dispatch_key(handle, &mut buf, event_type == KEY_PRESS);
                 }
-                FOCUS_OUT => {
-                    self.release_pointer_lock();
-
-                    let mut state = self
-                        .input
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-
-                    state.buttons = 0;
+                FOCUS_IN | FOCUS_OUT => {
+                    self.dispatch_focus(handle, &buf, event_type == FOCUS_IN);
+                }
+                GENERIC_EVENT => {
+                    self.dispatch_generic(&mut buf);
                 }
                 EXPOSE => {
                     // SAFETY: `event_type == EXPOSE` means `XNextEvent` just
@@ -1597,10 +2761,29 @@ impl HostWindow {
                     let ev = unsafe { &*(buf.as_ptr() as *const XConfigureEvent) };
                     self.dispatch_configure(handle, ev.width, ev.height);
                 }
+                CLIENT_MESSAGE => {
+                    // `WM_DELETE_WINDOW` arrives as a ClientMessage whose
+                    // `message_type` is WM_PROTOCOLS and whose first data word
+                    // is the delete atom -- the same offsets `open` writes by
+                    // hand. Read unaligned, since `buf` is a byte array.
+                    let message_type =
+                        unsafe { std::ptr::read_unaligned(buf.as_ptr().add(40) as *const c_ulong) };
+                    let protocol =
+                        unsafe { std::ptr::read_unaligned(buf.as_ptr().add(56) as *const c_ulong) };
+                    if message_type == self.wm_protocols && protocol == self.wm_delete_window {
+                        // Recorded, not acted on: the pump reads it and
+                        // `CORDIAL_NO_CLOSE_EXIT` decides whether it ends the
+                        // run, the same as a Wayland close.
+                        if !WINDOW_CLOSED.swap(true, Ordering::AcqRel) {
+                            println!("[android] X11: the window manager asked the window to close");
+                        }
+                    }
+                }
                 _ => {}
             }
         }
 
+        self.flush_raw_motion(handle);
         self.sync_pointer_lock();
     }
 
@@ -1894,34 +3077,262 @@ pub fn overrides() -> Vec<(&'static str, *mut c_void)> {
     ]
 }
 
+/// The character a key typed when `XLookupString` could not say, or `None`.
+///
+/// `XLookupString` only ever produces Latin-1, so on a Cyrillic layout it
+/// returns no bytes and the letter was lost. The keysym still names it, so it
+/// is used then -- and only then. It must not win over bytes Xlib did produce,
+/// and must not fire under Control or Alt: Ctrl+A's keysym is still `a`, and
+/// letting it through inserted the letter into a focused TextBox where Xlib had
+/// correctly reported a control character or nothing at all.
+fn keysym_text_fallback(lookup_len: c_int, x11_state: c_uint, keysym: c_ulong) -> Option<char> {
+    const CONTROL_MASK: c_uint = 1 << 2;
+    const MOD1_MASK: c_uint = 1 << 3;
+    if lookup_len > 0 || x11_state & (CONTROL_MASK | MOD1_MASK) != 0 {
+        return None;
+    }
+    super::input::keysym_to_char(keysym).filter(|c| !c.is_control())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn pointer_lock_is_wanted_for_any_of_its_three_independent_reasons() {
-        // Nothing asking: no lock, and the latch has nothing to hold.
-        assert_eq!(pointer_lock_decision(false, 0, false, false, false), (false, false));
-        // The engine's own request, alone.
-        assert_eq!(pointer_lock_decision(true, 0, false, false, false), (true, false));
-        // A camera-button drag, alone -- and blocked by CORDIAL_NO_DRAG_LOCK.
-        assert_eq!(pointer_lock_decision(false, BUTTON_SECONDARY, false, false, false), (true, false));
-        assert_eq!(pointer_lock_decision(false, BUTTON_SECONDARY, true, false, false), (false, false));
-        // The primary button is not a camera button and must not arm the lock.
-        assert_eq!(pointer_lock_decision(false, BUTTON_PRIMARY, false, false, false), (false, false));
-        // The forced override, alone.
-        assert_eq!(pointer_lock_decision(false, 0, false, true, false), (true, false));
+    fn held_keys_are_tracked_once_and_dropped_on_release() {
+        let mut held = Vec::new();
+        track_held_key(&mut held, true, (51, 25));
+        track_held_key(&mut held, true, (51, 25)); // auto-repeat
+        track_held_key(&mut held, true, (47, 39));
+        assert_eq!(held, vec![(51, 25), (47, 39)]);
+        track_held_key(&mut held, false, (51, 25));
+        assert_eq!(held, vec![(47, 39)], "only the key that came up is forgotten");
+        track_held_key(&mut held, false, (99, 99)); // release for a key never seen
+        assert_eq!(held, vec![(47, 39)]);
     }
 
     #[test]
-    fn the_escape_latch_holds_until_nothing_is_asking_any_more() {
-        // Escape has just suppressed the lock, but the engine (or a held
-        // camera button) is still asking for it the same pump: the latch
-        // must hold, not be immediately overridden.
-        assert_eq!(pointer_lock_decision(true, 0, false, false, true), (false, true));
-        // The ask has stopped -- the button was released, the engine let go
-        // -- so the latch clears and a later ask can re-arm the lock.
-        assert_eq!(pointer_lock_decision(false, 0, false, false, true), (false, false));
+    fn a_keysym_only_supplies_text_that_xlib_could_not() {
+        // Cyrillic_a on a Russian layout: no Latin-1 bytes, no modifiers.
+        assert_eq!(keysym_text_fallback(0, 0, 0x06c1), Some('а'));
+        // Shift is how capitals are typed and must not suppress them.
+        assert_eq!(keysym_text_fallback(0, 1, 0x06e1), Some('А'));
+        // Bytes from Xlib always win, including for a plain Latin letter.
+        assert_eq!(keysym_text_fallback(1, 0, 0x0061), None);
+        // Ctrl+A / Ctrl+C and Alt+letter: the keysym is the letter, but no
+        // letter was typed.
+        assert_eq!(keysym_text_fallback(0, 1 << 2, 0x0061), None);
+        assert_eq!(keysym_text_fallback(0, 1 << 2, 0x0063), None);
+        assert_eq!(keysym_text_fallback(0, 1 << 3, 0x06c1), None);
+        // An editing key has no character to offer.
+        assert_eq!(keysym_text_fallback(0, 0, 0xff08), None);
+    }
+
+    #[test]
+    fn pointer_lock_is_wanted_for_any_of_its_three_independent_reasons() {
+        let focused = Some(true);
+        // Nothing asking: no lock.
+        assert_eq!(pointer_lock_decision(false, 0, false, false, focused), Some(false));
+        // The engine's own request, alone.
+        assert_eq!(pointer_lock_decision(true, 0, false, false, focused), Some(true));
+        // A camera-button drag, alone -- and blocked by CORDIAL_NO_DRAG_LOCK.
+        assert_eq!(pointer_lock_decision(false, BUTTON_SECONDARY, false, false, focused), Some(true));
+        assert_eq!(pointer_lock_decision(false, BUTTON_TERTIARY, false, false, focused), Some(true));
+        assert_eq!(pointer_lock_decision(false, BUTTON_SECONDARY, true, false, focused), Some(false));
+        // The primary button is not a camera button and must not arm the lock.
+        assert_eq!(pointer_lock_decision(false, BUTTON_PRIMARY, false, false, focused), Some(false));
+        // The forced override, alone.
+        assert_eq!(pointer_lock_decision(false, 0, false, true, focused), Some(true));
+    }
+
+    #[test]
+    fn nothing_second_guesses_the_engine_while_focused() {
+        // The Escape latch is gone: with the engine asking, the answer is
+        // yes on every pump, with no state carried between them that could
+        // make it no. (The old signature took a `previously_suppressed`
+        // flag; there is nothing left to pass.)
+        for _ in 0..3 {
+            assert_eq!(pointer_lock_decision(true, 0, false, false, Some(true)), Some(true));
+        }
+    }
+
+    #[test]
+    fn an_unfocused_window_decides_nothing_and_an_unknown_one_still_does() {
+        // After a real FocusOut the lock was released; the gate is what
+        // stops the next pump taking it straight back while the user is
+        // typing in another window.
+        assert_eq!(pointer_lock_decision(true, 0, false, false, Some(false)), None);
+        assert_eq!(pointer_lock_decision(false, BUTTON_SECONDARY, false, true, Some(false)), None);
+        // No focus event seen yet must not freeze the lock forever.
+        assert_eq!(pointer_lock_decision(true, 0, false, false, None), Some(true));
+    }
+
+    #[test]
+    fn only_real_focus_changes_count_and_grabs_do_not() {
+        const NOTIFY_GRAB: c_int = 1;
+        const NOTIFY_ANCESTOR: c_int = 0;
+        const NOTIFY_NONLINEAR: c_int = 3;
+        const NOTIFY_POINTER: c_int = 5;
+        // Alt-tab, a click on another window, i3 moving focus.
+        assert!(focus_change_is_real(NOTIFY_NORMAL, NOTIFY_NONLINEAR));
+        assert!(focus_change_is_real(NOTIFY_NORMAL, NOTIFY_ANCESTOR));
+        assert!(focus_change_is_real(NOTIFY_NORMAL, NOTIFY_POINTER));
+        // A focus change that happened while a keyboard grab was active is
+        // still a focus change.
+        assert!(focus_change_is_real(NOTIFY_WHILE_GRABBED, NOTIFY_NONLINEAR));
+        // A media key or a window-manager binding activating and releasing a
+        // passive key grab: the review's "media keys jerk the camera".
+        assert!(!focus_change_is_real(NOTIFY_GRAB, NOTIFY_NONLINEAR));
+        assert!(!focus_change_is_real(NOTIFY_UNGRAB, NOTIFY_NONLINEAR));
+        // Focus moving into a child of this window never leaves it.
+        assert!(!focus_change_is_real(NOTIFY_NORMAL, NOTIFY_INFERIOR));
+    }
+
+    #[test]
+    fn a_focus_loss_releases_each_held_button_and_nothing_else() {
+        assert_eq!(held_button_bits(0), Vec::<i32>::new());
+        assert_eq!(held_button_bits(BUTTON_SECONDARY), vec![BUTTON_SECONDARY]);
+        assert_eq!(
+            held_button_bits(BUTTON_TERTIARY | BUTTON_PRIMARY | BUTTON_FORWARD),
+            vec![BUTTON_PRIMARY, BUTTON_TERTIARY, BUTTON_FORWARD],
+            "one release per held button, in a fixed order"
+        );
+    }
+
+    #[test]
+    fn a_grab_that_swallowed_a_release_is_reconciled_against_the_server() {
+        const BUTTON1: c_uint = 1 << 8;
+        const BUTTON3: c_uint = 1 << 10;
+        // Right still physically down after a media key: left alone, the
+        // drag goes on.
+        assert_eq!(buttons_released_elsewhere(BUTTON_SECONDARY, BUTTON3), Vec::<i32>::new());
+        // Right let go during the grab: released here, since the real
+        // release went to the grabbing client.
+        assert_eq!(buttons_released_elsewhere(BUTTON_SECONDARY, 0), vec![BUTTON_SECONDARY]);
+        // X's middle is Button2Mask and Android's TERTIARY; the masks must
+        // not be crossed with right's.
+        assert_eq!(buttons_released_elsewhere(BUTTON_TERTIARY, BUTTON3), vec![BUTTON_TERTIARY]);
+        // Unheld buttons are never released, whatever the server says.
+        assert_eq!(buttons_released_elsewhere(0, 0), Vec::<i32>::new());
+        // Side buttons have no core mask and are not released on a guess.
+        assert_eq!(buttons_released_elsewhere(BUTTON_BACK | BUTTON_PRIMARY, BUTTON1), Vec::<i32>::new());
+
+        // W (X keycode 25) still held, Shift_L (50) released during the grab.
+        let mut keymap = [0u8; 32];
+        keymap[25 / 8] |= 1 << (25 % 8);
+        let held = [(51, 25), (59, 50)];
+        assert_eq!(keys_released_elsewhere(&held, &keymap), vec![(59, 50)]);
+        keymap[50 / 8] |= 1 << (50 % 8);
+        assert_eq!(keys_released_elsewhere(&held, &keymap), Vec::<(i32, i32)>::new());
+    }
+
+    #[test]
+    fn a_modifier_keys_own_event_carries_its_own_bit() {
+        // X reports the state from *before* the event: Shift's press has no
+        // ShiftMask, its release still has it. The correction is the bit
+        // belonging to the key in hand, set on down and cleared on up.
+        let fix = |state: c_uint, keysym: c_ulong, down: bool| {
+            let m = android_meta_state(state);
+            let own = modifier_self_meta(keysym);
+            if down { m | own } else { m & !own }
+        };
+        assert_eq!(fix(0, 0xffe1, true), META_SHIFT_ON, "Shift_L down");
+        assert_eq!(fix(SHIFT_MASK, 0xffe1, false), 0, "Shift_L up");
+        assert_eq!(fix(0, 0xffe2, true), META_SHIFT_ON, "Shift_R down");
+        assert_eq!(fix(0, 0xffe3, true), META_CTRL_ON, "Control_L down");
+        // An ordinary key is untouched: W with Shift held keeps Shift.
+        assert_eq!(fix(SHIFT_MASK, 0x77, true), META_SHIFT_ON);
+        assert_eq!(fix(0, 0x77, false), 0);
+        // Shift_L is Android's KEYCODE_SHIFT_LEFT, which is what the engine
+        // reads for shift lock.
+        assert_eq!(keysym_to_android(0xffe1), Some(59));
+    }
+
+    #[test]
+    fn raw_valuators_are_unpacked_by_mask_not_by_index() {
+        // Both axes moved: two packed values each.
+        let both = [0b11u8];
+        assert_eq!(
+            raw_motion_axes(&both, &[3.0, -2.0], &[1.5, -1.0]),
+            ((3.0, -2.0), (1.5, -1.0))
+        );
+        // Purely vertical: bit 1 alone, and its value is at index 0. An
+        // unpacked read would send this to the horizontal axis.
+        let y_only = [0b10u8];
+        assert_eq!(raw_motion_axes(&y_only, &[4.0], &[2.0]), ((0.0, 4.0), (0.0, 2.0)));
+        // A third valuator (a wheel as an axis) is skipped, not read as X.
+        let with_wheel = [0b101u8];
+        assert_eq!(raw_motion_axes(&with_wheel, &[1.0, 9.0], &[0.5, 9.0]), ((1.0, 0.0), (0.5, 0.0)));
+        // Nothing set, or arrays shorter than the mask claims: zeros, no
+        // panic.
+        assert_eq!(raw_motion_axes(&[0u8, 0], &[], &[]), ((0.0, 0.0), (0.0, 0.0)));
+        assert_eq!(raw_motion_axes(&both, &[1.0], &[]), ((1.0, 0.0), (0.0, 0.0)));
+    }
+
+    #[test]
+    fn the_acceleration_setting_picks_the_pair_and_the_drain_sums_it() {
+        let acc = (6.0, -3.0);
+        let raw = (2.0, -1.0);
+        assert_eq!(choose_camera_delta(true, acc, raw), acc);
+        assert_eq!(choose_camera_delta(false, acc, raw), raw);
+
+        let mut sum = RawMotionAccumulator::default();
+        assert_eq!(sum.take(), None, "an empty drain wakes nobody");
+        sum.add((0.25, 1.0));
+        sum.add((0.5, -3.0));
+        sum.add((0.25, 0.0));
+        assert_eq!(sum.events, 3);
+        // Fractions survive: a high-resolution mouse's sub-pixel samples add
+        // up rather than each rounding to nothing.
+        assert_eq!(sum.take(), Some((1.0, -2.0)));
+        assert_eq!(sum.take(), None, "taking empties it");
+        // Movement that cancels out within a drain delivers nothing.
+        sum.add((1.0, 1.0));
+        sum.add((-1.0, -1.0));
+        assert_eq!(sum.take(), None);
+    }
+
+    #[test]
+    fn a_raw_sample_delivered_twice_under_the_grab_is_counted_once() {
+        // The measured shape: same time, device, source and values.
+        let a: RawSampleKey = (114255876, 2, 4, 7.0, -3.0);
+        assert!(!is_duplicate_raw(None, a), "the first sample of a lock is taken");
+        assert!(is_duplicate_raw(Some(a), a), "its second delivery is dropped");
+        // The next real sample, even with the same values, has a new time.
+        let b: RawSampleKey = (114255931, 2, 4, 7.0, -3.0);
+        assert!(!is_duplicate_raw(Some(a), b));
+        // Same millisecond, different movement: two real samples.
+        let c: RawSampleKey = (114255876, 2, 4, 6.0, -3.0);
+        assert!(!is_duplicate_raw(Some(a), c));
+        // Same millisecond and values from another device: also real.
+        let d: RawSampleKey = (114255876, 2, 9, 7.0, -3.0);
+        assert!(!is_duplicate_raw(Some(a), d));
+    }
+
+    #[test]
+    fn a_drag_holds_where_the_button_went_down_and_the_engine_gets_the_centre() {
+        let size = (1280, 720);
+        // Raw path, camera drag: the cursor stays where the player pressed.
+        assert_eq!(lock_anchor(false, true, Some((100, 200)), size), (100, 200));
+        // Clamped into the window if the press was reported just outside it.
+        assert_eq!(lock_anchor(false, true, Some((-5, 900)), size), (0, 719));
+        // The engine's own request is a *centred* lock on either path.
+        assert_eq!(lock_anchor(true, true, Some((100, 200)), size), (640, 360));
+        // The warp fallback measures from where it warps to and always needs
+        // the centre.
+        assert_eq!(lock_anchor(false, false, Some((100, 200)), size), (640, 360));
+        // No pointer position: the centre.
+        assert_eq!(lock_anchor(false, true, None, size), (640, 360));
+    }
+
+    #[test]
+    fn only_the_edge_band_triggers_a_raw_path_recentre() {
+        let size = (1280, 720);
+        assert!(!near_edge((640, 360), size));
+        assert!(!near_edge((RAW_EDGE_MARGIN, RAW_EDGE_MARGIN), size));
+        assert!(near_edge((RAW_EDGE_MARGIN - 1, 360), size));
+        assert!(near_edge((640, 719), size));
+        assert!(near_edge((1280 - RAW_EDGE_MARGIN, 360), size));
     }
 
     #[test]
@@ -1929,14 +3340,50 @@ mod tests {
         // The synthetic MotionNotify this backend's own XWarpPointer produces
         // lands exactly on the capture centre and must be dropped, or every
         // recentring warp would report itself as a fresh delta.
-        assert_eq!(locked_pointer_delta((640, 360), (640, 360), true), None);
+        assert_eq!(locked_pointer_delta((640, 360), (640, 360), true, 0), LockedMotion::Echo);
         // The same coincidence with the latch already spent (a previous
-        // frame consumed the echo) is real motion, not another echo.
-        assert_eq!(locked_pointer_delta((640, 360), (640, 360), false), Some((0, 0)));
-        // Ordinary motion away from centre, latch armed or not, is never
-        // swallowed -- only an exact match does that.
-        assert_eq!(locked_pointer_delta((645, 358), (640, 360), true), Some((5, -2)));
-        assert_eq!(locked_pointer_delta((645, 358), (640, 360), false), Some((5, -2)));
+        // frame consumed the echo) is still just a zero delta -- an `Echo`
+        // either way, since the two cases are indistinguishable and neither
+        // has anything to report.
+        assert_eq!(locked_pointer_delta((640, 360), (640, 360), false, 0), LockedMotion::Echo);
+        // Ordinary motion away from centre, with no warp outstanding, is
+        // never swallowed.
+        assert_eq!(locked_pointer_delta((645, 358), (640, 360), false, 0), LockedMotion::Real(5, -2));
+    }
+
+    #[test]
+    fn stale_pre_lock_motion_is_discarded_rather_than_read_as_a_spin() {
+        // #41: a motion event still in flight from before the lock engaged --
+        // the free cursor sitting near a window edge at the instant a camera
+        // drag or SetMouseBehavior(LockCenter) grabbed it -- must not be
+        // reported as a several-hundred-pixel delta just because it is not
+        // itself the echo. It is discarded, and the wait latch stays armed.
+        assert_eq!(locked_pointer_delta((1900, 40), (640, 360), true, 0), LockedMotion::Waiting);
+        // A second stale event before the echo arrives: still discarded.
+        assert_eq!(locked_pointer_delta((1850, 55), (640, 360), true, 1), LockedMotion::Waiting);
+        // The echo itself, whenever it turns up, is still recognised and
+        // clears the latch.
+        assert_eq!(locked_pointer_delta((640, 360), (640, 360), true, 2), LockedMotion::Echo);
+    }
+
+    #[test]
+    fn a_warp_with_no_echo_eventually_gives_up_waiting() {
+        // XWarpPointer onto a pixel the pointer already occupies produces no
+        // MotionNotify -- there is nothing to confirm the warp with -- so an
+        // unbounded wait would discard camera input for the rest of the
+        // lock. Once MAX_WARP_ECHO_WAIT is reached the next event is trusted
+        // even though the latch was never explicitly cleared.
+        for waiting in 0..MAX_WARP_ECHO_WAIT {
+            assert_eq!(
+                locked_pointer_delta((900, 200), (640, 360), true, waiting),
+                LockedMotion::Waiting,
+                "wait {waiting} should still be discarded"
+            );
+        }
+        assert_eq!(
+            locked_pointer_delta((900, 200), (640, 360), true, MAX_WARP_ECHO_WAIT),
+            LockedMotion::Real(260, -160)
+        );
     }
 
     #[test]

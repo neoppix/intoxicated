@@ -176,7 +176,10 @@ fn handle(line: &str) -> String {
         // answer *before* the right-drag latch is applied to it. See
         // `wayland::pointer_lock_report` for why reading a trace line instead
         // was not a measurement.
-        "pointerlock" => crate::android::wayland::pointer_lock_report(),
+        "pointerlock" => match crate::android::backend() {
+            crate::android::Backend::Wayland => crate::android::wayland::pointer_lock_report(),
+            crate::android::Backend::X11 => crate::android::window::pointer_lock_report(),
+        },
         // A test seam for the one input to the lock decision that cannot be
         // produced from outside a game. See `input::FAKE_ENGINE_LOCK` for what
         // a reading taken with it set does and does not establish.

@@ -76,6 +76,61 @@ pub const META_ALT_ON: i32 = 2;
 pub const META_CTRL_ON: i32 = 0x1000;
 pub const META_CAPS_LOCK_ON: i32 = 0x100000;
 
+/// The character an X keysym names, for the text `XLookupString` cannot give.
+///
+/// Xlib's lookup only produces Latin-1, so on a Cyrillic layout it returns no
+/// bytes and the letter never reached a TextBox. Two ranges are arithmetic
+/// (Unicode keysyms and Latin-1); everything else asks libxkbcommon, which
+/// shares X11's keysym numbering -- and therefore covers every layout X11 can
+/// name, not a list of scripts maintained here. It is `dlopen`ed rather than
+/// linked so this crate takes no build-time dependency; every binary that can
+/// start Cordial already links `libxkbcommon.so.0` through GTK, so in practice
+/// the lookup is always there.
+///
+/// **A hand-written Cyrillic table used to sit at the end of this file as a
+/// fallback, and it was wrong twice over.** It was unreachable -- the only host
+/// it claimed to serve is one with no libxkbcommon, which is not a host that
+/// got as far as running this code -- and it privileged one script, so that
+/// same imagined host would still have typed nothing in Greek, Hebrew or
+/// Arabic. Locale coverage belongs in the keysym library, not in a map kept
+/// up to date by hand.
+pub fn keysym_to_char(keysym: c_ulong) -> Option<char> {
+    let k = keysym as u32;
+    if (0x01000100..=0x0110ffff).contains(&k) {
+        return char::from_u32(k - 0x01000000);
+    }
+    if (0x0020..=0x007e).contains(&k) || (0x00a0..=0x00ff).contains(&k) {
+        return char::from_u32(k);
+    }
+    static FN: std::sync::OnceLock<Option<unsafe extern "C" fn(u32) -> u32>> = std::sync::OnceLock::new();
+    let f = FN.get_or_init(|| {
+        extern "C" {
+            fn dlopen(filename: *const std::ffi::c_char, flag: std::ffi::c_int) -> *mut std::ffi::c_void;
+            fn dlsym(handle: *mut std::ffi::c_void, symbol: *const std::ffi::c_char) -> *mut std::ffi::c_void;
+        }
+        unsafe {
+            let lib = dlopen(b"libxkbcommon.so.0\0".as_ptr() as *const std::ffi::c_char, 2);
+            if lib.is_null() {
+                None
+            } else {
+                let p = dlsym(lib, b"xkb_keysym_to_utf32\0".as_ptr() as *const std::ffi::c_char);
+                if p.is_null() {
+                    None
+                } else {
+                    Some(std::mem::transmute(p))
+                }
+            }
+        }
+    });
+    if let Some(to_utf32) = f {
+        let cp = unsafe { to_utf32(k) };
+        if cp != 0 {
+            return char::from_u32(cp);
+        }
+    }
+    None
+}
+
 /// A pragmatic subset of keysyms mapped to `android.view.KeyEvent.KEYCODE_*`.
 ///
 /// The values are X11's `keysymdef.h` numbering, but that numbering is not an

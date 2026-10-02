@@ -3814,6 +3814,12 @@ fn pointer_acceleration() -> bool {
     })
 }
 
+/// The camera-acceleration choice in force, read by the X11 backend's
+/// `XI_RawMotion` path (ADR-028) so one setting governs both backends.
+pub fn current_pointer_acceleration() -> bool {
+    pointer_acceleration()
+}
+
 static RELATIVE_POINTER_LISTENER: RelativePointerListener =
     RelativePointerListener { relative_motion: relative_pointer_motion };
 
