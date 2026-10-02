@@ -5,14 +5,14 @@
 <h1 align="center">Intoxicated</h1>
 
 <p align="center">
-  <strong>Native Roblox for FreeBSD.</strong> No emulator, no Wine, no Waydroid — the
-  official Roblox engine running as a FreeBSD process.
+  <strong>Native Roblox for FreeBSD.</strong> No linuxulator. No emulator, no Wine,
+  no Waydroid. The official Roblox engine running as a real FreeBSD process.
 </p>
 
 <p align="center">
   <em>A fork of <a href="https://github.com/luohoa97/cordial">cordial</a> by
-  <a href="https://github.com/luohoa97">luohoa97</a> &amp; the Cordial contributors.
-  Cordial does the hard part — a whole Roblox runtime for Linux; Intoxicated carries
+  <a href="https://github.com/luohoa97">luohoa97</a> and the Cordial contributors.
+  Cordial does the hard part, a whole Roblox runtime for Linux. Intoxicated carries
   it onto FreeBSD. GPL-3.0, same as upstream.</em>
 </p>
 
@@ -30,40 +30,40 @@
   Discord</a> is the shared community for both.
 </p>
 
----
-
-*A hobby project, not a commercial one. Please don't DMCA it.*
+<p align="center"><em>A hobby project, not a commercial one. Please don't DMCA it.</em></p>
 
 ## What it is
 
 Intoxicated loads Roblox's official **Android x86-64** engine directly on FreeBSD
 through cordial's purpose-built runtime: the AOSP bionic linker, a bionic/libc
 shim, a JNI VM in place of Android's, and a framework layer that answers the
-client's calls. The `cordial-run` binary itself is a **native FreeBSD ELF**, not a
-linuxulator program — it talks to your GPU through Vulkan or GLES2 the way any
-native application does. It loads the Linux/Android `libroblox.so` the way a loader
-loads a library, with FreeBSD-specific shims for the places the two ABIs disagree
-(syscalls, `pthread`, `environ`, `/proc`, futexes).
+client's calls.
 
-The headline port work: Roblox's anticheat kicks for **reason 304** on FreeBSD
+**It runs native, all the way down.** The `cordial-run` binary is a native
+FreeBSD ELF, not a linuxulator program. The graphics go through native FreeBSD
+Vulkan or GLES2. The input goes through native X11. And `libroblox.so` itself, the
+Linux/Android engine, is loaded and executed by cordial's **own** bionic linker as
+native FreeBSD code, with FreeBSD-specific shims wherever the two ABIs disagree
+(syscalls, `pthread`, `environ`, `/proc`, futexes). Nothing emulates Roblox and
+nothing runs it under the Linux ABI. It talks to your GPU the way any native app
+does.
+
+The headline port work: Roblox's anticheat kicks for **reason 304** on FreeBSD,
 because `libroblox.so` makes raw kernel-ABI syscalls the bionic setup can't route
 cleanly. Intoxicated patches all 40 raw syscall sites in the engine to `ud2` and
-catches the resulting `SIGILL`, routing each through `bionic_syscall` — so the
+catches the resulting `SIGILL`, routing each through `bionic_syscall`, so the
 anticheat stops seeing the thing it was killing the client for. That fix is what
 makes any of the rest matter.
 
 ## Get it running
 
-This is a **build-from-source hobby port** on FreeBSD. It is tested on FreeBSD
+This is a **build-from-source hobby port** on FreeBSD, tested on FreeBSD
 14.4-RELEASE with an NVIDIA GPU (RTX 40-series), native X11, and native Vulkan.
 
-Everything runs native: the `cordial-run` binary, the Vulkan/GLES graphics, the
-X11 input, and `libroblox.so` itself — loaded by cordial's own bionic linker as
-native FreeBSD code. **No linuxulator executes any Roblox code; no emulator, VM
-or Wine is involved.** The single Linux-compat dependency is `linprocfs`, a
-FreeBSD *kernel filesystem* that presents the kernel's own stats in Linux `/proc`
-format, because the engine reads `/proc/meminfo` and a few siblings. That is a
-mounted filesystem the engine reads from, not the Linux ABI running programs.
+The only Linux-compat dependency is `linprocfs`, a FreeBSD **kernel filesystem**
+that presents the kernel's own stats in Linux `/proc` format, because the engine
+reads `/proc/meminfo` and a few siblings. That is a mounted filesystem the engine
+reads from, not the Linux ABI running programs. Everything else is native.
 
 **1. Prerequisites** (as root):
 
@@ -91,7 +91,7 @@ git clone https://github.com/neoppix/intoxicated
 cd intoxicated
 git checkout freebsd-port
 cargo build -p cordial-runtime --release
-# -> target/release/cordial-run  (a native FreeBSD binary)
+# produces target/release/cordial-run, a native FreeBSD binary
 ```
 
 **3. Get Roblox's Android build.** Intoxicated does **not** ship Roblox and never
@@ -112,22 +112,22 @@ it at your own APK with `CORDIAL_ROBLOX_APK_URL`, or reuse the one
 ```
 
 Install the `intoxicated` launcher script to your path for the short form
-(`intoxicated`, or `intoxicated <placeId>` to join a game) — it wraps that command
+(`intoxicated`, or `intoxicated <placeId>` to join a game). It wraps that command
 with sane defaults.
 
-## Status — early, but it plays
+## Status: early, but it plays
 
 Reason-304 is solved, so the client stays in the game. Sign-in, loading a game,
 moving around, mouse and keyboard (including shift-lock, Ctrl+A/C/X/V and real
 clipboard), full framerate, held-key input, and audio all work. Known rough edges:
-in-game texture/mesh detail is lower than desktop Roblox (an Android-render-path
+in-game texture and mesh detail is lower than desktop Roblox (an Android-render-path
 limit still being chased), voice chat is unimplemented, and controllers are
 untested.
 
-## Credit & license
+## Credit and license
 
 Intoxicated is a fork of **[cordial](https://github.com/luohoa97/cordial)** by
-**[luohoa97](https://github.com/luohoa97)** and the Cordial contributors — the
+**[luohoa97](https://github.com/luohoa97)** and the Cordial contributors. The
 runtime, the architecture, and the years of reverse-engineering that make running
 Roblox outside Android possible are theirs. Intoxicated is the FreeBSD-specific
 layer on top.
