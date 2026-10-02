@@ -60,10 +60,12 @@ makes any of the rest matter.
 This is a **build-from-source hobby port** on FreeBSD, tested on FreeBSD
 14.4-RELEASE with an NVIDIA GPU (RTX 40-series), native X11, and native Vulkan.
 
-The only Linux-compat dependency is `linprocfs`, a FreeBSD **kernel filesystem**
-that presents the kernel's own stats in Linux `/proc` format, because the engine
-reads `/proc/meminfo` and a few siblings. That is a mounted filesystem the engine
-reads from, not the Linux ABI running programs. Everything else is native.
+**Zero `/compat/linux` at runtime.** The engine reads Linux `/proc` and `/sys`;
+every one of those reads (`meminfo`, `cpuinfo`, the process list the anticheat
+scans, `self/{fd,auxv,status,maps}`, and the rest) is answered from FreeBSD's own
+`sysctl`/`elf_aux_info`, not from linprocfs. There is no linuxulator and no
+Linux-compat filesystem mount to set up. Verified: a run makes **0** reads under
+`/compat/linux`.
 
 **1. Prerequisites** (as root):
 
@@ -74,15 +76,9 @@ pkg install rust libX11 libXi libXinerama vulkan-loader
 # Native GPU driver (this is what provides the real Vulkan ICD)
 pkg install nvidia-driver          # NVIDIA; use the Mesa drivers for AMD/Intel
 sysrc kld_list+="nvidia-modeset" && kldload nvidia-modeset
-
-# linprocfs: Linux-format /proc the engine reads. The filesystem only, not the
-# linuxulator ABI.
-kldload linprocfs
-mkdir -p /compat/linux/proc
-mount -t linprocfs linproc /compat/linux/proc    # add to /etc/fstab to persist
 ```
 
-You also need a running X11 session.
+You also need a running X11 session. That is the whole list, no linuxulator.
 
 **2. Build:**
 
