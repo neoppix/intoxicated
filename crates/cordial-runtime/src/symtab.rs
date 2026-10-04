@@ -231,6 +231,20 @@ pub fn build(host_libc: bool) -> SymbolTable {
         .then(|| HostLib::open(host_libc_soname, "libc.so"))
         .flatten();
 
+    // FreeBSD 15 moved the system-call wrappers -- munmap, mprotect, getpid,
+    // mmap and the rest -- out of libc.so.7 into a separate libsys.so.7 (the
+    // "libsys" project, landed Feb 2024). On 15 they are therefore absent from
+    // libc, and without this they fall to no-op stubs: a stubbed mprotect or
+    // munmap segfaults libroblox during its own early memory setup, which is the
+    // crash a 15.1 user reported. Open libsys as well and let the Generic
+    // fall-through consult it after libc. On FreeBSD 14 and earlier the file does
+    // not exist, the open returns None, and nothing changes -- the wrappers are
+    // still found in libc exactly as before, so a working 14 setup is untouched.
+    #[cfg(target_os = "freebsd")]
+    let libsys = HostLib::open("libsys.so.7", "libsys.so");
+    #[cfg(not(target_os = "freebsd"))]
+    let libsys: Option<HostLib> = None;
+
     let mut table = SymbolTable {
         libraries: BTreeMap::new(),
         stats: BTreeMap::new(),
@@ -268,7 +282,9 @@ pub fn build(host_libc: bool) -> SymbolTable {
                         let hit = if abi_unsafe_generic(symbol) {
                             None
                         } else {
-                            libc.as_ref().and_then(|l| l.lookup(symbol))
+                            libc.as_ref()
+                                .and_then(|l| l.lookup(symbol))
+                                .or_else(|| libsys.as_ref().and_then(|l| l.lookup(symbol)))
                         };
                         match hit {
                             Some(addr) => ("libc.so", addr, Source::Host),
