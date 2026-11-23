@@ -242,6 +242,10 @@ Known problems:
   blocky in the distance; no setting that raises them has been found yet.
 - Joining a server still stalls for about 2 s in all while the map loads,
   most of it the engine's own work.
+- About every 45 s the engine's own periodic work holds one frame for about
+  100 to 130 ms.
+- Now and then, once in a match, a frame freezes for up to about 3 s shortly
+  after deploying or at the first death; the cause is not found yet.
 - Voice chat is unimplemented. Game controllers are not supported yet: the old
   support read Linux-only joystick paths and never found a device on FreeBSD,
   so it was removed; native FreeBSD (evdev) support is still to be written.

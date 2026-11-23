@@ -810,6 +810,12 @@ static void check_threads() {
 
     // A file named libroblox.so, mapped executable, holding `mov rax, rdi; ret`
     // at 0x1010: the start routine is reported as an offset into it.
+    //
+    // It is mapped from a second open, by path, as the linker maps the real
+    // engine. kern.proc.vmmap names a mapped file from the name cache, and on
+    // UFS a file only just created through a descriptor has no entry there
+    // yet, so its mapping had no path and this check failed (reproduced on a
+    // UFS memory disk; ZFS reports the path regardless).
     char dir[] = "./intoxicated-engine-XXXXXX";
     if (mkdtemp(dir) != nullptr) {
         const std::string path = std::string(dir) + "/libroblox.so";
@@ -818,6 +824,11 @@ static void check_threads() {
         const unsigned char code[] = {0x48, 0x89, 0xf8, 0xc3};
         memcpy(image.data() + 0x1010, code, sizeof code);
         CHECK(fd >= 0 && write(fd, image.data(), image.size()) == static_cast<ssize_t>(image.size()));
+        if (fd >= 0) {
+            close(fd);
+        }
+        fd = open(path.c_str(), O_RDONLY);
+        CHECK(fd >= 0);
         void* map = mmap(nullptr, image.size(), PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
         CHECK(map != MAP_FAILED);
         if (map != MAP_FAILED) {
@@ -827,7 +838,10 @@ static void check_threads() {
             pthread_join(th, &back);
             const std::string text = err.take();
             CHECK(back == &th);
-            CHECK(contains(text, " (outside libroblox.so) start_routine=libroblox.so+0x1010\n"));
+            // The whole tail on failure, so a miss shows what was reported.
+            const size_t at = text.find(" (outside libroblox.so) start_routine=");
+            CHECK_EQ_STR(at == std::string::npos ? text : text.substr(at),
+                         std::string(" (outside libroblox.so) start_routine=libroblox.so+0x1010\n"));
             munmap(map, image.size());
         }
         if (fd >= 0) close(fd);
