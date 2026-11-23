@@ -80,9 +80,9 @@ fetch_apk() {
 
 # Flags the launcher keeps in the profile's flags.json. Each is put back on every
 # launch, but only when its key is absent, so a value chosen by hand is left
-# alone and a new or reset profile gets them too. intoxicated-run re-sends the
-# document every five seconds, so the engine's own flag reloader cannot revert
-# them mid-session.
+# alone and a new or reset profile gets them too. intoxicated-run sends the
+# document again after each of the engine's own settings reloads (every two
+# minutes), so the reloader cannot revert them mid-session.
 FLAGS_FILE="${INTOXICATED_FLAGS:-$DATADIR/profiles/default/flags.json}"
 
 # ensure_flag NAME VALUE WHAT

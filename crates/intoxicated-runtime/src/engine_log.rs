@@ -12,6 +12,10 @@
 //! [intoxicated] game: left
 //! ```
 //!
+//! It also counts, without printing anything, each time the engine's own
+//! settings reloader finishes a fetch ([`flag_reloads_seen`]); the keep-flags
+//! loop in [`crate::roblox_settings`] re-applies the launch flags after it.
+//!
 //! **The joined line does not name the user.** The engine's line carries the
 //! Roblox user id; it is parsed (a join without one is not a join) and never
 //! printed.
@@ -48,6 +52,9 @@ pub enum Event {
     Joined { place: u64, universe: u64, user: u64 },
     Server { address: String, port: u16 },
     Left,
+    /// The engine re-fetched and applied Roblox's settings document, which
+    /// resets the dynamic flags the document does not carry.
+    FlagsReloaded,
 }
 
 impl Event {
@@ -60,6 +67,7 @@ impl Event {
             }
             Event::Server { address, port } => format!("[intoxicated] game: server {address}:{port}"),
             Event::Left => "[intoxicated] game: left".to_string(),
+            Event::FlagsReloaded => "[intoxicated] flags: the engine reloaded its settings".to_string(),
         }
     }
 }
@@ -82,6 +90,9 @@ pub fn parse_line(line: &str) -> Option<Event> {
     let line = line.trim_end();
     if line.contains("[FLog::SingleSurfaceApp] leaveUGCGameInternal") {
         return Some(Event::Left);
+    }
+    if line.contains("[FLog::DynamicFastVariableReloader] DynamicFastVariableReloader finished flag fetch") {
+        return Some(Event::FlagsReloaded);
     }
     if line.contains("[FLog::GameJoinLoadTime]") && line.contains("game_join_loadtime") {
         return Some(Event::Joined {
@@ -212,12 +223,25 @@ pub fn joins_seen() -> u64 {
     JOINS.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Settings reloads the engine's log has reported in this process.
+static RELOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times [`poll`] has seen the engine's settings reloader finish a
+/// fetch: every 120 s in a run on 2.748 (measured over an hour).
+pub fn flag_reloads_seen() -> u64 {
+    RELOADS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// One looper tick: print what the engine's log reported since the last one.
 pub fn poll() {
     let events = follower().poll(Instant::now());
     for event in events {
         if matches!(event, Event::Joining { .. }) {
             JOINS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        if event == Event::FlagsReloaded {
+            RELOADS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            continue;
         }
         println!("{}", event.line());
         if event == Event::Left && close_on_leave() {
@@ -248,6 +272,15 @@ mod tests {
 
     fn server() -> String {
         format!("{PREFIX}[FLog::Network] UDMUX Address = 128.116.1.2, Port = 56789 | RCC Server Address = 10.1.2.3, Port = 1234")
+    }
+
+    #[test]
+    fn a_settings_reload_is_recognised() {
+        let line = format!(
+            "{PREFIX}[FLog::DynamicFastVariableReloader] DynamicFastVariableReloader finished flag fetch. Tombstone status: valid"
+        );
+        assert_eq!(parse_line(&line), Some(Event::FlagsReloaded));
+        assert_eq!(parse_line(&format!("{PREFIX}[FLog::AndroidGLView] nativeInitClientSettings")), None);
     }
 
     #[test]

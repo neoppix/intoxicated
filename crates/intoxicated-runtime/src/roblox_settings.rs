@@ -42,12 +42,20 @@ pub const MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
 /// Text every settings document contains, quotes included.
 pub const MARKER: &str = "\"applicationSettings\"";
 
-/// Re-send interval of the keep-flags loop when nothing else is asked for.
-pub const KEEP_FLAGS_DEFAULT_MS: u64 = 5_000;
-
-/// Shortest re-send interval accepted, so a typo cannot spin the engine's
-/// flag path.
+/// Shortest fixed re-send interval accepted, so a typo cannot spin the
+/// engine's flag path.
 pub const KEEP_FLAGS_MIN_MS: u64 = 1_000;
+
+/// How long after the engine's reload the launch flags are sent again, so the
+/// engine has finished applying its own copy first.
+pub const RELOAD_DELAY: Duration = Duration::from_secs(1);
+
+/// With no reload seen by then, the engine's log line was not recognised (a
+/// newer build, say) and the loop falls back to [`FALLBACK_EVERY`].
+pub const FALLBACK_AFTER: Duration = Duration::from_secs(150);
+
+/// The fallback interval: the reloader's own period on 2.748.
+pub const FALLBACK_EVERY: Duration = Duration::from_secs(120);
 
 /// Where the document came from, or why there is none.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -222,31 +230,83 @@ pub fn document() -> String {
     document_and_origin().0
 }
 
-/// The keep-flags interval in milliseconds, or `None` when it is switched off.
-///
+/// When the keep-flags loop re-sends the launch flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeepFlags {
+    Off,
+    /// [`RELOAD_DELAY`] after each settings reload the engine's log reports.
+    AfterReload,
+    /// Every this many milliseconds, whatever the engine does.
+    Every(u64),
+}
+
 /// `switch` is `INTOXICATED_KEEP_FLAGS` (`off` or `0` disable), `interval` is
-/// `INTOXICATED_KEEP_FLAGS_MS` (whole milliseconds; anything that is not, or
-/// is under [`KEEP_FLAGS_MIN_MS`], means the default).
-pub fn keep_flags_interval(switch: Option<&str>, interval: Option<&str>) -> Option<u64> {
+/// `INTOXICATED_KEEP_FLAGS_MS`: whole milliseconds, at least
+/// [`KEEP_FLAGS_MIN_MS`], for a fixed interval instead of following reloads;
+/// anything else is ignored.
+pub fn keep_flags_mode(switch: Option<&str>, interval: Option<&str>) -> KeepFlags {
     if matches!(switch, Some("off") | Some("0")) {
-        return None;
+        return KeepFlags::Off;
     }
-    Some(
-        interval
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&ms| ms >= KEEP_FLAGS_MIN_MS)
-            .unwrap_or(KEEP_FLAGS_DEFAULT_MS),
-    )
+    match interval.and_then(|v| v.parse::<u64>().ok()).filter(|&ms| ms >= KEEP_FLAGS_MIN_MS) {
+        Some(ms) => KeepFlags::Every(ms),
+        None => KeepFlags::AfterReload,
+    }
+}
+
+/// When to re-send in [`KeepFlags::AfterReload`] mode, given the time since
+/// the loop started and the reload count from the engine's log.
+#[derive(Debug, Default)]
+pub struct ReloadSchedule {
+    handled: u64,
+    due: Option<Duration>,
+    last_send: Duration,
+    /// Set once the fallback has started, so it is reported once.
+    pub fell_back: bool,
+}
+
+impl ReloadSchedule {
+    /// Whether to send now.
+    pub fn tick(&mut self, now: Duration, reloads: u64) -> bool {
+        if reloads != self.handled {
+            self.handled = reloads;
+            self.due = Some(now + RELOAD_DELAY);
+        }
+        if let Some(due) = self.due {
+            if now < due {
+                return false;
+            }
+            self.due = None;
+            self.last_send = now;
+            return true;
+        }
+        if self.handled == 0 && now >= FALLBACK_AFTER && now.saturating_sub(self.last_send) >= FALLBACK_EVERY {
+            self.fell_back = true;
+            self.last_send = now;
+            return true;
+        }
+        false
+    }
 }
 
 /// Re-send `doc` to the settings native for the rest of the process.
 ///
 /// **Why.** The fps cap override, `DFIntTaskSchedulerTargetFps`, is a dynamic
 /// flag that Roblox's own document does not carry. The engine's reloader
-/// re-fetches that document about two minutes into a run (and every 180
-/// minutes after) and resets the dynamic flags it does not mention to their
-/// compiled defaults, which pins the frame rate at 60. Sending the same merged
-/// document again puts the value back.
+/// re-fetches that document every 120 s (measured over an hour on 2.748) and
+/// resets the dynamic flags it does not mention to their compiled defaults,
+/// which pins the frame rate at 60. Sending the same merged document again
+/// puts the value back.
+///
+/// **When.** Each send makes the engine parse the whole document, about 1.5
+/// MB and 25,000 flags: 260 ms of a core, during which the render thread
+/// mostly waits. Sent every 5 s, as this loop used to, that was half of all
+/// time spent in frames over 25 ms in two minutes of play (22 of 79 such
+/// frames, 6.9 of 14.2 s, measured with DTrace). So it is now sent only
+/// [`RELOAD_DELAY`] after the engine's log reports a reload
+/// ([`crate::engine_log::flag_reloads_seen`]), and on a fixed
+/// [`FALLBACK_EVERY`] only if no reload has been seen [`FALLBACK_AFTER`] into
+/// the run. `INTOXICATED_KEEP_FLAGS_MS` still asks for a fixed interval.
 ///
 /// `doc` is the snapshot delivered at bootstrap and is never reloaded, so an
 /// edit to `flags.json` during a run does not reach the engine through here.
@@ -259,24 +319,58 @@ pub fn keep_flags_interval(switch: Option<&str>, interval: Option<&str>) -> Opti
 pub fn keep_applied(settings_native: usize, doc: String) {
     let switch = std::env::var("INTOXICATED_KEEP_FLAGS").ok();
     let interval = std::env::var("INTOXICATED_KEEP_FLAGS_MS").ok();
-    let Some(ms) = keep_flags_interval(switch.as_deref(), interval.as_deref()) else {
-        println!("  [intoxicated] keep-flags: off (INTOXICATED_KEEP_FLAGS={})", switch.unwrap_or_default());
-        return;
-    };
-    println!(
-        "  [intoxicated] keep-flags: re-applying launch flags every {ms} ms so the engine's reloader \
-         cannot revert the fps cap (INTOXICATED_KEEP_FLAGS=off to disable)"
-    );
-    let spawned = std::thread::Builder::new().name("keep-flags".into()).spawn(move || loop {
-        std::thread::sleep(Duration::from_millis(ms));
-        if let Err(e) = intoxicated_linker_sys::game_activity::init_client_settings(
+    let mode = keep_flags_mode(switch.as_deref(), interval.as_deref());
+    match mode {
+        KeepFlags::Off => {
+            println!("  [intoxicated] keep-flags: off (INTOXICATED_KEEP_FLAGS={})", switch.unwrap_or_default());
+            return;
+        }
+        KeepFlags::AfterReload => println!(
+            "  [intoxicated] keep-flags: re-applying launch flags after each settings reload the engine \
+             reports, so it cannot revert the fps cap (INTOXICATED_KEEP_FLAGS=off to disable)"
+        ),
+        KeepFlags::Every(ms) => println!(
+            "  [intoxicated] keep-flags: re-applying launch flags every {ms} ms (INTOXICATED_KEEP_FLAGS_MS)"
+        ),
+    }
+    let send = move || {
+        intoxicated_linker_sys::game_activity::init_client_settings(
             settings_native as *mut std::ffi::c_void,
             &doc,
             "",
             "",
-        ) {
-            eprintln!("[intoxicated] keep-flags: re-apply failed, stopping: {e}");
-            break;
+        )
+    };
+    let spawned = std::thread::Builder::new().name("keep-flags".into()).spawn(move || {
+        let start = std::time::Instant::now();
+        let mut schedule = ReloadSchedule::default();
+        loop {
+            let go = match mode {
+                KeepFlags::Every(ms) => {
+                    std::thread::sleep(Duration::from_millis(ms));
+                    true
+                }
+                _ => {
+                    std::thread::sleep(Duration::from_millis(250));
+                    let fell_back = schedule.fell_back;
+                    let go = schedule.tick(start.elapsed(), crate::engine_log::flag_reloads_seen());
+                    if schedule.fell_back && !fell_back {
+                        eprintln!(
+                            "[intoxicated] keep-flags: no settings reload seen in the engine's log after {} s; \
+                             re-applying every {} s instead",
+                            FALLBACK_AFTER.as_secs(),
+                            FALLBACK_EVERY.as_secs()
+                        );
+                    }
+                    go
+                }
+            };
+            if go {
+                if let Err(e) = send() {
+                    eprintln!("[intoxicated] keep-flags: re-apply failed, stopping: {e}");
+                    break;
+                }
+            }
         }
     });
     if let Err(e) = spawned {
@@ -449,13 +543,40 @@ mod tests {
 
     #[test]
     fn keep_flags_switches() {
-        assert_eq!(keep_flags_interval(None, None), Some(5000));
-        assert_eq!(keep_flags_interval(Some("off"), None), None);
-        assert_eq!(keep_flags_interval(Some("0"), Some("2000")), None);
-        assert_eq!(keep_flags_interval(Some("on"), Some("2000")), Some(2000));
-        assert_eq!(keep_flags_interval(Some(""), Some("1000")), Some(1000));
-        assert_eq!(keep_flags_interval(None, Some("999")), Some(5000));
-        assert_eq!(keep_flags_interval(None, Some("-5")), Some(5000));
-        assert_eq!(keep_flags_interval(None, Some("2.5")), Some(5000));
+        use KeepFlags::*;
+        assert_eq!(keep_flags_mode(None, None), AfterReload);
+        assert_eq!(keep_flags_mode(Some("off"), None), Off);
+        assert_eq!(keep_flags_mode(Some("0"), Some("2000")), Off);
+        assert_eq!(keep_flags_mode(Some("on"), Some("2000")), Every(2000));
+        assert_eq!(keep_flags_mode(Some(""), Some("1000")), Every(1000));
+        assert_eq!(keep_flags_mode(None, Some("999")), AfterReload);
+        assert_eq!(keep_flags_mode(None, Some("-5")), AfterReload);
+        assert_eq!(keep_flags_mode(None, Some("2.5")), AfterReload);
+    }
+
+    /// A reload is answered once, a second after it; nothing is sent in
+    /// between; with no reload seen at all, the fallback starts at 150 s and
+    /// repeats every 120 s, and stops once a reload is seen.
+    #[test]
+    fn re_sends_follow_the_engines_reloads() {
+        let s = |secs: f64| Duration::from_secs_f64(secs);
+        let mut r = ReloadSchedule::default();
+        assert!(!r.tick(s(5.0), 0) && !r.tick(s(60.0), 0));
+        assert!(!r.tick(s(120.2), 1), "not before the delay");
+        assert!(!r.tick(s(121.0), 1));
+        assert!(r.tick(s(121.25), 1));
+        assert!(!r.tick(s(121.5), 1) && !r.tick(s(200.0), 1), "once per reload");
+        assert!(!r.tick(s(240.1), 2));
+        assert!(r.tick(s(241.2), 2));
+        assert!(!r.tick(s(400.0), 2), "no fallback once reloads are seen");
+        assert!(!r.fell_back);
+
+        let mut f = ReloadSchedule::default();
+        assert!(!f.tick(s(149.9), 0));
+        assert!(f.tick(s(150.0), 0) && f.fell_back);
+        assert!(!f.tick(s(269.0), 0));
+        assert!(f.tick(s(270.0), 0));
+        assert!(!f.tick(s(300.0), 1) && f.tick(s(301.0), 1), "a late reload is still answered");
+        assert!(!f.tick(s(500.0), 1), "and ends the fallback");
     }
 }
