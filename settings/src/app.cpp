@@ -256,6 +256,9 @@ void MainWindow::fillProfiles() {
         if (p.name == current)
             m_profiles->setCurrentIndex(m_profiles->count() - 1);
     }
+    // With one profile there is nothing to choose; the picker comes back
+    // as soon as a second profile exists.
+    m_profiles->setVisible(profiles.size() > 1);
     m_state->setProfile(current);
 }
 
