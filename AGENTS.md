@@ -8,12 +8,16 @@ with its own licence (see `NOTICE`).
 
 ## FreeBSD only
 
-Everything here is native FreeBSD. Never use Linux, the linuxulator, anything
-under `/compat/linux` or a Linux binary, not even for a quick check.
+Intoxicated is FreeBSD only and must run on a system with no linuxulator:
+nothing Linux goes into the tree, the build or the install (no Linux
+binaries, libraries or paths), and at run time nothing is read under
+`/compat/linux`.
 
-A coding agent may itself run under the linuxulator. Its shell then resolves
-`sh`, coreutils, `sed`, `grep` and the like to Linux copies first. Run every
-command through the native Python with a FreeBSD PATH instead:
+A coding agent may itself run under the linuxulator, and using its shell to
+read and search files is fine. Its shell resolves `sh`, coreutils, `sed`,
+`grep` and the like to Linux copies first, though, so anything that builds,
+tests or runs Intoxicated goes through the native Python with a FreeBSD
+PATH:
 
     /usr/local/bin/python3.11 -c "import subprocess,os; subprocess.run(['/bin/sh','-c','CMD'], cwd='REPO', env={'HOME':os.environ['HOME'],'PATH':'/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin'})"
 
