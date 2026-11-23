@@ -1,0 +1,33 @@
+[package]
+name = "intoxicated-runtime"
+description = "Runs Roblox's Android x86-64 engine as a native FreeBSD process: the libc and Android layers it links against, its window, input and launch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "intoxicated-run"
+path = "src/bin/intoxicated_run/main.rs"
+
+[dependencies]
+# The guest linker, libjnivm and the framework shims under native/.
+intoxicated-linker-sys = { path = "../intoxicated-linker-sys" }
+# flock and the kern.proc sysctls behind the profile lock (`profile_lock.rs`).
+libc = "0.2"
+# `net::get_text` (client settings) and `browser_tracker`.
+ureq.workspace = true
+# Client settings and flag documents are parsed as JSON and written back
+# through it, never spliced together as text.
+serde_json = "1"
+# Assets are read out of the APK (a zip) by `android::assets`: raw deflate
+# and the CRC32 every entry is checked against, both pure Rust.
+miniz_oxide = "0.8"
+crc32fast = "1"
+# syscall_sites decodes libroblox's code to find its raw `syscall`
+# instructions. Decoder only: no formatter, encoder or instruction tables.
+# syscall_sites::DECODER names this version in its cache files.
+iced-x86 = { version = "1.22", default-features = false, features = ["std", "decoder"] }
+
+[dev-dependencies]
+# The asset tests compare against SHA-256 vectors measured from the real APK.
+sha2 = "0.10"

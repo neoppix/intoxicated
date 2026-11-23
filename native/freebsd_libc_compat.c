@@ -1,0 +1,1191 @@
+// freebsd_libc_compat.c: definitions for the handful of glibc/bionic libc
+// symbols the AOSP linker and shim reference that FreeBSD's libc spells
+// differently or does not provide. Whole file compiles to nothing off FreeBSD.
+#if defined(__FreeBSD__)
+
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <pthread_np.h>
+#include <sys/param.h>
+#include <sys/mount.h>
+#include <sys/stat.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/auxv.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <locale.h>
+#include <math.h>
+#include <xlocale.h>
+
+// glibc's locale-aware MB_CUR_MAX accessor. bionic exports it too; FreeBSD does
+// not, but its MB_CUR_MAX macro yields the same value for the current locale.
+size_t __ctype_get_mb_cur_max(void) { return MB_CUR_MAX; }
+
+// ── long double is not the same type ────────────────────────────────────────
+// bionic x86-64 makes `long double` IEEE binary128, passed in %xmm0; FreeBSD
+// amd64 makes it x87 80-bit, passed on the stack. Routing roundl/llroundl to
+// the host libm would read garbage for the argument, so these take the value as
+// __float128, which clang lays out and passes exactly as bionic does.
+// 2^112: every binary128 at or above this magnitude is already an integer.
+#define BIONIC_LD_INTEGRAL 5192296858534827628530496329220096.0Q
+
+__float128 bionic_roundl(__float128 x) {
+    __float128 a = x < 0 ? -x : x;
+    if (!(a < BIONIC_LD_INTEGRAL)) {
+        return x;  // already integral, or inf/NaN
+    }
+    __float128 t = (__float128)(__int128)x;  // truncates toward zero
+    if (a - (t < 0 ? -t : t) >= 0.5Q) {
+        t += x < 0 ? -1 : 1;  // halfway cases round away from zero
+    }
+    return t == 0 && x < 0 ? -0.0Q : t;
+}
+
+long long bionic_llroundl(__float128 x) {
+    __float128 r = bionic_roundl(x);
+    // Out of range or NaN: bionic's result is unspecified; match x86's
+    // "integer indefinite" rather than invoke undefined behaviour.
+    if (!(r >= -9223372036854775808.0Q && r < 9223372036854775808.0Q)) {
+        return (long long)(1ULL << 63);
+    }
+    return (long long)r;
+}
+
+// powl, fmal and strtold_l cross the same boundary, so they take and return
+// the binary128 bionic passes, as __float128, like roundl above. FreeBSD has
+// no binary128 maths library; each is computed here in binary128 where that
+// can be done exactly, and through the host's x87 version (64-bit mantissa)
+// with the result widened exactly where it cannot.
+
+// x - x is 0 only for a finite x: inf - inf and NaN - NaN are NaN.
+static int bionic_ld_finite(__float128 x) { return x - x == 0; }
+
+// 10^n, exact for 0 <= n <= 48 (5^48 < 2^113), by repeated squaring.
+static __float128 bionic_ld_pow10(int n) {
+    __float128 r = 1, b = 10;
+    for (; n > 0; n >>= 1, b *= b) {
+        if (n & 1) r *= b;
+    }
+    return r;
+}
+
+// An integer exponent of modest size is raised by repeated squaring in
+// binary128, which is exact while the intermediate values fit 113 bits
+// (powers of ten up to 10^48, of two everywhere) and otherwise off by a few
+// units in the 113th bit. Everything else goes through the host powl.
+__float128 bionic_powl(__float128 x, __float128 y) {
+    __float128 ay = y < 0 ? -y : y;
+    if (bionic_ld_finite(x) && ay <= 4096 && (__float128)(long long)ay == ay) {
+        long long n = (long long)ay;
+        __float128 r = 1, b = x;
+        for (; n > 0; n >>= 1, b *= b) {
+            if (n & 1) r *= b;
+        }
+        return y < 0 ? 1 / r : r;
+    }
+    return (__float128)powl((long double)x, (long double)y);
+}
+
+// a * b as p + e exactly (Dekker's product with Veltkamp's split at 57
+// bits), for operands far enough from overflow that the split cannot
+// overflow.
+static void bionic_ld_two_prod(__float128 a, __float128 b, __float128 *p, __float128 *e) {
+    const __float128 split = 144115188075855873.0Q;  // 2^57 + 1
+    __float128 t = split * a;
+    __float128 ah = t - (t - a), al = a - ah;
+    t = split * b;
+    __float128 bh = t - (t - b), bl = b - bh;
+    *p = a * b;
+    *e = ((ah * bh - *p) + ah * bl + al * bh) + al * bl;
+}
+
+// a * b + c with one rounding in all but the rarest double-rounding cases:
+// the exact product (p + e) and the exact sum (s + t) of p and c, then
+// s + (t + e). Infinities, NaNs and products near the overflow threshold take
+// the plain expression, which is what IEEE prescribes for them anyway.
+__float128 bionic_fmal(__float128 a, __float128 b, __float128 c) {
+    const __float128 big = 1.0e4000Q;
+    __float128 aa = a < 0 ? -a : a, ab = b < 0 ? -b : b;
+    if (!bionic_ld_finite(a) || !bionic_ld_finite(b) || !bionic_ld_finite(c) || aa > big || ab > big) {
+        return a * b + c;
+    }
+    __float128 p, e;
+    bionic_ld_two_prod(a, b, &p, &e);
+    if (!bionic_ld_finite(p)) {
+        return a * b + c;
+    }
+    __float128 s = p + c;
+    __float128 bb = s - p;
+    __float128 t = (p - (s - bb)) + (c - bb);
+    __float128 r = s + (t + e);
+    // An exact zero keeps the sign IEEE gives a * b + c.
+    return r == 0 ? p + c : r;
+}
+
+// Decimal text in the form [sign] digits [. digits] [e [sign] digits] with
+// at most 34 significant digits and a power of ten within 10^+-48 converts
+// exactly: the digits fit 113 bits, the power is exact, and one
+// multiplication or division rounds once (Clinger's fast path). Anything
+// else (more digits, larger exponents, hexadecimal, inf, nan, a locale whose
+// decimal point is not '.') is the host's x87 parse, widened exactly.
+// Returns 1 and sets *out when the fast path applies to [s, end).
+static int bionic_ld_parse_exact(const char *s, const char *end, __float128 *out) {
+    while (s < end && (*s == ' ' || (*s >= '\t' && *s <= '\r'))) s++;
+    int neg = 0;
+    if (s < end && (*s == '+' || *s == '-')) neg = *s++ == '-';
+    unsigned __int128 m = 0;
+    int digits = 0, frac = 0, seen = 0, point = 0, trailing = 0;
+    for (; s < end; s++) {
+        if (*s == '.' && !point) {
+            point = 1;
+            continue;
+        }
+        if (*s < '0' || *s > '9') break;
+        seen = 1;
+        if (*s == '0' && digits == 0) {
+            if (point) frac++;
+            continue;  // leading zeros carry no significance
+        }
+        if (*s == '0') {
+            trailing++;  // zeros held back until a nonzero digit follows
+            if (point) frac++;
+            continue;
+        }
+        for (; trailing > 0; trailing--) {
+            if (++digits > 34) return 0;
+            m *= 10;
+        }
+        if (++digits > 34) return 0;
+        m = m * 10 + (unsigned)(*s - '0');
+        if (point) frac++;
+    }
+    if (!seen) return 0;
+    long e10 = trailing;  // held-back zeros are a power of ten
+    if (s < end && (*s == 'e' || *s == 'E')) {
+        s++;
+        int eneg = 0;
+        if (s < end && (*s == '+' || *s == '-')) eneg = *s++ == '-';
+        if (s >= end || *s < '0' || *s > '9') return 0;
+        long x = 0;
+        for (; s < end && *s >= '0' && *s <= '9'; s++) {
+            if (x < 100000) x = x * 10 + (*s - '0');
+        }
+        e10 += eneg ? -x : x;
+    }
+    if (s != end) return 0;
+    e10 -= frac;
+    __float128 v = (__float128)m;  // exact: m < 10^34 < 2^113
+    if (m == 0) {
+        *out = neg ? -0.0Q : 0.0Q;
+        return 1;
+    }
+    if (e10 > 48 || e10 < -48) return 0;
+    v = e10 >= 0 ? v * bionic_ld_pow10((int)e10) : v / bionic_ld_pow10((int)-e10);
+    *out = neg ? -v : v;
+    return 1;
+}
+
+__float128 bionic_strtold_l(const char *s, char **end, locale_t loc) {
+    char *stop = NULL;
+    long double host = strtold_l(s, &stop, loc);
+    if (end) *end = stop;
+    const struct lconv *lc = localeconv_l(loc);
+    __float128 exact;
+    if (stop != s && lc && lc->decimal_point && strcmp(lc->decimal_point, ".") == 0 &&
+        bionic_ld_parse_exact(s, stop, &exact)) {
+        return exact;
+    }
+    return (__float128)host;
+}
+
+// ── posix_fallocate on ZFS ──────────────────────────────────────────────────
+// FreeBSD's posix_fallocate() returns EINVAL on ZFS (and EOPNOTSUPP/ENODEV on
+// some other filesystems): those filesystems have no block-preallocation
+// primitive. The engine calls posix_fallocate to size every mmap-backed store
+// it keeps -- LocalStorage, the rbx-storage content cache, and the
+// ota_rbxm_decompressed_cache / DataModelPatch buffers that hold decompressed
+// place content. On a ZFS home (the default FreeBSD layout) every one of those
+// calls fails, the file is never grown, the mmap-backed store is left empty or
+// short, and the engine's own integrity scan then finds thousands of cache
+// files whose contents do not match their content-hash names ("found file with
+// invalid hash"). The server turns that corrupt-content state into
+// DisconnectAndroidAnticheatKick -- reason 304, surfaced to the user as "Roblox
+// has detected missing or corrupted files" -- roughly 60s into the session.
+//
+// ftruncate() has no such filesystem restriction: on ZFS it sizes the file
+// sparsely and ZFS allocates blocks on write, which is exactly how the engine
+// touches these files (mmap then store). ftruncate satisfies the only property
+// posix_fallocate is being used for here -- that the file be at least
+// offset+len bytes so the following mmap covers it. We fall back to it only
+// when preallocation is genuinely unsupported; a real ENOSPC/EBADF/EFBIG is
+// returned unchanged so the engine still sees true failures. posix_fallocate
+// reports through its return value, never errno, so the engine's logged
+// "errno (...)" for these was always a stale value from an unrelated call.
+int intoxicated_posix_fallocate(int fd, off_t offset, off_t len) {
+    int rc = posix_fallocate(fd, offset, len);
+    if (rc == 0)
+        return 0;
+    if (rc == EINVAL || rc == EOPNOTSUPP || rc == ENOTSUP || rc == ENODEV) {
+        if (offset < 0 || len <= 0)
+            return rc; // preserve libc's argument validation
+        off_t need = offset + len;
+        if (need < offset)
+            return EFBIG; // offset+len overflowed
+        struct stat st;
+        if (fstat(fd, &st) != 0)
+            return errno;
+        if (st.st_size < need && ftruncate(fd, need) != 0)
+            return errno;
+        return 0;
+    }
+    return rc;
+}
+
+// ── bionic pthread_mutex via a pointer-keyed side-table ─────────────────────
+// bionic's pthread_mutex_t (a few bytes) and FreeBSD's (a pointer to an opaque
+// struct) have incompatible layouts, so we cannot forward the bionic object to
+// FreeBSD's pthread. Instead, key a real FreeBSD (recursive) mutex off the
+// bionic object's *address*. The engine only ever touches the bionic mutex
+// through these calls, so its bytes are never interpreted -- the address is a
+// stable identity. Recursive avoids self-deadlock from bionic type differences.
+#define BM_SLOTS 8192
+struct bm_entry {
+    const void *key;
+    pthread_mutex_t real;
+    struct bm_entry *next;
+};
+static struct bm_entry *bm_tab[BM_SLOTS];
+static pthread_mutex_t bm_guard = PTHREAD_MUTEX_INITIALIZER;
+
+static struct bm_entry *bm_lookup(const void *key) {
+    unsigned h = (unsigned)(((uintptr_t)key >> 4) & (BM_SLOTS - 1));
+    // The list is append-only (entries are never removed or reordered), so an
+    // existing key is found lock-free -- critical because the flag parser locks
+    // mutexes tens of thousands of times and a global guard here would serialise
+    // all of it and lose the flag-load race against the main thread.
+    for (struct bm_entry *e = __atomic_load_n(&bm_tab[h], __ATOMIC_ACQUIRE); e;
+         e = e->next)
+        if (e->key == key)
+            return e;
+    // Miss: take the guard, re-check (someone may have added it), then append.
+    pthread_mutex_lock(&bm_guard);
+    for (struct bm_entry *e = bm_tab[h]; e; e = e->next)
+        if (e->key == key) {
+            pthread_mutex_unlock(&bm_guard);
+            return e;
+        }
+    struct bm_entry *e = calloc(1, sizeof *e);
+    pthread_mutexattr_t a;
+    pthread_mutexattr_init(&a);
+    pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&e->real, &a);
+    pthread_mutexattr_destroy(&a);
+    e->key = key;
+    e->next = bm_tab[h];
+    __atomic_store_n(&bm_tab[h], e, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&bm_guard);
+    return e;
+}
+
+// Create a cond whose clock is CLOCK_MONOTONIC. bionic's conds use monotonic
+// deadlines for pthread_cond_timedwait; FreeBSD's default is CLOCK_REALTIME, so
+// a monotonic absolute deadline (~seconds since boot) reads as long past →
+// timedwait returns ETIMEDOUT instantly and every wait_for loop busy-spins.
+int bionic_cond_init_monotonic(void *cond) {
+    pthread_condattr_t a;
+    pthread_condattr_init(&a);
+    pthread_condattr_setclock(&a, 4 /* CLOCK_MONOTONIC on FreeBSD */);
+    int r = pthread_cond_init((pthread_cond_t *)cond, &a);
+    pthread_condattr_destroy(&a);
+    return r;
+}
+
+// The real FreeBSD mutex backing a bionic mutex object -- so pthread_cond_wait,
+// which must operate on the same lock the engine's mutex_lock/unlock use, gets
+// the side-table entry rather than the (uninterpreted) bionic bytes.
+pthread_mutex_t *bionic_mutex_real(void *m) { return &bm_lookup(m)->real; }
+
+int bionic_pthread_mutex_init(void *m, const void *attr) { (void)attr; bm_lookup(m); return 0; }
+int bionic_pthread_mutex_lock(void *m) { return pthread_mutex_lock(&bm_lookup(m)->real); }
+int bionic_pthread_mutex_unlock(void *m) { return pthread_mutex_unlock(&bm_lookup(m)->real); }
+int bionic_pthread_mutex_trylock(void *m) { return pthread_mutex_trylock(&bm_lookup(m)->real); }
+int bionic_pthread_mutex_destroy(void *m) { (void)m; return 0; }
+
+// bionic pthread_rwlock_t (56 bytes) has no relation to FreeBSD's (an 8-byte
+// pointer). Same side-table treatment as the mutex: a real FreeBSD rwlock keyed
+// off the bionic object's address. Left stubbed, OpenSSL's OBJ_NAME table lock
+// (crypto/objects/o_names.c) either no-ops or blocks on garbage -- a deadlock.
+struct br_entry {
+    const void *key;
+    pthread_rwlock_t real;
+    struct br_entry *next;
+};
+static struct br_entry *br_tab[BM_SLOTS];
+static pthread_mutex_t br_guard = PTHREAD_MUTEX_INITIALIZER;
+
+static pthread_rwlock_t *br_lookup(const void *key) {
+    unsigned h = (unsigned)(((uintptr_t)key >> 4) & (BM_SLOTS - 1));
+    for (struct br_entry *e = __atomic_load_n(&br_tab[h], __ATOMIC_ACQUIRE); e;
+         e = e->next)
+        if (e->key == key)
+            return &e->real;
+    pthread_mutex_lock(&br_guard);
+    for (struct br_entry *e = br_tab[h]; e; e = e->next)
+        if (e->key == key) {
+            pthread_mutex_unlock(&br_guard);
+            return &e->real;
+        }
+    struct br_entry *e = calloc(1, sizeof *e);
+    pthread_rwlock_init(&e->real, NULL);
+    e->key = key;
+    e->next = br_tab[h];
+    __atomic_store_n(&br_tab[h], e, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&br_guard);
+    return &e->real;
+}
+
+int bionic_pthread_rwlock_init(void *l, const void *attr) { (void)attr; br_lookup(l); return 0; }
+int bionic_pthread_rwlock_rdlock(void *l) { return pthread_rwlock_rdlock(br_lookup(l)); }
+int bionic_pthread_rwlock_wrlock(void *l) { return pthread_rwlock_wrlock(br_lookup(l)); }
+int bionic_pthread_rwlock_tryrdlock(void *l) { return pthread_rwlock_tryrdlock(br_lookup(l)); }
+int bionic_pthread_rwlock_trywrlock(void *l) { return pthread_rwlock_trywrlock(br_lookup(l)); }
+int bionic_pthread_rwlock_unlock(void *l) { return pthread_rwlock_unlock(br_lookup(l)); }
+int bionic_pthread_rwlock_destroy(void *l) { (void)l; return 0; }
+
+// FORTIFY open with no mode arg, and a registered prctl (unsupported).
+// The engine's Android anti-cheat root check reaches the filesystem through this
+// shim (confirmed by a live backtrace: libroblox -> intoxicated_fbsd___open_2 ->
+// open), which calls the host open() directly and so bypasses s_open's hiding of
+// host-only root binaries. Without this, the check open()s FreeBSD's /usr/bin/su
+// and the server disconnects with reason 304. Decline the same paths s_open does.
+extern int intoxicated_path_is_hidden(const char *path);
+int __open_2(const char *path, int flags) {
+    if (intoxicated_path_is_hidden(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    return open(path, flags);
+}
+
+// pipe2 logger + write-end table. The engine's GameActivity app thread makes a
+// command pipe (pipe2), ALooper_addFd's the READ end, and its android_main loop
+// dispatches commands read from it. The runtime never fed that pipe, so the
+// StartupController (created on command 3) never got made. To fix that the runtime
+// needs the WRITE end, but only sees the read end (via ALooper_addFd). Record
+// every pipe2 pair here so the read->write mapping can be looked up later.
+#define PIPE_TAB 256
+static int g_pipe_rd[PIPE_TAB];
+static int g_pipe_wr[PIPE_TAB];
+static int g_pipe_n;
+static pthread_mutex_t g_pipe_lock = PTHREAD_MUTEX_INITIALIZER;
+int pipe2(int fds[2], int flags) {
+    // Raw syscall, NOT the libc pipe2 (this IS the libc pipe2 for intoxicated-run, so
+    // calling it would recurse).
+    int r = (int)syscall(SYS_pipe2, fds, flags);
+    if (r == 0) {
+        pthread_mutex_lock(&g_pipe_lock);
+        int i = g_pipe_n % PIPE_TAB;
+        g_pipe_rd[i] = fds[0];
+        g_pipe_wr[i] = fds[1];
+        g_pipe_n++;
+        pthread_mutex_unlock(&g_pipe_lock);
+        if (getenv("INTOXICATED_TRACE_PIPE"))
+            fprintf(stderr, "[pipe2] read=%d write=%d flags=0x%x\n", fds[0], fds[1], flags);
+    }
+    return r;
+}
+// AGDK's android_native_app_glue uses the classic pipe(2), not pipe2.
+int pipe(int fds[2]) {
+    int r = (int)syscall(SYS_pipe2, fds, 0);
+    if (r == 0) {
+        pthread_mutex_lock(&g_pipe_lock);
+        int i = g_pipe_n % PIPE_TAB;
+        g_pipe_rd[i] = fds[0];
+        g_pipe_wr[i] = fds[1];
+        g_pipe_n++;
+        pthread_mutex_unlock(&g_pipe_lock);
+        if (getenv("INTOXICATED_TRACE_PIPE"))
+            fprintf(stderr, "[pipe] read=%d write=%d\n", fds[0], fds[1]);
+    }
+    return r;
+}
+// Look up the write end paired with a given read-end fd (from a pipe/pipe2 call).
+// Returns -1 if unknown. The runtime calls this to find the command pipe's write end.
+int intoxicated_pipe_write_end(int read_fd) {
+    int w = -1;
+    pthread_mutex_lock(&g_pipe_lock);
+    for (int i = 0; i < g_pipe_n && i < PIPE_TAB; i++)
+        if (g_pipe_rd[i] == read_fd) w = g_pipe_wr[i];
+    pthread_mutex_unlock(&g_pipe_lock);
+    return w;
+}
+
+// mmap(2) flag translation. The engine passes *Linux* MAP_* flag numbers, but
+// this reaches FreeBSD's mmap, which numbers them differently -- most fatally
+// Linux MAP_ANONYMOUS=0x20 vs FreeBSD MAP_ANON=0x1000, and Linux
+// MAP_NORESERVE=0x4000 which is FreeBSD's MAP_EXCL. Untranslated, every
+// anonymous allocation fails EINVAL and the engine's allocator gets no memory.
+#include <sys/mman.h>
+#define LX_MAP_SHARED    0x01
+#define LX_MAP_PRIVATE   0x02
+#define LX_MAP_FIXED     0x10
+#define LX_MAP_ANONYMOUS 0x20
+#define LX_MAP_STACK     0x20000
+void *bionic_mmap(void *addr, size_t len, int prot, int lx, int fd, off_t off) {
+    int f = 0;
+    if (lx & LX_MAP_SHARED)    f |= MAP_SHARED;
+    if (lx & LX_MAP_PRIVATE)   f |= MAP_PRIVATE;
+    if (lx & LX_MAP_FIXED)     f |= MAP_FIXED;
+    if (lx & LX_MAP_ANONYMOUS) {
+        f |= MAP_ANON;
+        // Linux ignores fd for anonymous maps; FreeBSD requires fd == -1 and
+        // returns EINVAL otherwise (the engine passes fd 0 for some of them).
+        fd = -1;
+    }
+    if (lx & LX_MAP_STACK)     f |= MAP_STACK;
+    // Linux-only advisory flags (NORESERVE, POPULATE, DENYWRITE, GROWSDOWN,
+    // LOCKED, HUGETLB, NONBLOCK) have no FreeBSD equivalent -- drop them.
+    // PROT_* bits match between the two, so prot passes through unchanged.
+    return mmap(addr, len, prot, f, fd, off);
+}
+
+// Linux sysinfo(2): fills total/free RAM etc. Roblox's allocator sizes its
+// arenas from totalram, so a stub (garbage) makes it abort. FreeBSD has no
+// sysinfo; source the same numbers from sysctl.
+#include <sys/sysctl.h>
+struct linux_sysinfo {
+    long uptime;
+    unsigned long loads[3];
+    unsigned long totalram, freeram, sharedram, bufferram, totalswap, freeswap;
+    unsigned short procs, pad;
+    unsigned long totalhigh, freehigh;
+    unsigned int mem_unit;
+    // bionic's trailing pad `_f` is `20 - 2*sizeof(long) - sizeof(int)` = 0 bytes
+    // on LP64, making sizeof(struct sysinfo) == 104. A larger struct here makes
+    // memset() overrun the caller's buffer and trips its stack canary.
+};
+int bionic_sysinfo(struct linux_sysinfo *info) {
+    memset(info, 0, sizeof(*info));
+    unsigned long physmem = 0;
+    size_t len = sizeof(physmem);
+    // FreeBSD sysconf selector numbers (BSD_VISIBLE macros aren't exposed under
+    // the build's strict feature flags, so spell them out): _SC_PAGESIZE=47,
+    // _SC_PHYS_PAGES=121, _SC_NPROCESSORS_ONLN=58.
+    long pgsz = sysconf(47);
+    if (pgsz <= 0)
+        pgsz = 4096;
+    if (sysctlbyname("hw.physmem", &physmem, &len, NULL, 0) != 0)
+        physmem = (unsigned long)sysconf(121) * (unsigned long)pgsz;
+    unsigned long freepg = 0;
+    len = sizeof(freepg);
+    sysctlbyname("vm.stats.vm.v_free_count", &freepg, &len, NULL, 0);
+    info->mem_unit = 1;
+    info->totalram = physmem;
+    info->freeram = freepg * (unsigned long)pgsz;
+    if (info->freeram == 0 || info->freeram > physmem)
+        info->freeram = physmem / 2;
+    long ncpu = sysconf(58);
+    info->procs = (unsigned short)(ncpu > 0 ? ncpu : 1);
+    return 0;
+}
+
+// ── bionic syscall(2) shim ──────────────────────────────────────────────────
+// libroblox calls syscall() with *Linux* numbers. FreeBSD's syscall uses
+// different numbers, so forwarding raw would be catastrophic. Dispatch the
+// handful bionic actually issues during init to real FreeBSD calls, and return
+// -ENOSYS (not garbage) for the rest so callers take their error path. Named
+// bionic_syscall so the host process keeps libc's real syscall.
+#include <sched.h>
+#include <sys/random.h>
+#include <time.h>
+
+// Real futex over FreeBSD's _umtx_op. Returning 0 from a FUTEX_WAIT (as a stub
+// does) makes every thread that should block busy-spin, livelocking the engine.
+struct fbsd_umtx_time {
+    struct timespec _timeout;
+    unsigned int _flags;
+    unsigned int _clockid;
+};
+extern int _umtx_op(void *obj, int op, unsigned long val, void *uaddr, void *uaddr2);
+#define FBSD_UMTX_OP_WAIT_UINT_PRIVATE 15
+#define FBSD_UMTX_OP_WAKE_PRIVATE 16
+#define FBSD_UMTX_ABSTIME 1
+#define FBSD_CLOCK_REALTIME 0
+#define FBSD_CLOCK_MONOTONIC 4
+#define LX_FUTEX_WAIT 0
+#define LX_FUTEX_WAKE 1
+#define LX_FUTEX_WAIT_BITSET 9  // bionic's timed waits use this -- absolute deadline
+#define LX_FUTEX_WAKE_BITSET 10
+#define LX_FUTEX_PRIVATE_FLAG 128
+#define LX_FUTEX_CLOCK_REALTIME 256
+
+// Cached so the hot WAIT path (100k+/s under a busy-wait) does not getenv() on
+// every call. Benign first-call race.
+static int futex_trace_enabled(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("INTOXICATED_TRACE_FUTEX") ? 1 : 0;
+    return v;
+}
+
+static long do_futex(void *uaddr, int op, unsigned int val, const struct timespec *to) {
+    // Strip the PRIVATE / CLOCK_REALTIME flag bits to get the base command.
+    int cmd = op & ~(LX_FUTEX_PRIVATE_FLAG | LX_FUTEX_CLOCK_REALTIME);
+    if (cmd == LX_FUTEX_WAIT || cmd == LX_FUTEX_WAIT_BITSET) {
+        struct fbsd_umtx_time ut;
+        void *tptr = NULL;
+        unsigned long tsz = 0;
+        if (to) {
+            ut._timeout = *to;
+            if (cmd == LX_FUTEX_WAIT_BITSET) {
+                // BITSET carries an *absolute* deadline (this is how bionic's
+                // pthread_cond / lock timeouts are implemented -- treating it as
+                // a no-op returning 0 was the flag-parse busy-spin).
+                ut._flags = FBSD_UMTX_ABSTIME;
+                ut._clockid = (op & LX_FUTEX_CLOCK_REALTIME) ? FBSD_CLOCK_REALTIME
+                                                             : FBSD_CLOCK_MONOTONIC;
+            } else {
+                ut._flags = 0; // plain WAIT is a relative timeout
+                ut._clockid = FBSD_CLOCK_MONOTONIC;
+            }
+            // EXPERIMENT (INTOXICATED_FUTEX_MINBLOCK=<us>): the TaskScheduler's
+            // eventcount (TS::CV) waits with an absolute deadline that is the
+            // stale next-frame time (already in the past because TS::Step hasn't
+            // advanced the frame clock), so every WAIT_BITSET insta-ETIMEDOUTs and
+            // the workers hot-spin instead of ever parking. A producer that only
+            // wakes *blocked* waiters then never issues a wake -> dispatch stalls.
+            // When set, a past absolute deadline is pushed to now+MINBLOCK (still
+            // ABSTIME, clock 4) so the waiter actually parks briefly, giving a
+            // concurrent notify a window to land. Off by default.
+            if (cmd == LX_FUTEX_WAIT_BITSET) {
+                static int mb = -2;
+                if (mb == -2) { const char *e = getenv("INTOXICATED_FUTEX_MINBLOCK"); mb = e ? atoi(e) : -1; }
+                if (mb > 0) {
+                    struct timespec nowm; clock_gettime(4, &nowm);
+                    long long now_us = (long long)nowm.tv_sec * 1000000LL + nowm.tv_nsec / 1000;
+                    long long dl_us  = (long long)ut._timeout.tv_sec * 1000000LL + ut._timeout.tv_nsec / 1000;
+                    if (dl_us <= now_us) {
+                        long long t = now_us + mb;
+                        ut._timeout.tv_sec = t / 1000000LL;
+                        ut._timeout.tv_nsec = (t % 1000000LL) * 1000;
+                    }
+                }
+            }
+            tptr = &ut;
+            tsz = sizeof(ut);
+        }
+        if (futex_trace_enabled()) {
+            struct timespec now_m = {0, 0}, now_r = {0, 0};
+            clock_gettime(4 /*FreeBSD MONOTONIC*/, &now_m);
+            clock_gettime(0 /*REALTIME*/, &now_r);
+            fprintf(stderr,
+                "[futex] tid=%d WAIT addr=%p cmd=%d op=0x%x val=%u to=%s{%lld.%09ld} flags=%u clk=%u "
+                "| mono=%lld.%09ld real=%lld.%09ld\n",
+                (int)pthread_getthreadid_np(), uaddr, cmd, op, val, to ? "" : "NULL",
+                (long long)(to ? to->tv_sec : 0), (long)(to ? to->tv_nsec : 0),
+                to ? ut._flags : 0u, to ? ut._clockid : 0u,
+                (long long)now_m.tv_sec, now_m.tv_nsec,
+                (long long)now_r.tv_sec, now_r.tv_nsec);
+        }
+        int r = _umtx_op(uaddr, FBSD_UMTX_OP_WAIT_UINT_PRIVATE,
+                         (unsigned long)val, (void *)tsz, tptr);
+        // bionic's __futex checks the raw negative-errno convention (-ETIMEDOUT,
+        // -EAGAIN, -EINTR), so return -errno rather than -1.
+        return r == 0 ? 0 : -errno;
+    }
+    if (cmd == LX_FUTEX_WAKE || cmd == LX_FUTEX_WAKE_BITSET) {
+        int r = _umtx_op(uaddr, FBSD_UMTX_OP_WAKE_PRIVATE,
+                         (unsigned long)val, NULL, NULL);
+        if (futex_trace_enabled())
+            fprintf(stderr, "[futex] tid=%d WAKE addr=%p cmd=%d op=0x%x val=%u -> r=%d errno=%d\n",
+                    (int)pthread_getthreadid_np(), uaddr, cmd, op, val, r, r == 0 ? 0 : errno);
+        return r == 0 ? (long)val : -errno;
+    }
+    // Any other op (requeue, PI, wake_op): report unsupported rather than lie
+    // with 0, which would busy-spin the caller.
+    return -ENOSYS;
+}
+
+// bionic pthread_once on the 4-byte control word, using the real futex for
+// waiting -- NO global guard. A single global lock held across the init routine
+// deadlocks when an init routine itself calls pthread_once (OpenSSL and the
+// engine's reflection init both nest them).
+#include <limits.h>
+#define ONCE_NOT_STARTED 0
+#define ONCE_IN_PROGRESS 1
+#define ONCE_DONE 2
+int bionic_pthread_once(int *control, void (*init)(void)) {
+    for (;;) {
+        int old = __atomic_load_n(control, __ATOMIC_ACQUIRE);
+        if (old == ONCE_DONE)
+            return 0;
+        if (old == ONCE_NOT_STARTED) {
+            int expected = ONCE_NOT_STARTED;
+            if (__atomic_compare_exchange_n(control, &expected, ONCE_IN_PROGRESS,
+                                            0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                if (init)
+                    init();
+                __atomic_store_n(control, ONCE_DONE, __ATOMIC_RELEASE);
+                do_futex(control, LX_FUTEX_WAKE, INT_MAX, NULL); // wake waiters
+                return 0;
+            }
+            // Lost the race to start it; re-read and act on the new state.
+        } else {
+            // In progress on another thread: block on the control word until it
+            // transitions (bionic's own protocol, via _umtx_op).
+            do_futex(control, LX_FUTEX_WAIT, ONCE_IN_PROGRESS, NULL);
+        }
+    }
+}
+
+// Translate a Linux clockid to FreeBSD's -- they disagree: Linux CLOCK_MONOTONIC
+// is 1, but FreeBSD 1 is CLOCK_VIRTUAL (process user-CPU time); FreeBSD's
+// monotonic is 4. Untranslated, every engine timer reads CPU time, not wall
+// time, and timed loops never satisfy their deadlines.
+static int fbsd_clockid(int lx) {
+    switch (lx) {
+    case 0: return 0;   // CLOCK_REALTIME
+    case 1: return 4;   // CLOCK_MONOTONIC        -> FreeBSD 4
+    case 2: return 15;  // CLOCK_PROCESS_CPUTIME  -> FreeBSD 15
+    case 3: return 14;  // CLOCK_THREAD_CPUTIME   -> FreeBSD 14
+    case 4: return 4;   // CLOCK_MONOTONIC_RAW    -> monotonic
+    case 5: return 10;  // CLOCK_REALTIME_COARSE  -> REALTIME_FAST
+    case 6: return 12;  // CLOCK_MONOTONIC_COARSE -> MONOTONIC_FAST
+    case 7: return 4;   // CLOCK_BOOTTIME         -> monotonic
+    default: return lx;
+    }
+}
+
+// clock_gettime / clock_getres translating the clockid. The engine imports
+// these directly (not only via syscall), so both need an override.
+int bionic_clock_gettime(int lx_clockid, struct timespec *ts) {
+    int r = clock_gettime(fbsd_clockid(lx_clockid), ts);
+    // DIAGNOSTIC (INTOXICATED_TRACE_CLOCK=1): confirm the engine's clock_gettime is
+    // actually routed through this shim, and whether the value advances. Prints
+    // once per ~200k calls with the raw returned monotonic value.
+    static int trace = -1;
+    if (trace < 0) trace = getenv("INTOXICATED_TRACE_CLOCK") ? 1 : 0;
+    if (trace && ts) {
+        static unsigned long n;
+        unsigned long i = __atomic_fetch_add(&n, 1UL, __ATOMIC_RELAXED);
+        if ((i % 200000) == 0)
+            fprintf(stderr, "[clk] call#%lu lx_clockid=%d fbsd=%d -> %lld.%09ld\n",
+                    i, lx_clockid, fbsd_clockid(lx_clockid),
+                    (long long)ts->tv_sec, (long)ts->tv_nsec);
+    }
+    return r;
+}
+int bionic_clock_getres(int lx_clockid, struct timespec *ts) {
+    return clock_getres(fbsd_clockid(lx_clockid), ts);
+}
+
+// timerfd_create / timerfd_settime with clockid + flag translation. The engine
+// paces its frame loop with a timerfd on the ALooper; bionic passes a *Linux*
+// clockid (CLOCK_MONOTONIC == 1) and *Linux* flag bits (TFD_NONBLOCK == O_NONBLOCK
+// == 0x800, TFD_CLOEXEC == O_CLOEXEC == 0x80000). FreeBSD reads clockid 1 as
+// CLOCK_VIRTUAL (process virtual time) and uses different O_ bit values, so an
+// untranslated call arms the frame timer on the wrong clock with wrong flags and
+// it never fires -> the TaskScheduler's frame clock never steps -> no frames.
+// Translate both. (TFD_TIMER_ABSTIME == 1 on both, so timerfd_settime's flags and
+// the itimerspec pass through unchanged; the absolute deadline is already in the
+// translated MONOTONIC clock the engine reads via bionic_clock_gettime.)
+extern int timerfd_create(int clockid, int flags);
+extern int timerfd_settime(int fd, int flags, const void *new_value, void *old_value);
+#define LX_TFD_NONBLOCK 0x800
+#define LX_TFD_CLOEXEC  0x80000
+#define FBSD_O_NONBLOCK 0x0004
+#define FBSD_O_CLOEXEC  0x00100000
+int bionic_timerfd_create(int lx_clockid, int lx_flags) {
+    int f = 0;
+    if (lx_flags & LX_TFD_NONBLOCK) f |= FBSD_O_NONBLOCK;
+    if (lx_flags & LX_TFD_CLOEXEC)  f |= FBSD_O_CLOEXEC;
+    int fd = timerfd_create(fbsd_clockid(lx_clockid), f);
+    if (getenv("INTOXICATED_TRACE_TIMERFD"))
+        fprintf(stderr, "[timerfd] create(lx_clk=%d->fbsd=%d, lx_flags=0x%x->0x%x) = %d\n",
+                lx_clockid, fbsd_clockid(lx_clockid), lx_flags, f, fd);
+    return fd;
+}
+int bionic_timerfd_settime(int fd, int flags, const void *new_value, void *old_value) {
+    int r = timerfd_settime(fd, flags, new_value, old_value);
+    if (getenv("INTOXICATED_TRACE_TIMERFD")) {
+        const long long *v = (const long long *)new_value; // {interval.s,interval.ns,value.s,value.ns}
+        fprintf(stderr, "[timerfd] settime(fd=%d, flags=0x%x, interval=%lld.%09lld value=%lld.%09lld) = %d\n",
+                fd, flags, v?v[0]:0, v?v[1]:0, v?v[2]:0, v?v[3]:0, r);
+    }
+    return r;
+}
+
+// Linux x86-64 syscall numbers.
+#define LX_read            0
+#define LX_write           1
+#define LX_open            2
+#define LX_close           3
+#define LX_stat            4
+#define LX_fstat           5
+#define LX_lstat           6
+#define LX_lseek           8
+#define LX_ioctl           16
+#define LX_pread64         17
+#define LX_access          21
+#define LX_sched_yield     24
+#define LX_nanosleep       35
+#define LX_getpid          39
+#define LX_uname           63
+#define LX_fcntl           72
+#define LX_readlink        89
+#define LX_gettimeofday    96
+#define LX_getuid          102
+#define LX_getgid          104
+#define LX_geteuid         107
+#define LX_getegid         108
+#define LX_getppid         110
+#define LX_statfs          137
+#define LX_fstatfs         138
+#define LX_gettid          186
+#define LX_futex           202
+#define LX_getdents64      217
+#define LX_set_tid_address 218
+#define LX_clock_gettime   228
+#define LX_exit_group      231
+#define LX_tgkill          234
+#define LX_openat          257
+#define LX_newfstatat      262
+#define LX_readlinkat      267
+#define LX_faccessat       269
+#define LX_getrandom       318
+
+// Reach the runtime's registered libc shims (s_openat/s_fstat/... with the /proc
+// redirect, root-file hiding and bionic struct translation) so a RAW syscall the
+// anti-cheat issues produces the exact same result the libc path does -- the point
+// of the whole raw-syscall trap (native/syscall_trap.c). Linux-convention errno
+// is applied by the caller via the -1 return; the shims set a FreeBSD errno which
+// intoxicated_fbsd_errno_to_linux maps there.
+struct IntoxicatedSystemSymbolDecl { const char* name; void* addr; };
+extern const struct IntoxicatedSystemSymbolDecl* intoxicated_system_symbols(size_t* count);
+static void* intoxicated_shim(const char* name) {
+    size_t n = 0;
+    const struct IntoxicatedSystemSymbolDecl* t = intoxicated_system_symbols(&n);
+    for (size_t i = 0; i < n; i++) {
+        if (t[i].name && strcmp(t[i].name, name) == 0) return t[i].addr;
+    }
+    return NULL;
+}
+
+long bionic_syscall(long number, ...) {
+    va_list ap;
+    va_start(ap, number);
+    long a0 = va_arg(ap, long), a1 = va_arg(ap, long), a2 = va_arg(ap, long);
+    long a3 = va_arg(ap, long);
+    (void)a3;
+    va_end(ap);
+
+    switch (number) {
+    case LX_gettid:
+    case LX_set_tid_address:
+        // Both want the current thread id; set_tid_address also returns it.
+        return (long)pthread_getthreadid_np();
+    case LX_getpid:
+        return (long)getpid();
+    case LX_getrandom:
+        return (long)getrandom((void *)a0, (size_t)a1, (unsigned)a2);
+    case LX_clock_gettime:
+        return bionic_clock_gettime((int)a0, (struct timespec *)a1);
+    case LX_gettimeofday:
+        return gettimeofday((struct timeval *)a0, (struct timezone *)a1);
+    case LX_sched_yield:
+        return sched_yield();
+    case LX_nanosleep:
+        return nanosleep((const struct timespec *)a0, (struct timespec *)a1);
+    case LX_futex:
+        // futex(uaddr=a0, op=a1, val=a2, timeout=a3) -> real _umtx_op wait/wake.
+        {
+            long r = do_futex((void *)a0, (int)a1, (unsigned int)a2,
+                              (const struct timespec *)a3);
+            // This function answers
+            // the engine's import of libc `syscall()`, whose contract is -1
+            // with errno set -- not the kernel's raw -errno, which is what
+            // bionic's *internal* __futex expects. A caller testing
+            // `== -1 && errno == ETIMEDOUT` reads -60 as success and waits
+            // again: three threads were measured doing exactly that at ~90k/s,
+            // and the client presented 0 frames/s under driven motion (twice);
+            // with this, 19.1 and 19.2. INTOXICATED_SYSCALL_RAW_ERRNO=1 restores
+            // the raw return as the control.
+            static int conv = -1;
+            if (conv < 0) conv = getenv("INTOXICATED_SYSCALL_RAW_ERRNO") ? 0 : 1;
+            if (conv && r < 0) {
+                extern void intoxicated_fbsd_errno_to_linux(void);
+                errno = (int)-r;
+                intoxicated_fbsd_errno_to_linux();
+                return -1;
+            }
+            return r;
+        }
+    // ── file / path syscalls: route through the runtime's shims so a raw syscall
+    // matches the libc path byte-for-byte (same /proc redirect, su-hiding,
+    // bionic struct layout). ──────────────────────────────────────────────
+    case LX_openat: {
+        // s_openat is variadic (mode); keep the pointer variadic so the x86-64
+        // call sets AL=0 as the callee expects.
+        typedef int (*fn)(int, const char*, int, ...);
+        fn f = (fn)intoxicated_shim("openat");
+        return f ? f((int)a0, (const char*)a1, (int)a2, (unsigned)a3) : -1;
+    }
+    case LX_open: {
+        typedef int (*fn)(const char*, int, ...);
+        fn f = (fn)intoxicated_shim("open");
+        return f ? f((const char*)a0, (int)a1, (unsigned)a2) : -1;
+    }
+    case LX_stat: {
+        typedef int (*fn)(const char*, void*);
+        fn f = (fn)intoxicated_shim("stat");
+        return f ? f((const char*)a0, (void*)a1) : -1;
+    }
+    case LX_lstat: {
+        typedef int (*fn)(const char*, void*);
+        fn f = (fn)intoxicated_shim("lstat");
+        return f ? f((const char*)a0, (void*)a1) : -1;
+    }
+    case LX_fstat: {
+        typedef int (*fn)(int, void*);
+        fn f = (fn)intoxicated_shim("fstat");
+        return f ? f((int)a0, (void*)a1) : -1;
+    }
+    case LX_newfstatat: {
+        typedef int (*fn)(int, const char*, void*, int);
+        fn f = (fn)intoxicated_shim("newfstatat");
+        return f ? f((int)a0, (const char*)a1, (void*)a2, (int)a3) : -1;
+    }
+    case LX_access: {
+        typedef int (*fn)(const char*, int);
+        fn f = (fn)intoxicated_shim("access");
+        return f ? f((const char*)a0, (int)a1) : -1;
+    }
+    case LX_faccessat: {
+        typedef int (*fn)(int, const char*, int, int);
+        fn f = (fn)intoxicated_shim("faccessat");
+        return f ? f((int)a0, (const char*)a1, (int)a2, (int)a3) : -1;
+    }
+    case LX_readlink: {
+        typedef long (*fn)(const char*, char*, size_t);
+        fn f = (fn)intoxicated_shim("readlink");
+        return f ? f((const char*)a0, (char*)a1, (size_t)a2) : -1;
+    }
+    case LX_readlinkat: {
+        // AT_FDCWD (-100 on Linux): same as readlink; otherwise fall back to the
+        // host readlinkat (no path rewrite, but these targets are not hidden).
+        if ((int)a0 == -100) {
+            typedef long (*fn)(const char*, char*, size_t);
+            fn f = (fn)intoxicated_shim("readlink");
+            if (f) return f((const char*)a1, (char*)a2, (size_t)a3);
+        }
+        return readlinkat((int)a0, (const char*)a1, (char*)a2, (size_t)a3);
+    }
+    // ── plain pass-throughs: the engine's libc uses the host's unshimmed
+    // version of these too, so a raw call matches without translation. ──────
+    case LX_read:      return read((int)a0, (void*)a1, (size_t)a2);
+    case LX_write:     return write((int)a0, (const void*)a1, (size_t)a2);
+    case LX_close: {
+        // Route through the runtime's close shim so a synth-fd tag is dropped on close.
+        typedef int (*fn)(int);
+        fn f = (fn)intoxicated_shim("close");
+        return f ? f((int)a0) : close((int)a0);
+    }
+    case LX_lseek:     return lseek((int)a0, (off_t)a1, (int)a2);
+    case LX_pread64:   return pread((int)a0, (void*)a1, (size_t)a2, (off_t)a3);
+    // ── trivial identity getters. ──────────────────────────────────────────
+    case LX_getuid:    return (long)getuid();
+    case LX_geteuid:   return (long)geteuid();
+    case LX_getgid:    return (long)getgid();
+    case LX_getegid:   return (long)getegid();
+    case LX_getppid:   return (long)getppid();
+    // fstatfs/statfs: route to the runtime's shims, which report procfs/sysfs for a
+    // synth /proc|/sys fd (the anti-cheat fstatfs()es /proc/self/maps to confirm it
+    // is really procfs) and an ext4 magic + real sizes for real files -- the Linux
+    // `struct statfs` layout the bionic caller expects. Same shim the libc path
+    // uses, so raw and libc agree.
+    case LX_fstatfs: {
+        typedef int (*fn)(int, void*);
+        fn f = (fn)intoxicated_shim("fstatfs");
+        return f ? f((int)a0, (void*)a1) : -1;
+    }
+    case LX_statfs: {
+        typedef int (*fn)(const char*, void*);
+        fn f = (fn)intoxicated_shim("statfs");
+        return f ? f((const char*)a0, (void*)a1) : -1;
+    }
+    case LX_exit_group:
+        _exit((int)a0);
+        // ioctl/fcntl/getdents64/tgkill are deliberately NOT handled here: their
+        // request codes / struct layouts / semantics differ between Linux and
+        // FreeBSD and the libc path shims them separately, so a naive pass-through
+        // would mismatch. They fall through to the logged default; if the raw path
+        // ever issues one, INTOXICATED_TRACE_RAWSYS names it and it gets a real
+        // translation then.
+
+    default:
+        // A refusal here is silent to the engine's caller and to us, which is
+        // the shape of bug that hides for weeks: `INTOXICATED_TRACE_SYSCALL=1`
+        // names each unanswered number once so the gap can be found.
+        if (getenv("INTOXICATED_TRACE_SYSCALL")) {
+            static unsigned char seen[512];
+            if (number < 0 || number >= 512 || !seen[number]) {
+                if (number >= 0 && number < 512) seen[number] = 1;
+                fprintf(stderr, "[syscall] unhandled Linux syscall %ld (a0=%#lx a1=%#lx a2=%#lx) -> ENOSYS\n",
+                        number, a0, a1, a2);
+            }
+        }
+        errno = ENOSYS;
+        return -1;
+    }
+}
+
+// glibc exposes errno's address as __errno_location(); FreeBSD calls it __error().
+extern int *__error(void);
+int *__errno_location(void) { return __error(); }
+
+// Linux gettid(2). FreeBSD's documented equivalent returns the same small tid.
+pid_t gettid(void) { return (pid_t)pthread_getthreadid_np(); }
+
+// glibc/bionic getauxval(3) over FreeBSD's elf_aux_info(3).
+//
+// Callers here are bionic, so `type` is a *Linux* AT_* number. Only 0..14 share
+// values with FreeBSD; from 15 up they diverge and a blind passthrough is a
+// silent corruption:
+//   Linux AT_HWCAP=16   == FreeBSD AT_CANARY=16
+//   Linux AT_RANDOM=25  == FreeBSD AT_HWCAP=25
+// So a bionic caller asking AT_RANDOM (a pointer to 16 entropy bytes for the
+// stack canary) would get a hwcap bitmask and dereference it -> SIGSEGV.
+//
+// We translate the numbers we care about and, for the pointer-valued ones,
+// hand back a real pointer of our own rather than whatever elf_aux_info copies.
+enum {
+    LX_AT_PHDR   = 3,  LX_AT_PHENT = 4,  LX_AT_PHNUM = 5,
+    LX_AT_PAGESZ = 6,  LX_AT_BASE  = 7,  LX_AT_ENTRY = 9,
+    LX_AT_HWCAP  = 16, LX_AT_SECURE = 23, LX_AT_RANDOM = 25, LX_AT_HWCAP2 = 26,
+    FB_AT_HWCAP  = 25, FB_AT_HWCAP2 = 26,
+};
+unsigned long getauxval(unsigned long type) {
+    switch (type) {
+    case LX_AT_RANDOM: {
+        // Bionic wants a pointer to 16 random bytes (stack-guard seed). FreeBSD
+        // exposes a canary via AT_CANARY, but elf_aux_info *copies* it rather
+        // than returning a pointer, so just own the buffer ourselves.
+        static unsigned char rnd[16];
+        static int seeded = 0;
+        if (!seeded) { arc4random_buf(rnd, sizeof(rnd)); seeded = 1; }
+        return (unsigned long)rnd;
+    }
+    case LX_AT_HWCAP: {
+        unsigned long v = 0;
+        if (elf_aux_info(FB_AT_HWCAP, &v, sizeof(v)) != 0) return 0;
+        return v;
+    }
+    case LX_AT_HWCAP2: {
+        unsigned long v = 0;
+        if (elf_aux_info(FB_AT_HWCAP2, &v, sizeof(v)) != 0) return 0;
+        return v;
+    }
+    case LX_AT_SECURE:
+        // No FreeBSD auxv equivalent; report "not a setuid exec" (safe default).
+        return 0;
+    case LX_AT_PHDR: case LX_AT_PHENT: case LX_AT_PHNUM:
+    case LX_AT_PAGESZ: case LX_AT_BASE: case LX_AT_ENTRY: {
+        // Shared numbers (0..14) -- forward straight through.
+        unsigned long v = 0;
+        if (elf_aux_info((int)type, &v, sizeof(v)) != 0) return 0;
+        return v;
+    }
+    default:
+        return 0;
+    }
+}
+
+// glibc's LFS alias. FreeBSD's off_t is already 64-bit, so open64 == open.
+int open64(const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    return open(path, flags, mode);
+}
+
+// Linux prctl(2). The linker uses it only for best-effort VMA naming
+// (PR_SET_VMA) and similar; FreeBSD has no analogue, and every caller tolerates
+// failure. Report unsupported rather than pretend success.
+int prctl(int option, ...) {
+    (void)option;
+    errno = ENOSYS;
+    return -1;
+}
+
+// Linux/bionic uname(2). libroblox imports `uname` (crashpad's
+// SystemSnapshotLinux::ReadKernelVersion, among others), and with `--host-libc`
+// an unprovided `uname` resolves to FreeBSD's, which answers
+// `sysname="FreeBSD" release="14.4-RELEASE..." machine="amd64"` -- a straight
+// "this kernel is not Linux/Android" tell that no Build.* string covers, read
+// through a libc call that never reaches `bionic_syscall` so it is invisible to
+// INTOXICATED_TRACE_SYSCALL. Two defects in one, the same shape as the statvfs /
+// sigset_t / mallinfo divergences: (1) the VALUES name FreeBSD, and (2) bionic's
+// `struct utsname` is six 65-byte fields (SYS_NMLN=65) while FreeBSD's is six
+// 256-byte fields, so even a corrected passthrough would land every field but
+// the first at the wrong offset. Fill the bionic shape by hand with
+// Android/Linux values, consistent with `os.name="Linux"` (platform_name()).
+struct intoxicated_bionic_utsname {
+    char sysname[65];
+    char nodename[65];
+    char release[65];
+    char version[65];
+    char machine[65];
+    char domainname[65];
+};
+int uname(struct intoxicated_bionic_utsname *u) {
+    if (u == NULL) {
+        errno = EFAULT;
+        return -1;
+    }
+    memset(u, 0, sizeof *u);
+    strlcpy(u->sysname, "Linux", sizeof u->sysname);
+    strlcpy(u->nodename, "localhost", sizeof u->nodename);
+    // A plausible Android/Linux kernel release and build string. The exact value
+    // is not load-bearing the way `sysname` is; what matters is that it reads as
+    // a Linux kernel, not FreeBSD. x86_64 matches what the client runs and what the
+    // x86_64 Roblox APK targets.
+    // The trailing `-g<hash>` must read as a real 12-hex kernel git hash: the old
+    // suffix spelled the inherited project's name, a literal fingerprint in a
+    // string the anti-cheat can report verbatim.
+    strlcpy(u->release, "5.10.157-android13-4-00003-gb5a8f0e7c2d1", sizeof u->release);
+    strlcpy(u->version, "#1 SMP PREEMPT Thu Jan 1 00:00:00 UTC 2026",
+            sizeof u->version);
+    strlcpy(u->machine, "x86_64", sizeof u->machine);
+    strlcpy(u->domainname, "localdomain", sizeof u->domainname);
+    return 0;
+}
+
+// Linux sched_setscheduler/sched_setparam. The engine's FunctionMarshaller (and
+// other threads) ask for SCHED_FIFO at max priority. On FreeBSD that either fails
+// EPERM (unprivileged) or, if it succeeds, makes the thread real-time -- and a
+// real-time thread that then blocks on a mutex held by a normal-priority thread
+// can priority-invert into a hang (no PI on these bionic mutexes). bionic itself
+// treats these as best-effort hints. Report success without actually changing the
+// policy, so scheduling stays uniform and no inversion is possible.
+int sched_setscheduler(pid_t pid, int policy, const struct sched_param *param) {
+    (void)pid; (void)policy; (void)param;
+    // Report the honest unprivileged result ("could not set the policy") rather
+    // than a fake success. bionic treats these as best-effort and does not check
+    // the return, so EPERM changes nothing behaviourally but never lies that the
+    // thread became real-time (verified: does not affect the boot either way).
+    errno = EPERM;
+    return -1;
+}
+int sched_setparam(pid_t pid, const struct sched_param *param) {
+    (void)pid; (void)param;
+    errno = EPERM;
+    return -1;
+}
+
+// --- bionic pthread_attr_t family ------------------------------------------
+//
+// This is the single nastiest ABI mismatch in the port. bionic's
+// `pthread_attr_t` is a *by-value* 56-byte struct (LP64 layout below); FreeBSD's
+// is an *opaque pointer* (`struct pthread_attr *`). libroblox hands bionic attr
+// structs to these symbols, so every one of them MUST be owned here -- routing
+// even one to host libthr means libthr reads bionic's first qword (`flags`) as a
+// `struct pthread_attr *` and free()s it. Observed exactly that: a stubbed
+// pthread_getattr_np left the struct uninitialised, then libthr's
+// pthread_attr_destroy did free(0xffffffff) and jemalloc walked off into
+// unmapped memory. Keep the whole family self-consistent over this one layout.
+struct bionic_pthread_attr {
+    uint32_t flags;          // 0x00
+    uint32_t _pad;           // 0x04
+    void*    stack_base;     // 0x08
+    size_t   stack_size;     // 0x10
+    size_t   guard_size;     // 0x18
+    int32_t  sched_policy;   // 0x20
+    int32_t  sched_priority; // 0x24
+    char     __reserved[16]; // 0x28..0x38  (total 0x38 = 56 bytes)
+};
+#define BIONIC_ATTR_FLAG_DETACHED 1u
+
+int bionic_pthread_attr_init(void* attr) {
+    struct bionic_pthread_attr* a = attr;
+    memset(a, 0, sizeof *a);
+    a->stack_size = 8u * 1024u * 1024u;  // Roblox threads are heavy; 8 MiB.
+    a->guard_size = (size_t)getpagesize();
+    a->sched_policy = 0;                 // SCHED_OTHER / bionic SCHED_NORMAL
+    return 0;
+}
+
+// bionic attr owns no heap, so destroy just scrubs the struct. Critically this
+// keeps the pointer-vs-struct mismatch from ever reaching free().
+int bionic_pthread_attr_destroy(void* attr) {
+    memset(attr, 0, sizeof(struct bionic_pthread_attr));
+    return 0;
+}
+
+// glibc/bionic extension: fill `attr` with a live thread's real attributes.
+// `thread` is a genuine FreeBSD pthread_t here -- every handle libroblox holds
+// came from host pthread_create/pthread_self -- so FreeBSD's pthread_attr_get_np
+// accepts it directly. We copy the stack bounds into the bionic layout.
+int bionic_pthread_getattr_np(pthread_t thread, void* attr) {
+    struct bionic_pthread_attr* a = attr;
+    memset(a, 0, sizeof *a);
+    pthread_attr_t fa;
+    if (pthread_attr_init(&fa) != 0)
+        return ENOMEM;
+    // If we cannot get the real bounds, DO NOT return success with a NULL/zero
+    // stack -- a bionic caller (jemalloc, the GC stack scanner) would trust those
+    // and walk off a zero-length stack, the exact class of stack-attr lie the
+    // header comment above records biting us before.
+    int rc = pthread_attr_get_np(thread, &fa);
+    if (rc != 0) {
+        pthread_attr_destroy(&fa);
+        return rc;
+    }
+    void* base = NULL;
+    size_t size = 0, guard = 0;
+    pthread_attr_getstack(&fa, &base, &size);
+    pthread_attr_getguardsize(&fa, &guard);
+    pthread_attr_destroy(&fa);
+    if (base == NULL || size == 0)
+        return EINVAL;
+    a->stack_base = base;
+    a->stack_size = size;
+    a->guard_size = guard;
+    return 0;
+}
+
+int bionic_pthread_attr_getstack(const void* attr, void** base, size_t* size) {
+    const struct bionic_pthread_attr* a = attr;
+    if (base) *base = a->stack_base;
+    if (size) *size = a->stack_size;
+    return 0;
+}
+
+int bionic_pthread_attr_setstacksize(void* attr, size_t stacksize) {
+    ((struct bionic_pthread_attr*)attr)->stack_size = stacksize;
+    return 0;
+}
+
+int bionic_pthread_attr_setdetachstate(void* attr, int state) {
+    struct bionic_pthread_attr* a = attr;
+    if (state) a->flags |= BIONIC_ATTR_FLAG_DETACHED;
+    else       a->flags &= ~BIONIC_ATTR_FLAG_DETACHED;
+    return 0;
+}
+
+// struct sched_param leads with `int sched_priority` on both bionic and FreeBSD,
+// so reading the first int is layout-safe.
+int bionic_pthread_attr_setschedparam(void* attr, const void* param) {
+    ((struct bionic_pthread_attr*)attr)->sched_priority = *(const int*)param;
+    return 0;
+}
+
+#endif /* __FreeBSD__ */

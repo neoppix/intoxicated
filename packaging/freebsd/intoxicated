@@ -1,0 +1,190 @@
+#!/bin/sh
+# Intoxicated: native FreeBSD Roblox client.
+# Usage:
+#   intoxicated                      # launch to the home page
+#   intoxicated 189707               # join a place by id
+#   intoxicated 'roblox://...'       # join a roblox:// deep link
+#   intoxicated 'roblox-player:1+launchmode:play+...'
+#                                    # the link roblox.com's Play button hands
+#                                    # the browser (intoxicated.desktop)
+#   intoxicated 'https://www.roblox.com/games/189707/...'
+#                                    # a roblox.com game page link
+#   intoxicated --update-apk         # re-download the Roblox build, then exit
+# Where the checkout lives; INTOXICATED_REPO overrides it.
+REPO="${INTOXICATED_REPO:-$HOME/intoxicated}"
+BIN="$REPO/target/release/intoxicated-run"
+FETCH="$REPO/target/release/intoxicated-fetch"
+# Where the Roblox build lives. native/system_paths.cpp derives what it hides in
+# /proc/self/maps from the --lib-dir and --apk actually passed, so this is a
+# convention, not a requirement.
+APKDIR="${XDG_CACHE_HOME:-$HOME/.cache}/intoxicated/apk"
+APK="$APKDIR/candidate-0.apk"
+ENGINE="$APKDIR/lib/x86_64/libroblox.so"
+# The client's data. profiles/<name>/ holds the session, flags.json and Roblox's
+# own storage; intoxicated-run derives the same directory from XDG_DATA_HOME.
+DATADIR="${XDG_DATA_HOME:-$HOME/.local/share}/intoxicated"
+
+# DISPLAY/XAUTHORITY are inherited from the terminal's X session, not hard-coded.
+# The early client settings that keep a fresh profile from aborting before its
+# flags load are always sent now; INTOXICATED_EARLY_SETTINGS is no longer needed.
+export INTOXICATED_FAKE_PROC=1
+export INTOXICATED_THROTTLE=off
+export INTOXICATED_SET_BASE_URL='https://www.roblox.com,https://apis.roblox.com'
+
+# Download the newest build from APKPure into a scratch directory next to
+# APKDIR, unpack its x86-64 libraries, then swap it into place. intoxicated-fetch
+# refuses anything whose v2, v3 and v3.1 signatures do not verify against one of
+# Roblox's pinned certificates, so a bad or tampered download never reaches APKDIR.
+fetch_apk() {
+  if [ ! -x "$FETCH" ]; then
+    echo "intoxicated: building the APK fetcher..." >&2
+    (cd "$REPO" && cargo build --release -q -p intoxicated-fetch) || return 1
+  fi
+
+  # mkdir is atomic, so it doubles as a lock against two launches downloading at once.
+  lock="$APKDIR.lock"
+  if ! mkdir "$lock" 2>/dev/null; then
+    echo "intoxicated: another download is running (remove $lock if it is not)" >&2
+    return 1
+  fi
+  tmp="$APKDIR.new.$$"
+  trap 'rm -rf "$tmp" "$lock"' EXIT INT TERM
+
+  echo "intoxicated: downloading the Roblox build from APKPure..." >&2
+  "$FETCH" "$tmp" >&2 || { echo "intoxicated: download failed" >&2; return 1; }
+  if [ ! -f "$tmp/candidate-0.apk" ]; then
+    echo "intoxicated: the mirror returned no candidate-0.apk" >&2
+    return 1
+  fi
+
+  # The monolithic APK carries every ABI; only x86_64 is loaded. Check every
+  # candidate in case the mirror ever hands back a split build instead.
+  mkdir -p "$tmp/lib/x86_64"
+  for candidate in "$tmp"/candidate-*.apk; do
+    unzip -o -j -q "$candidate" 'lib/x86_64/*.so' -d "$tmp/lib/x86_64" 2>/dev/null
+  done
+  if [ ! -f "$tmp/lib/x86_64/libroblox.so" ]; then
+    echo "intoxicated: no lib/x86_64/libroblox.so in the download" >&2
+    return 1
+  fi
+
+  rm -rf "$APKDIR.old"
+  [ -d "$APKDIR" ] && mv "$APKDIR" "$APKDIR.old"
+  mv "$tmp" "$APKDIR" || { [ -d "$APKDIR.old" ] && mv "$APKDIR.old" "$APKDIR"; return 1; }
+  rm -rf "$APKDIR.old" "$lock"
+  trap - EXIT INT TERM
+  echo "intoxicated: build installed in $APKDIR" >&2
+}
+
+# Flags the launcher keeps in the profile's flags.json. Each is put back on every
+# launch, but only when its key is absent, so a value chosen by hand is left
+# alone and a new or reset profile gets them too. intoxicated-run re-sends the
+# document every five seconds, so the engine's own flag reloader cannot revert
+# them mid-session.
+FLAGS_FILE="${INTOXICATED_FLAGS:-$DATADIR/profiles/default/flags.json}"
+
+# ensure_flag NAME VALUE WHAT
+ensure_flag() {
+  [ "$2" = off ] && return 0
+  mkdir -p "$(dirname "$FLAGS_FILE")"
+  [ -s "$FLAGS_FILE" ] || printf '{}\n' > "$FLAGS_FILE"
+  /usr/local/bin/jq -e --arg k "$1" 'has($k)' "$FLAGS_FILE" >/dev/null 2>&1 && return 0
+  if /usr/local/bin/jq --arg k "$1" --arg v "$2" '. + {($k): $v}' "$FLAGS_FILE" > "$FLAGS_FILE.new" 2>/dev/null; then
+    mv "$FLAGS_FILE.new" "$FLAGS_FILE"
+    echo "intoxicated: $3 ($1=$2 in $FLAGS_FILE)" >&2
+  else
+    rm -f "$FLAGS_FILE.new"
+    echo "intoxicated: $FLAGS_FILE is not valid JSON; $1 left at Roblox's default" >&2
+  fi
+}
+
+ensure_flags() {
+  # Roblox's TaskScheduler defaults to 60 fps, the Android handheld target.
+  # INTOXICATED_FPS sets the value written; =off skips it.
+  ensure_flag DFIntTaskSchedulerTargetFps "${INTOXICATED_FPS:-9999}" "fps unlocked"
+  # The Android build sets caps.videoMemory to a constant 64 MB whatever the GPU
+  # has -- real Android logs the same 67108864 against 12 GB of device memory.
+  # Phones render full meshes under that same budget, so it is NOT established
+  # as the cause of low-poly meshes here; it is raised because 64 MB is plainly
+  # wrong for a desktop GPU and costs nothing to correct. This is Roblox's
+  # own override, in bytes and clamped to a signed 32-bit int; 1.5 GiB follows
+  # mocktail's texture_memory_policy.h (Apache-2.0). Check it took with the
+  # "[FLog::Graphics] Video memory size:" line in the engine log.
+  # INTOXICATED_VIDEO_MEMORY sets the value written; =off skips it.
+  ensure_flag FIntRenderForceVideoMemorySize "${INTOXICATED_VIDEO_MEMORY:-1610612736}" "video memory budget raised"
+}
+
+# join_link ARG: print the link intoxicated-run will be given for ARG (a place
+# id or a link), or fail after intoxicated-run has said on stderr why it is
+# refused. The check is intoxicated-run's own, the one --join-url applies, so
+# the launcher takes exactly what the client takes. ARG is never echoed:
+# roblox.com's link carries a one-time sign-in ticket, which the check drops.
+# It goes in on stdin, so it is not in another process's arguments either.
+join_link() {
+  case "$1" in
+    *[!0-9]*) link="$1" ;;
+    *) link="roblox://experiences/start?placeId=$1" ;;
+  esac
+  printf '%s\n' "$link" | "$BIN" --check-join-url
+}
+
+JOIN=""
+if [ -n "$1" ]; then
+  case "$1" in
+    --update-apk) fetch_apk; exit $? ;;
+  esac
+  if [ ! -x "$BIN" ]; then
+    echo "intoxicated: $BIN is not built; run cargo build --release in $REPO" >&2
+    exit 1
+  fi
+  JOIN=$(join_link "$1") || exit 2
+  # A link the check rewrote (roblox.com's, with its ticket) would otherwise
+  # stay in this process's arguments for the whole session. Run again with the
+  # rewritten one instead. The check gives the same link back for it, so this
+  # happens once.
+  case "$1" in
+    *[!0-9]*)
+      if [ "$JOIN" != "$1" ] && [ -z "$INTOXICATED_LINK_REWRITTEN" ]; then
+        INTOXICATED_LINK_REWRITTEN=1 exec /bin/sh "$0" "$JOIN"
+      fi
+      ;;
+  esac
+fi
+unset INTOXICATED_LINK_REWRITTEN
+
+if [ ! -f "$APK" ] || [ ! -f "$ENGINE" ]; then
+  echo "intoxicated: no Roblox build in $APKDIR" >&2
+  fetch_apk || { echo "intoxicated: could not get a Roblox build" >&2; exit 1; }
+fi
+
+ensure_flags
+
+set -- --lib-dir "$APKDIR/lib/x86_64" --apk "$APK" --host-libc --game-activity --run 0
+[ -n "$JOIN" ] && set -- "$@" --join-url "$JOIN"
+# The runtime publishes the join link once, when the home page is interactive,
+# and watches the bus for the engine's Game.launch. This adds a bounded retry
+# (once a second, at most 40 tries) for a link that goes unanswered for 15 s.
+# Any Game.launch stops it, and only one for the link's own place counts as the
+# link arriving, so a join is never doubled.
+[ -n "$JOIN" ] && export INTOXICATED_DEEPLINK_RETRY=1
+
+i=0
+while [ $i -lt 4 ]; do
+  i=$((i+1))
+  "$BIN" "$@"
+  rc=$?
+  # 124 is the teardown watchdog cutting off a shutdown that hung after the
+  # window was closed. 130 and 143 are a second Ctrl-C (SIGINT) or SIGTERM
+  # ending the client at once, or either signal killing it before it could
+  # handle one. All three are the user leaving, not a boot failure, so they
+  # must not count as a hiccup and relaunch the game.
+  case $rc in
+    0) exit 0 ;;
+    124) echo "intoxicated: shutdown hung and was cut off" >&2; exit 124 ;;
+    130|143) exit $rc ;;
+  esac
+  echo "intoxicated: boot hiccup, retrying ($i)..." >&2
+  sleep 1
+done
+echo "intoxicated: failed to start after $i tries" >&2
+exit 1

@@ -1,0 +1,14 @@
+[package]
+name = "intoxicated-linker-sys"
+description = "Builds native/ (the bionic linker port, libjnivm and the Android framework shims) and binds its C surface for intoxicated-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# The key is the archive the C surface lives in. Nothing reads the
+# `DEP_INTOXICATED_LINKER_SHIM_*` metadata it produces; what it buys is that Cargo
+# refuses a second crate in the graph that links the same native library, which
+# would otherwise put two copies of bionic's global loader state in one binary.
+links = "intoxicated_linker_shim"
+
+[build-dependencies]
+cmake = "0.1"

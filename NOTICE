@@ -1,0 +1,45 @@
+Intoxicated
+Copyright 2026 the Intoxicated contributors
+
+Licensed under the GNU General Public License v3.0 or later. See LICENSE.
+
+This product includes software developed by third parties, listed below with
+the licence each is distributed under. Apache-2.0 is one-way compatible with
+GPL-3.0, so Apache-licensed work may be incorporated here; the reverse is not
+true, and nothing in this repository may be taken back the other way.
+
+-------------------------------------------------------------------------------
+mcpelauncher-linker
+Copyright (c) 2024 ChristopherHX and MCMrARM
+Licensed under the MIT License.
+https://github.com/minecraft-linux/mcpelauncher-linker
+
+third_party/mcpelauncher-linker/ is the ported AOSP bionic linker Intoxicated loads
+libroblox.so with. crates/intoxicated-linker-sys/build.rs compiles bionic/linker and
+bionic/libdl from it, so it is statically linked into every binary shipped here
+and nothing loads without it. The MIT text is kept beside it at
+third_party/mcpelauncher-linker/LICENSE.
+
+Local changes are not committed into the submodule, which belongs to somebody
+else and has nowhere to push. The build uses it as pinned, with no local
+patches applied.
+-------------------------------------------------------------------------------
+libjnivm
+Copyright (c) 2019 ChristopherHX
+Licensed under the MIT License.
+https://github.com/ChristopherHX/libjnivm
+
+third_party/libjnivm/ stands in for Android's ART: it answers the JNI calls
+libroblox.so makes into what it believes is a Java VM. Statically linked
+(cargo:rustc-link-lib=static=jnivm). The MIT text is at
+third_party/libjnivm/LICENSE.
+-------------------------------------------------------------------------------
+mocktail
+Copyright 2026 komaruworld
+Licensed under the Apache License, Version 2.0.
+https://github.com/komaruworld/mocktail
+
+No mocktail code is included. Some engine facts (an input action ordering and
+the field names of one Roblox constructor) were cross-checked against it, and
+the source comments that rely on them say so.
+-------------------------------------------------------------------------------

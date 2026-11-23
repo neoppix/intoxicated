@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/intoxicated-fetch",
+    "crates/intoxicated-linker-sys",
+    "crates/intoxicated-runtime",
+]
+
+[workspace.package]
+version = "0.13.2"
+edition = "2021"
+license = "GPL-3.0-or-later"  # see LICENSE; third-party notices in THIRD-PARTY-NOTICES.md
+rust-version = "1.75"
+
+[workspace.dependencies]
+# One HTTP client for the workspace: rustls only, no gzip (intoxicated-fetch
+# counts the file's own bytes, and features unify across the workspace).
+ureq = { version = "3.3", default-features = false, features = ["rustls"] }
+
+[profile.release]
+debug = true      # the runtime is useless to debug without symbols

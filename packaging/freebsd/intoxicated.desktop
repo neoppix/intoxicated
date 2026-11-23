@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Intoxicated
+GenericName=Roblox Client
+Comment=Native FreeBSD Roblox client
+Exec=intoxicated %u
+Icon=intoxicated
+Terminal=false
+Categories=Game;
+StartupNotify=true
+# Must equal intoxicated-runtime's WM_RES_CLASS, which a test in
+# android/x11_window/tests.rs pins to this line. A taskbar or capture
+# picker matches a window to this entry through it, and a drift shows up as a
+# nameless, iconless window rather than as an error.
+StartupWMClass=Intoxicated
+MimeType=x-scheme-handler/roblox-player;x-scheme-handler/roblox;
