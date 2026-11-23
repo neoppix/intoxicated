@@ -186,6 +186,15 @@ only if it is missing so a value you set by hand wins:
 - `FIntRenderForceVideoMemorySize` raises the Android build's fixed 64 MB video
   memory budget to 1.5 GiB. `INTOXICATED_VIDEO_MEMORY=<bytes>` or `=off`.
 
+The client itself turns off memory savers that Roblox's servers hand the
+Android build for phones: `FFlagRenderShadowResolutionScaling`, which shrinks
+the shadows of lights to as little as 114 pixels and keeps rebuilding them,
+and the Vulkan allocator settings that pool only small allocations and free
+every empty page at once (`FFlagVulkanAllocatorPoolSmallOnly`,
+`FIntVulkanAllocatorKeepEmptyPages`, `FFlagVulkanAllocatorEmptyPageBudget`).
+The allocator ones cost a few hundred MB more VRAM. A value for any of these
+keys in `flags.json` overrides the client's.
+
 `target/release/intoxicated-run --help` lists the client's options and
 environment switches. Among them, `INTOXICATED_RESOLUTION=<w>x<h>` sets the
 render size (1280x720 by default; a fullscreen monitor overrides it) and
@@ -214,10 +223,13 @@ letters and dead keys. Meshes load at
 full detail, and on NVIDIA, whose Vulkan driver has no ETC2 textures, Intoxicated
 decodes them itself so the textures the engine would otherwise drop are drawn.
 
-The ETC2 decode runs across several cores: a deploy in Frontlines that used to
-drop to 1-2 fps while new textures streamed in now holds frame intervals under
-14 ms, and the full 48 MB map load decodes in about 50 ms behind the loading
-screen. `intoxicated <placeId>` joins the place directly.
+The ETC2 decode runs across several cores (a 50 MB burst while a map loads
+decodes in about 60 ms), and the memory it decodes into is reused rather than
+allocated again for every frame, which on NVIDIA is a slow kernel call. In
+Frontlines, the seconds after deploying used to bring 15 to 18 frames of 100
+to 800 ms and once a 3.3 s freeze; now 3 to 6 frames of up to about 150 ms,
+and 2.5 minutes in game afterwards had 9 frames over 40 ms, none over 250 ms.
+`intoxicated <placeId>` joins the place directly.
 Game audio goes straight to OSS with about 10 ms of device latency, so it works
 without PulseAudio and sounds land in time with what is on screen.
 Keys reach the game by their physical position, so Shift plus a number switches
@@ -226,6 +238,10 @@ arrives before the click that follows it, so a flick and a shot land in order.
 
 Known problems:
 
+- Sun shadows use the 1024-pixel shadow maps the Android build picks and look
+  blocky in the distance; no setting that raises them has been found yet.
+- Joining a server still stalls for about 2 s in all while the map loads,
+  most of it the engine's own work.
 - Voice chat is unimplemented. Game controllers are not supported yet: the old
   support read Linux-only joystick paths and never found a device on FreeBSD,
   so it was removed; native FreeBSD (evdev) support is still to be written.

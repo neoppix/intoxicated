@@ -2,7 +2,7 @@
 //!
 //! Two layers, lowest precedence first:
 //!
-//! 1. [`Source::BuiltIn`]: [`BUILT_IN`], one entry.
+//! 1. [`Source::BuiltIn`]: [`BUILT_IN`].
 //! 2. [`Source::User`]: the profile's `flags.json` (see [`crate::flag_file`]).
 //!
 //! A later layer replaces an earlier one's value for the same key, so the user
@@ -33,12 +33,38 @@ use std::path::{Path, PathBuf};
 /// The prefix of the keys that are this client's own settings.
 pub const CLIENT_PREFIX: &str = "Intoxicated";
 
-/// The built-in layer.
+/// The built-in layer. A user overrides any entry by setting the key in
+/// `flags.json`.
 ///
 /// `FFlagUserLaunchedWithBloxstrap` is not an engine flag; it is the marker
-/// desktop launchers set. INFERRED that experiences can read it. A user turns
-/// it off with `"FFlagUserLaunchedWithBloxstrap": "False"` in `flags.json`.
-pub const BUILT_IN: [(&str, &str); 1] = [("FFlagUserLaunchedWithBloxstrap", "True")];
+/// desktop launchers set. INFERRED that experiences can read it.
+///
+/// The other four undo what Roblox's server settings hand the Android client
+/// for phones (its "mem-savings" experiment), which is wrong for a desktop GPU.
+/// Measured in Frontlines on an RTX 4070 Ti, with each depth image the engine
+/// created logged from the Vulkan layer:
+///
+/// - `FFlagRenderShadowResolutionScaling` shrinks the shadow maps of local
+///   lights and resizes them as the view changes: with it on they were 114 to
+///   210 pixels square and one map scene created 191 of them in 35 s; off, a
+///   1042-pixel map appears and they are created a handful of times. It does
+///   not change the sun's two 1056-pixel cascades.
+/// - `FFlagVulkanAllocatorPoolSmallOnly`, `FIntVulkanAllocatorKeepEmptyPages`
+///   and `FFlagVulkanAllocatorEmptyPageBudget` make the engine's own Vulkan
+///   allocator pool only small allocations and free every page the moment it
+///   empties. Off and 32, the engine made 611 to 639 device allocations in the
+///   5 s after deploying instead of 881 to 2260, each a kernel call of about a
+///   millisecond on NVIDIA, for 170 to 550 MB more VRAM in game. Whether that
+///   shortens the stalls was not established: two pairs of runs gave 248 and
+///   365 ms of slow frames after deploying with it against 2660 and 372 ms
+///   without.
+pub const BUILT_IN: [(&str, &str); 5] = [
+    ("FFlagUserLaunchedWithBloxstrap", "True"),
+    ("FFlagRenderShadowResolutionScaling", "False"),
+    ("FFlagVulkanAllocatorPoolSmallOnly", "False"),
+    ("FIntVulkanAllocatorKeepEmptyPages", "32"),
+    ("FFlagVulkanAllocatorEmptyPageBudget", "False"),
+];
 
 /// Where a value came from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -198,7 +224,8 @@ mod tests {
         let layers = collect_from(&file);
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0].source, Source::BuiltIn);
-        assert_eq!(layers[0].values, vec![("FFlagUserLaunchedWithBloxstrap".into(), "True".into())]);
+        let built_in: Vec<(String, String)> = BUILT_IN.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        assert_eq!(layers[0].values, built_in);
 
         // The launcher's layout, exactly as it is on disk today.
         std::fs::write(
@@ -209,7 +236,15 @@ mod tests {
         let resolved = resolve(collect_from(&file));
         assert_eq!(resolved["DFIntTaskSchedulerTargetFps"].value, "9999");
         assert_eq!(resolved["DFIntTaskSchedulerTargetFps"].source, Source::User);
-        assert_eq!(resolved.len(), 3);
+        assert_eq!(resolved.len(), 2 + BUILT_IN.len());
+        assert_eq!(resolved["FFlagRenderShadowResolutionScaling"].value, "False");
+        assert_eq!(resolved["FFlagRenderShadowResolutionScaling"].source, Source::BuiltIn);
+
+        // A user's own value for a built-in key wins.
+        std::fs::write(&file, "{\"FFlagRenderShadowResolutionScaling\":\"True\"}").unwrap();
+        let resolved = resolve(collect_from(&file));
+        assert_eq!(resolved["FFlagRenderShadowResolutionScaling"].value, "True");
+        assert_eq!(resolved["FFlagRenderShadowResolutionScaling"].source, Source::User);
 
         // Edited between two reads: the second read sees the edit.
         std::fs::write(&file, "{\n  \"DFIntTaskSchedulerTargetFps\": 144,\n  \"FFlagX\": true\n}").unwrap();

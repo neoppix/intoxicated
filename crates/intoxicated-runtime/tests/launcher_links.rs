@@ -125,12 +125,13 @@ fn no_argument_is_no_link() {
 }
 
 /// A client that stopped because the user quit is not started again: 0 after
-/// a close or one Ctrl-C, 130 or 143 after a second SIGINT or SIGTERM, and
-/// 124 after a shutdown the watchdog cut off. Anything else is a failed start
-/// and is retried, four launches in all.
+/// a close or one Ctrl-C, 130 or 143 after a second SIGINT or SIGTERM, 124
+/// after a shutdown the watchdog cut off, and 3 when the profile is already
+/// open in another client. Anything else is a failed start and is retried,
+/// four launches in all.
 #[test]
 fn only_a_failed_start_is_relaunched() {
-    for status in [0, 124, 130, 143] {
+    for status in [0, 3, 124, 130, 143] {
         let r = run_exiting(&format!("exit-{status}"), None, status);
         assert_eq!(r.status, status, "{}", r.stderr);
         assert_eq!(r.launches, 1, "exit {status} was relaunched: {}", r.stderr);

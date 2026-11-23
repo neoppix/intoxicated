@@ -105,6 +105,23 @@ const WHOLE_SIZE: u64 = u64::MAX;
 const STAGING_CHUNK: u64 = 8 << 20;
 const STAGING_ALIGN: u64 = 16;
 
+/// Released chunks of [`STAGING_CHUNK`] are kept, still bound and mapped, for
+/// the next recording that needs one. On NVIDIA a new chunk costs about 6.5 ms
+/// to allocate, bind and map and a free up to a few ms, all on the render
+/// thread, and the engine begins each command buffer again every frame:
+/// freeing on release cost a spawn 1087 allocations and 777 frees in 5 s, over
+/// a second of it (measured with DTrace). Decoding expands ETC four to eight
+/// times, so a burst is large: one submit while a map loaded needed 303 MB.
+///
+/// Up to [`SPARE_MAX`] chunks (384 MB of host memory) are kept, so the next
+/// burst finds them; once a chunk has sat unused for [`SPARE_IDLE`], the
+/// spares shrink back to [`SPARE_KEEP`], one free per [`SPARE_TRIM_EVERY`] so
+/// that trimming never costs a frame more than one free.
+const SPARE_MAX: usize = 48;
+const SPARE_KEEP: usize = 8;
+const SPARE_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+const SPARE_TRIM_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
+
 // ------------------------------------------------------------------ switch
 
 /// The environment variable that turns this off or forces it on.
@@ -737,6 +754,11 @@ struct Emu {
     mapped: HashMap<u64, Mapping>,
     pool_of: HashMap<usize, u64>,
     recordings: HashMap<usize, Recording>,
+    /// Idle chunks for reuse, oldest first, each with when it went idle;
+    /// see [`SPARE_MAX`].
+    spare: Vec<(std::time::Instant, Chunk)>,
+    /// When a spare chunk was last freed by trimming.
+    trimmed: Option<std::time::Instant>,
 }
 
 static EMU: Mutex<Option<Emu>> = Mutex::new(None);
@@ -812,6 +834,8 @@ fn build_emu(pd: *mut c_void, device: *mut c_void) -> Option<Emu> {
         buffers: HashMap::new(),
         mapped: HashMap::new(),
         pool_of: HashMap::new(),
+        spare: Vec::new(),
+        trimmed: None,
         recordings: HashMap::new(),
     })
 }
@@ -820,17 +844,47 @@ impl Emu {
     fn release(&mut self, cmd: usize) {
         if let Some(r) = self.recordings.remove(&cmd) {
             LIVE_RECORDINGS.fetch_sub(1, Relaxed);
+            let now = std::time::Instant::now();
             for c in r.chunks {
-                (self.fns.destroy_buffer)(self.device, c.buffer, std::ptr::null());
-                (self.fns.free_memory)(self.device, c.memory, std::ptr::null());
+                if c.size == STAGING_CHUNK && self.spare.len() < SPARE_MAX {
+                    self.spare.push((now, c));
+                } else {
+                    self.destroy_chunk(c);
+                }
             }
         }
+        self.trim_spare();
+    }
+
+    /// Free the oldest spare chunk if the spares are above [`SPARE_KEEP`], it
+    /// has been idle for [`SPARE_IDLE`] and nothing was trimmed in the last
+    /// [`SPARE_TRIM_EVERY`].
+    fn trim_spare(&mut self) {
+        let Some(&(idle_since, _)) = self.spare.first() else { return };
+        let now = std::time::Instant::now();
+        if self.spare.len() <= SPARE_KEEP
+            || now.duration_since(idle_since) < SPARE_IDLE
+            || self.trimmed.is_some_and(|t| now.duration_since(t) < SPARE_TRIM_EVERY)
+        {
+            return;
+        }
+        let (_, c) = self.spare.remove(0);
+        self.destroy_chunk(c);
+        self.trimmed = Some(now);
+    }
+
+    fn destroy_chunk(&self, c: Chunk) {
+        (self.fns.destroy_buffer)(self.device, c.buffer, std::ptr::null());
+        (self.fns.free_memory)(self.device, c.memory, std::ptr::null());
     }
 
     fn release_all(&mut self) {
         let cmds: Vec<usize> = self.recordings.keys().copied().collect();
         for c in cmds {
             self.release(c);
+        }
+        for (_, c) in std::mem::take(&mut self.spare) {
+            self.destroy_chunk(c);
         }
         LIVE_IMAGES.fetch_sub(self.images.len(), Relaxed);
         self.images.clear();
@@ -851,6 +905,15 @@ impl Emu {
             if at + len <= c.size {
                 c.used = at + len;
                 return Ok((c.buffer, at, c.ptr + at as usize));
+            }
+        }
+        if len <= STAGING_CHUNK {
+            // The most recently idle, so the oldest age out.
+            if let Some((_, mut c)) = self.spare.pop() {
+                c.used = len;
+                let reused = (c.buffer, 0, c.ptr);
+                self.recording(cmd).chunks.push(c);
+                return Ok(reused);
             }
         }
         let (device, size) = (self.device, len.max(STAGING_CHUNK));
@@ -1213,10 +1276,10 @@ fn record_upload(
                 continue;
             }
         };
-        // Zero first, so a region whose source turns out unreadable at submit
-        // uploads black rather than whatever the staging last held.
-        // SAFETY: `dst` is `dst_len` bytes of this module's own mapping.
-        unsafe { std::ptr::write_bytes(dst as *mut u8, 0, plan.dst_len) };
+        // Not zeroed here: every upload is decoded at submit, and a region
+        // that cannot be is zeroed there (`decode_job`), so it uploads black
+        // rather than whatever reused staging last held. Zeroing every region
+        // first wrote each one twice on the render thread.
         e.recording(cmd as usize).uploads.push(Upload {
             memory,
             offset: bound_at + r.buffer_offset,
@@ -1476,6 +1539,7 @@ fn decode_job(job: &mut Job) {
     let src = match &job.src {
         Ok(p) => *p,
         Err(why) => {
+            blank(job);
             job.outcome = Some(Err(why.clone()));
             return;
         }
@@ -1495,10 +1559,22 @@ fn decode_job(job: &mut Job) {
     // holds, distinct from every other job's; its command buffer has not been
     // reset.
     let dst = unsafe { std::slice::from_raw_parts_mut(job.dst as *mut u8, job.plan.dst_len) };
-    job.outcome = Some(run_plan(&job.plan, &source, dst).map(|()| {
+    let outcome = run_plan(&job.plan, &source, dst).map(|()| {
         glcount::ETC_REGIONS.fetch_add(1, Relaxed);
         hash
-    }));
+    });
+    if outcome.is_err() {
+        blank(job);
+    }
+    job.outcome = Some(outcome);
+}
+
+/// Zero a region that could not be decoded, so it uploads black rather than
+/// what reused staging last held.
+fn blank(job: &Job) {
+    // SAFETY: as in `decode_job`: `dst` is `dst_len` bytes of staging this
+    // module mapped and still holds, distinct from every other job's.
+    unsafe { std::ptr::write_bytes(job.dst as *mut u8, 0, job.plan.dst_len) };
 }
 
 /// A fast 64-bit hash, only to notice a resubmitted command buffer whose
@@ -1840,6 +1916,119 @@ mod tests {
         assert!(!request_is_offered(IMAGE_TILING_OPTIMAL, 0x10, 0), "colour attachment");
         assert!(!request_is_offered(IMAGE_TILING_OPTIMAL, 0x4, IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE));
         assert_eq!(offered(0xFFFF_FFFF), [0, OFFERED_FEATURES, 0]);
+    }
+
+    // Stand-ins for the host calls staging makes, counting allocations and
+    // frees. Only `pool_*` tests use them.
+    static POOL_ALLOCS: AtomicUsize = AtomicUsize::new(0);
+    static POOL_FREES: AtomicUsize = AtomicUsize::new(0);
+    extern "C" fn pool_create(_: usize, _: *const c_void, _: *const c_void, out: *mut u64) -> i32 {
+        // SAFETY: the caller's out-pointer.
+        unsafe { *out = 1 };
+        VK_SUCCESS
+    }
+    extern "C" fn pool_destroy(_: usize, _: u64, _: *const c_void) {}
+    extern "C" fn pool_requirements(_: usize, _: u64, out: *mut [u64; 3]) {
+        // SAFETY: the caller's out-pointer. Size, alignment, any memory type.
+        unsafe { *out = [STAGING_CHUNK, 16, 1] };
+    }
+    extern "C" fn pool_allocate(_: usize, _: *const c_void, _: *const c_void, out: *mut u64) -> i32 {
+        let n = POOL_ALLOCS.fetch_add(1, Relaxed) as u64 + 1;
+        // SAFETY: the caller's out-pointer.
+        unsafe { *out = n };
+        VK_SUCCESS
+    }
+    extern "C" fn pool_free(_: usize, _: u64, _: *const c_void) {
+        POOL_FREES.fetch_add(1, Relaxed);
+    }
+    extern "C" fn pool_bind(_: usize, _: u64, _: u64, _: u64) -> i32 {
+        VK_SUCCESS
+    }
+    extern "C" fn pool_map(_: usize, _: u64, _: u64, _: u64, _: u32, out: *mut *mut c_void) -> i32 {
+        // SAFETY: the caller's out-pointer; staging never writes through it.
+        unsafe { *out = 0x1000 as *mut c_void };
+        VK_SUCCESS
+    }
+    extern "C" fn pool_unmap(_: usize, _: u64) {}
+    extern "C" fn pool_copy(_: usize, _: u64, _: u64, _: i32, _: u32, _: *const BufferImageCopy) {}
+
+    fn pool_emu() -> Emu {
+        Emu {
+            device: 0x7001,
+            fns: Fns {
+                create_buffer: pool_create,
+                destroy_buffer: pool_destroy,
+                buffer_requirements: pool_requirements,
+                allocate_memory: pool_allocate,
+                free_memory: pool_free,
+                bind_buffer_memory: pool_bind,
+                map_memory: pool_map,
+                unmap_memory: pool_unmap,
+                copy_buffer_to_image: pool_copy,
+            },
+            memory_types: vec![MEMORY_PROPERTY_HOST_VISIBLE | MEMORY_PROPERTY_HOST_COHERENT],
+            images: HashMap::new(),
+            buffers: HashMap::new(),
+            mapped: HashMap::new(),
+            pool_of: HashMap::new(),
+            recordings: HashMap::new(),
+            spare: Vec::new(),
+            trimmed: None,
+        }
+    }
+
+    /// Released chunks are reused instead of freed, up to [`SPARE_MAX`];
+    /// an oversized one is freed; idle spares shrink to [`SPARE_KEEP`] one
+    /// free per [`SPARE_TRIM_EVERY`]; destroying the device frees the rest.
+    #[test]
+    fn pool_reuses_released_staging_and_trims_it_when_idle() {
+        let mut e = pool_emu();
+        let (allocs, frees) = (|| POOL_ALLOCS.load(Relaxed), || POOL_FREES.load(Relaxed));
+        let mb = 1 << 20;
+
+        e.staging(1, mb).unwrap();
+        e.staging(1, mb).unwrap();
+        assert_eq!(allocs(), 1, "two regions share one chunk");
+        e.release(1);
+        assert_eq!((frees(), e.spare.len()), (0, 1), "released into the spares, not freed");
+        e.staging(2, mb).unwrap();
+        assert_eq!(allocs(), 1, "the spare is reused");
+        e.release(2);
+
+        e.staging(3, STAGING_CHUNK + 1).unwrap();
+        assert_eq!(allocs(), 2);
+        e.release(3);
+        assert_eq!((frees(), e.spare.len()), (1, 1), "an oversized chunk is not kept");
+
+        for cmd in 10..10 + SPARE_MAX + 2 {
+            e.staging(cmd, mb).unwrap();
+        }
+        let before = frees();
+        for cmd in 10..10 + SPARE_MAX + 2 {
+            e.release(cmd);
+        }
+        assert_eq!((e.spare.len(), frees() - before), (SPARE_MAX, 2), "kept up to the cap");
+
+        // Nothing is trimmed while the spares are fresh.
+        e.release(999);
+        assert_eq!(e.spare.len(), SPARE_MAX);
+        let old = std::time::Instant::now() - SPARE_IDLE - std::time::Duration::from_secs(1);
+        e.spare.iter_mut().for_each(|(t, _)| *t = old);
+        e.release(999);
+        e.release(999);
+        assert_eq!(e.spare.len(), SPARE_MAX - 1, "one free per trim interval");
+        while e.spare.len() > SPARE_KEEP {
+            e.trimmed = Some(old);
+            e.release(999);
+        }
+        e.trimmed = Some(old);
+        e.release(999);
+        assert_eq!(e.spare.len(), SPARE_KEEP, "never below the floor");
+
+        let before = frees();
+        e.release_all();
+        assert_eq!((e.spare.len(), frees() - before), (0, SPARE_KEEP));
+        assert_eq!(allocs() - frees(), 0, "everything allocated was freed");
     }
 
     #[test]

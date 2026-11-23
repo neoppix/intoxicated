@@ -180,9 +180,11 @@ while [ $i -lt 4 ]; do
   # window was closed. 130 and 143 are a second Ctrl-C (SIGINT) or SIGTERM
   # ending the client at once, or either signal killing it before it could
   # handle one. All three are the user leaving, not a boot failure, so they
-  # must not count as a hiccup and relaunch the game.
+  # must not count as a hiccup and relaunch the game. 3 is the profile already
+  # open in another client, which says so itself; trying again cannot help.
   case $rc in
     0) exit 0 ;;
+    3) exit 3 ;;
     124) echo "intoxicated: shutdown hung and was cut off" >&2; exit 124 ;;
     130|143) exit $rc ;;
   esac
