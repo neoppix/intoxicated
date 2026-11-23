@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Intoxicated Settings
+GenericName=Roblox Client Settings
+Comment=Flags, client options and profiles for Intoxicated
+Exec=intoxicated-settings
+Icon=intoxicated
+Terminal=false
+Categories=Game;Settings;
+StartupNotify=true

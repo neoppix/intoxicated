@@ -1,0 +1,299 @@
+// Intoxicated Settings: the window, its pages and the state they share.
+
+#pragma once
+
+#include "core.h"
+
+#include <QDialog>
+#include <QStyledItemDelegate>
+#include <QWidget>
+
+#include <memory>
+
+class QFrame;
+class QGroupBox;
+class QLabel;
+class QLineEdit;
+class QListWidget;
+class QPlainTextEdit;
+class QProcess;
+class QPushButton;
+class QStackedWidget;
+class QTableWidget;
+class QTemporaryDir;
+class QTimer;
+
+namespace intox {
+
+class Combo;
+class Switch;
+
+// What the pages share: the profile chosen in the bottom bar, the client's
+// built-in flags, and launching.
+class AppState : public QObject {
+    Q_OBJECT
+public:
+    explicit AppState(QObject *parent = nullptr);
+
+    const QString &profile() const { return m_profile; }
+    void setProfile(const QString &name);
+
+    // From `intoxicated --default-flags`, read once at start.
+    const FlagMap &defaults() const { return m_defaults; }
+    const QString &defaultsError() const { return m_defaultsError; }
+
+    // Start `intoxicated [LINK]` detached on the chosen profile.
+    bool launch(const QString &link);
+    // Whether an update runs (the window asks before closing then).
+    bool busy = false;
+
+signals:
+    void profileChanged(const QString &name);
+    // A profile was created or deleted, or the default one changed.
+    void profilesChanged();
+    // settings.conf changed under a page (reset, video memory).
+    void settingsChanged();
+    // A line for the bottom bar.
+    void status(const QString &message);
+
+private:
+    QString m_profile;
+    FlagMap m_defaults;
+    QString m_defaultsError;
+};
+
+// --- Pages -----------------------------------------------------------------
+
+class PlayPage : public QWidget {
+    Q_OBJECT
+public:
+    explicit PlayPage(AppState *state);
+    ~PlayPage() override;
+
+private:
+    void join();
+    void runUpdate(const QString &what, const QStringList &args, bool install);
+    void finished(int code, bool crashed);
+    void append(const QString &text);
+
+    AppState *m_state;
+    QLineEdit *m_link;
+    QPushButton *m_updateApk;
+    QPushButton *m_updateApp;
+    QPlainTextEdit *m_log;
+    QLabel *m_result;
+    QProcess *m_process = nullptr;
+    std::unique_ptr<QTemporaryDir> m_askpassDir;
+    QString m_running;
+};
+
+class FlagsPage : public QWidget {
+    Q_OBJECT
+public:
+    explicit FlagsPage(AppState *state);
+    void reload();
+
+protected:
+    void showEvent(QShowEvent *event) override;
+
+private:
+    bool edit(const std::function<void(FlagMap &)> &change);
+    void fillPresets();
+    void fillTable();
+    void fpsChosen(int index);
+    void videoMemoryChosen(int index);
+    void cellEdited(int row, int column);
+    void addFlag();
+    void importJson();
+    void exportJson();
+    void resetFlags();
+    void backUp();
+    // Why TEXT cannot go in ROW's COLUMN, or an empty string.
+    QString cellProblem(int row, int column, const QString &text) const;
+
+    AppState *m_state;
+    QLabel *m_subtitle;
+    QFrame *m_banner;
+    QLabel *m_bannerText;
+    QGroupBox *m_presets;
+    QGroupBox *m_custom;
+    Combo *m_fps;
+    Combo *m_videoMemory;
+    QList<Switch *> m_switches;
+    QList<QLabel *> m_switchDescs;
+    QLabel *m_defaultsNote;
+    QTableWidget *m_table;
+    QLabel *m_empty;
+    QLabel *m_tableError;
+    QPushButton *m_export;
+    QPushButton *m_reset;
+    FlagMap m_flags;
+    bool m_broken = false;
+    bool m_filling = false;
+
+    friend class FlagDelegate;
+};
+
+class ClientPage : public QWidget {
+    Q_OBJECT
+public:
+    explicit ClientPage(AppState *state);
+    void reload();
+
+protected:
+    void showEvent(QShowEvent *event) override;
+
+private:
+    void write(const QString &key, const std::optional<QString> &value);
+    void writeWheel();
+    void resolutionChosen(int index);
+    void reset();
+
+    AppState *m_state;
+    Switch *m_fullscreen;
+    Combo *m_monitor;
+    Combo *m_resolution;
+    Combo *m_scale;
+    Switch *m_cursor;
+    Combo *m_wheel;
+    Switch *m_invert;
+    Switch *m_noDragLock;
+    Combo *m_present;
+    Combo *m_renderer;
+    Combo *m_audio;
+    Switch *m_closeOnLeave;
+    bool m_filling = false;
+};
+
+class ProfilesPage : public QWidget {
+    Q_OBJECT
+public:
+    explicit ProfilesPage(AppState *state);
+    void reload();
+
+protected:
+    void showEvent(QShowEvent *event) override;
+    void hideEvent(QHideEvent *event) override;
+
+private:
+    QString selected() const;
+    void updateButtons();
+    void newProfile();
+    void setDefault();
+    void deleteSelected();
+
+    AppState *m_state;
+    QTableWidget *m_table;
+    QPushButton *m_new;
+    QPushButton *m_setDefault;
+    QPushButton *m_delete;
+    QTimer *m_poll;
+    QList<ProfileInfo> m_profiles;
+    QString m_default;
+};
+
+class ModsPage : public QWidget {
+    Q_OBJECT
+public:
+    ModsPage();
+};
+
+class AboutPage : public QWidget {
+    Q_OBJECT
+public:
+    AboutPage();
+
+protected:
+    void showEvent(QShowEvent *event) override;
+
+private:
+    QLabel *m_version;
+    QProcess *m_query = nullptr;
+};
+
+// --- Dialogs ---------------------------------------------------------------
+
+// One line of input checked as it is typed; OK only when it passes.
+class NameDialog : public QDialog {
+    Q_OBJECT
+public:
+    NameDialog(QWidget *parent, const QString &title, const QString &prompt, const QString &placeholder,
+               std::function<QString(const QString &)> problem);
+    QString text() const;
+
+private:
+    QLineEdit *m_edit;
+};
+
+class AddFlagDialog : public QDialog {
+    Q_OBJECT
+public:
+    AddFlagDialog(QWidget *parent, const FlagMap &current);
+    QString name() const;
+    QString value() const;
+
+private:
+    void check();
+
+    const FlagMap &m_current;
+    QLineEdit *m_name;
+    QLineEdit *m_value;
+    QLabel *m_problem;
+    QPushButton *m_ok;
+    QString m_normalised;
+};
+
+class ImportDialog : public QDialog {
+    Q_OBJECT
+public:
+    ImportDialog(QWidget *parent, const QString &file, const QList<ImportItem> &items);
+    QSet<QString> chosen() const;
+
+private:
+    QTableWidget *m_table;
+    const QList<ImportItem> &m_items;
+};
+
+// The inline editor of the custom flags table: says what is wrong while the
+// text is typed and refuses to store a value that does not fit.
+class FlagDelegate : public QStyledItemDelegate {
+    Q_OBJECT
+public:
+    FlagDelegate(FlagsPage *page, QLabel *problem);
+    QWidget *createEditor(QWidget *parent, const QStyleOptionViewItem &option, const QModelIndex &index) const override;
+    void setModelData(QWidget *editor, QAbstractItemModel *model, const QModelIndex &index) const override;
+
+private:
+    FlagsPage *m_page;
+    QLabel *m_problem;
+};
+
+// --- The window ------------------------------------------------------------
+
+class MainWindow : public QWidget {
+    Q_OBJECT
+public:
+    MainWindow(AppState *state, int startPage);
+    static QStringList pageNames();
+    QSize sizeHint() const override;
+
+protected:
+    void closeEvent(QCloseEvent *event) override;
+
+private:
+    QWidget *sidebar();
+    QWidget *bottomBar();
+    void fillProfiles();
+
+    AppState *m_state;
+    QListWidget *m_nav;
+    QStackedWidget *m_stack;
+    Combo *m_profiles;
+    QLabel *m_status;
+    QTimer *m_statusTimer;
+};
+
+// `intoxicated-settings --askpass PROMPT`, for sudo -A.
+int runAskpass(int argc, char **argv);
+
+} // namespace intox
