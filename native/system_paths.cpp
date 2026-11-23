@@ -1106,18 +1106,35 @@ static intoxicated::maps::Sources maps_sources() {
 /// This process's map in Linux's /proc/self/maps layout, built from FreeBSD's
 /// `kern.proc.vmmap`: `start-end perms offset major:minor inode`, then from
 /// column 73 the file's path, or `[stack]` for the stack that grows down.
+///
+/// The kernel walks the whole map, counting every mapping's resident pages, on
+/// each call, the size-only call included: about 72 ms per call for a client
+/// with 1 GB resident, and the engine reads its map every 45 s, which showed as
+/// a 158 ms frame each time (measured with DTrace). So there is one call, into
+/// a buffer sized from the previous read, and another only if that was too
+/// small. With `kern.proc_vmmap_skip_resident_count=1` the counting, which
+/// Linux's layout has no column for, is skipped altogether.
+static std::atomic<size_t> g_vmmap_bytes{512 * 1024};
+
 static std::string native_maps() {
     std::string out;
     int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_VMMAP, static_cast<int>(getpid())};
+    std::vector<char> buf;
     size_t len = 0;
-    if (sysctl(mib, 4, nullptr, &len, nullptr, 0) != 0 || len == 0) {
-        return out;
+    for (size_t cap = g_vmmap_bytes.load(std::memory_order_relaxed);; cap *= 2) {
+        if (cap > (64u << 20)) {
+            return out;
+        }
+        buf.resize(cap);
+        len = cap;
+        if (sysctl(mib, 4, buf.data(), &len, nullptr, 0) == 0) {
+            break;
+        }
+        if (errno != ENOMEM) {
+            return out;
+        }
     }
-    len += len / 3;  // the map can grow between the two calls
-    std::vector<char> buf(len);
-    if (sysctl(mib, 4, buf.data(), &len, nullptr, 0) != 0) {
-        return out;
-    }
+    g_vmmap_bytes.store(len + len / 2, std::memory_order_relaxed);
     out.reserve(len / 4);
     for (size_t off = 0; off + offsetof(struct kinfo_vmentry, kve_path) <= len;) {
         const auto* kve = reinterpret_cast<const struct kinfo_vmentry*>(buf.data() + off);
