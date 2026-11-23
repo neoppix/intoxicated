@@ -1,5 +1,5 @@
-//! The command line: the options, the usage text, the parse errors and
-//! `--check-join-url`.
+//! The command line: the options, the usage text, the parse errors,
+//! `--check-join-url` and `--print-default-flags`.
 //!
 //! Arguments are read left to right. A flag that takes a value consumes the
 //! next argument whatever it looks like, a repeated flag replaces the earlier
@@ -213,6 +213,22 @@ pub fn check_join_url() -> ExitCode {
     }
 }
 
+/// `--print-default-flags`: the built-in flag layer
+/// ([`intoxicated_runtime::flag_layers::BUILT_IN`]) as one JSON object, keys
+/// sorted, on stdout. Nothing else runs. The launcher's `--default-flags`
+/// and Intoxicated Settings read it, so the defaults are kept in one place.
+pub fn print_default_flags() -> ExitCode {
+    println!("{}", default_flags_json());
+    ExitCode::SUCCESS
+}
+
+/// The text [`print_default_flags`] prints, without its final newline.
+pub fn default_flags_json() -> String {
+    let layer: std::collections::BTreeMap<&str, &str> =
+        intoxicated_runtime::flag_layers::BUILT_IN.iter().copied().collect();
+    serde_json::to_string_pretty(&layer).expect("a map of strings always serialises")
+}
+
 /// The usage text, written to stderr by `--help` and after a parse error.
 ///
 /// One block per option, the flag and its placeholder padded to column 20
@@ -259,6 +275,10 @@ usage: intoxicated-run --lib-dir <dir> [options]
   --check-join-url  read one link from stdin, print the link --join-url would
                     hand the engine and exit 0, or explain on stderr and exit
                     2. Runs nothing else; the launcher uses it
+  --print-default-flags  print the flags the client sets itself (its
+                    built-in layer, which <profile>/flags.json overrides) as
+                    one JSON object, keys sorted, and exit 0. Runs nothing
+                    else; the launcher's --default-flags runs it
   --run <secs>      how long to let Roblox run after handover (default 15).
                     0 means no timer: run until the window is closed or the
                     process is sent SIGTERM/SIGINT. Closing the window ends the
@@ -500,6 +520,7 @@ mod tests {
         assert_eq!(error("--run 3"), "--lib-dir is required");
         assert_eq!(error("--bogus"), "unrecognised argument: --bogus");
         assert_eq!(error("--lib-dir x --check-join-url"), "unrecognised argument: --check-join-url");
+        assert_eq!(error("--lib-dir x --print-default-flags"), "unrecognised argument: --print-default-flags");
         for (flag, message) in [
             ("--lib-dir", "--lib-dir needs a value"),
             ("--library", "--library needs a value"),
@@ -583,6 +604,28 @@ mod tests {
     }
 
     #[test]
+    fn the_default_flags_are_the_built_in_layer_with_sorted_keys() {
+        let text = default_flags_json();
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let object = doc.as_object().expect("one JSON object");
+        let built_in = intoxicated_runtime::flag_layers::BUILT_IN;
+        assert_eq!(object.len(), built_in.len());
+        for (key, value) in built_in {
+            assert_eq!(object[key], serde_json::Value::String(value.to_string()), "{key}");
+        }
+        // Sorted in the text itself, not only once parsed.
+        let mut at = Vec::new();
+        for (key, _) in built_in {
+            at.push((text.find(&format!("\"{key}\"")).unwrap(), key));
+        }
+        at.sort();
+        let order: Vec<&str> = at.iter().map(|(_, k)| *k).collect();
+        let mut sorted: Vec<&str> = built_in.iter().map(|(k, _)| *k).collect();
+        sorted.sort();
+        assert_eq!(order, sorted);
+    }
+
+    #[test]
     fn the_exit_statuses() {
         assert_eq!(EXIT_USAGE, 2);
         assert_eq!(EXIT_PROFILE, 3);
@@ -637,6 +680,7 @@ mod tests {
             "--game-activity",
             "--join-url <url>",
             "--check-join-url",
+            "--print-default-flags",
             "--run <secs>",
             "--dump-classes <f>",
             "-v, --verbose",

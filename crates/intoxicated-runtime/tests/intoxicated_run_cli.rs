@@ -144,6 +144,35 @@ fn check_join_url_runs_nothing_else() {
 }
 
 #[test]
+fn print_default_flags_prints_the_built_in_layer_and_nothing_else() {
+    let root = scratch("default-flags");
+    let out = run(&root, &["--print-default-flags"], &[]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(!stdout.contains(BANNER_START), "no banner: {stdout}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON object");
+    let object = doc.as_object().expect("an object");
+    let built_in = intoxicated_runtime::flag_layers::BUILT_IN;
+    assert_eq!(object.len(), built_in.len(), "{stdout}");
+    for (key, value) in built_in {
+        assert_eq!(object[key].as_str(), Some(value), "{key}");
+    }
+    // Sorted in the text as printed (serde_json's map would sort them anyway).
+    let mut positions: Vec<(usize, &str)> =
+        built_in.iter().map(|(k, _)| (stdout.find(&format!("\"{k}\"")).unwrap(), *k)).collect();
+    positions.sort();
+    let printed: Vec<&str> = positions.iter().map(|(_, k)| *k).collect();
+    let mut sorted: Vec<&str> = built_in.iter().map(|(k, _)| *k).collect();
+    sorted.sort();
+    assert_eq!(printed, sorted);
+    assert!(!root.join("data/intoxicated").exists(), "no profile was touched");
+
+    let help = run(&root, &["--help"], &[]);
+    assert!(text(&help.stderr).contains("\n  --print-default-flags  "), "listed in --help");
+}
+
+#[test]
 fn a_busy_profile_is_refused_with_3() {
     let root = scratch("busy");
     let dir = profile_dir(&root, "default");

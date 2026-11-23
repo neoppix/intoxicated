@@ -4,7 +4,8 @@
 //!
 //! This file only sequences the steps; each lives in its module.
 //!
-//! 1. `--check-join-url` alone, if it is the first argument ([`cli`]).
+//! 1. `--check-join-url` or `--print-default-flags` alone, if it is the
+//!    first argument ([`cli`]).
 //! 2. The banner and the descriptor limit ([`startup`]).
 //! 3. The command line ([`cli`]): `--profile` is latched while it is read,
 //!    before anything can ask for the profile.
@@ -35,8 +36,10 @@ mod switches;
 mod teardown;
 
 fn main() -> ExitCode {
-    if std::env::args().nth(1).as_deref() == Some("--check-join-url") {
-        return cli::check_join_url();
+    match std::env::args().nth(1).as_deref() {
+        Some("--check-join-url") => return cli::check_join_url(),
+        Some("--print-default-flags") => return cli::print_default_flags(),
+        _ => {}
     }
     // First line of every run: which build this is, and its licence. The full
     // copyright and licence notices are in LICENSE and NOTICE.
