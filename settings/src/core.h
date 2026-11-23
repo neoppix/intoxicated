@@ -128,6 +128,25 @@ bool presetIsOn(const SwitchPreset &preset, const FlagMap &flags, const FlagMap 
 // it; turning off writes the opposite values (or removes the keys).
 void applyPreset(const SwitchPreset &preset, bool on, FlagMap &flags, const FlagMap &defaults);
 
+// --- Quality presets -------------------------------------------------------
+
+// A whole-profile graphics level. Only flags Roblox allows on its own Windows
+// client are used, so no preset gives an edge another player could not have.
+struct QualityPreset {
+    QString name;
+    QString description;
+    // Set by the preset; every other key in qualityPresetKeys() is removed.
+    QList<QPair<QString, QString>> flags;
+};
+
+QList<QualityPreset> qualityPresets();
+// Every key any quality preset sets.
+QStringList qualityPresetKeys();
+// The preset the profile's flags match exactly over qualityPresetKeys(), or -1
+// for a custom mix.
+int matchingQualityPreset(const FlagMap &flags);
+void applyQualityPreset(const QualityPreset &preset, FlagMap &flags);
+
 inline const QString kFpsFlag = QStringLiteral("DFIntTaskSchedulerTargetFps");
 inline const QString kVideoMemoryFlag = QStringLiteral("FIntRenderForceVideoMemorySize");
 inline const QString kFpsSetting = QStringLiteral("INTOXICATED_FPS");

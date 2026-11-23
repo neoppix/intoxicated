@@ -263,6 +263,36 @@ FlagsPage::FlagsPage(AppState *state) : m_state(state) {
     b->addWidget(m_banner);
     m_banner->hide();
 
+    // Quality: whole-profile presets, one at a time.
+    Section quality = section(QStringLiteral("Quality"));
+    auto *qv = new QVBoxLayout(quality.body);
+    qv->setContentsMargins(12, 10, 12, 10);
+    qv->setSpacing(8);
+    auto *row = new QHBoxLayout;
+    row->setSpacing(6);
+    const QList<QualityPreset> qualities = qualityPresets();
+    for (int i = 0; i < qualities.size(); ++i) {
+        auto *btn = new QPushButton(qualities[i].name);
+        btn->setObjectName(QStringLiteral("segment"));
+        btn->setCheckable(true);
+        btn->setCursor(Qt::PointingHandCursor);
+        btn->setMinimumHeight(34);
+        row->addWidget(btn, 1);
+        m_qualityButtons.append(btn);
+        connect(btn, &QPushButton::clicked, this, [this, i] {
+            const QualityPreset preset = qualityPresets().at(i);
+            edit([&](FlagMap &flags) { applyQualityPreset(preset, flags); });
+        });
+    }
+    qv->addLayout(row);
+    m_qualityDesc = new QLabel;
+    m_qualityDesc->setObjectName(QStringLiteral("note"));
+    m_qualityDesc->setWordWrap(true);
+    qv->addWidget(m_qualityDesc);
+    m_quality = quality.box;
+    b->addWidget(quality.box);
+    b->addSpacing(8);
+
     // Presets.
     Section presets = section(QStringLiteral("Presets"));
     m_presets = presets.box;
@@ -388,6 +418,7 @@ void FlagsPage::reload() {
     }
     m_banner->setVisible(m_broken);
     m_presets->setEnabled(!m_broken);
+    m_quality->setEnabled(!m_broken);
     m_custom->setEnabled(!m_broken);
     setProblem(m_tableError, QString());
     fillPresets();
@@ -434,6 +465,14 @@ void FlagsPage::fillPresets() {
     }
     m_videoMemory->addItem(QStringLiteral("Custom..."), QStringLiteral("custom"));
     m_videoMemory->setCurrentIndex(at);
+
+    const int quality = matchingQualityPreset(m_flags);
+    const QList<QualityPreset> qualities = qualityPresets();
+    for (int i = 0; i < m_qualityButtons.size(); ++i)
+        m_qualityButtons[i]->setChecked(i == quality);
+    m_qualityDesc->setText(quality >= 0 ? qualities[quality].description
+                                        : QStringLiteral("Custom: this profile's flags match none of the presets. "
+                                                         "Picking one replaces the graphics flags it covers."));
 
     const QList<SwitchPreset> presets = switchPresets();
     for (int i = 0; i < presets.size(); ++i) {

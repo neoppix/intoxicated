@@ -231,6 +231,19 @@ QPushButton#play {
 QPushButton#play:hover { background: #F03A40; }
 QPushButton#play:pressed { background: #A5071A; }
 
+QPushButton#segment {
+    background: #232329;
+    color: #d6d6dc;
+    border: 1px solid #2f2f37;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-weight: 600;
+}
+QPushButton#segment:hover { background: #2b2b32; border-color: #3a3a43; }
+QPushButton#segment:checked { background: #E91F26; border-color: #E91F26; color: #ffffff; }
+QPushButton#segment:checked:hover { background: #F03A40; border-color: #F03A40; }
+QPushButton#segment:disabled { background: #1d1d22; color: #63636b; }
+
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical { background: #3a3a43; border-radius: 3px; min-height: 30px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }

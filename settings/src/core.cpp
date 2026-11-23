@@ -410,6 +410,74 @@ void applyPreset(const SwitchPreset &preset, bool on, FlagMap &flags, const Flag
     }
 }
 
+QList<QualityPreset> qualityPresets() {
+    const auto kv = [](const char *k, const char *v) {
+        return QPair<QString, QString>(QString::fromLatin1(k), QString::fromLatin1(v));
+    };
+    return {
+        {QStringLiteral("Lowest"),
+         QStringLiteral("Graphics quality 1, no anti-aliasing, grey sky, no grass, frozen lighting updates and the "
+                        "simplest meshes at every distance. For the weakest machines."),
+         {kv("DFIntDebugFRMQualityLevelOverride", "1"), kv("FIntDebugForceMSAASamples", "1"),
+          kv("FFlagDebugSkyGray", "True"), kv("DFFlagDebugPauseVoxelizer", "True"),
+          kv("FIntFRMMinGrassDistance", "0"), kv("FIntFRMMaxGrassDistance", "0"),
+          kv("DFIntCSGLevelOfDetailSwitchingDistance", "0"), kv("DFIntCSGLevelOfDetailSwitchingDistanceL12", "0"),
+          kv("DFIntCSGLevelOfDetailSwitchingDistanceL23", "0"), kv("DFIntCSGLevelOfDetailSwitchingDistanceL34", "0")}},
+        {QStringLiteral("Low"),
+         QStringLiteral("Graphics quality 5, no anti-aliasing and no grass, for machines that struggle at Default."),
+         {kv("DFIntDebugFRMQualityLevelOverride", "5"), kv("FIntDebugForceMSAASamples", "1"),
+          kv("FIntFRMMinGrassDistance", "0"), kv("FIntFRMMaxGrassDistance", "0")}},
+        {QStringLiteral("Default"),
+         QStringLiteral("Roblox's own settings and the in-game graphics slider, with Intoxicated's desktop fixes."),
+         {}},
+        {QStringLiteral("High"),
+         QStringLiteral("Graphics quality 21, the highest, with 4x anti-aliasing."),
+         {kv("DFIntDebugFRMQualityLevelOverride", "21"), kv("FIntDebugForceMSAASamples", "4")}},
+        {QStringLiteral("Competitive"),
+         QStringLiteral("Mid graphics (quality 9) so the scene stays easy to read, with no anti-aliasing and no "
+                        "grass for frame rate and a clear line of sight."),
+         {kv("DFIntDebugFRMQualityLevelOverride", "9"), kv("FIntDebugForceMSAASamples", "1"),
+          kv("FIntFRMMinGrassDistance", "0"), kv("FIntFRMMaxGrassDistance", "0")}},
+    };
+}
+
+QStringList qualityPresetKeys() {
+    QStringList keys;
+    for (const QualityPreset &p : qualityPresets())
+        for (const auto &entry : p.flags)
+            if (!keys.contains(entry.first))
+                keys.append(entry.first);
+    return keys;
+}
+
+int matchingQualityPreset(const FlagMap &flags) {
+    const QStringList keys = qualityPresetKeys();
+    const QList<QualityPreset> presets = qualityPresets();
+    for (int i = 0; i < presets.size(); ++i) {
+        FlagMap want;
+        for (const auto &[k, v] : presets[i].flags)
+            want.insert(k, v);
+        bool same = true;
+        for (const QString &k : keys) {
+            if (want.contains(k) != flags.contains(k) ||
+                (want.contains(k) && !sameFlagValue(k, want.value(k), flags.value(k)))) {
+                same = false;
+                break;
+            }
+        }
+        if (same)
+            return i;
+    }
+    return -1;
+}
+
+void applyQualityPreset(const QualityPreset &preset, FlagMap &flags) {
+    for (const QString &k : qualityPresetKeys())
+        flags.remove(k);
+    for (const auto &[k, v] : preset.flags)
+        flags.insert(k, v);
+}
+
 QString effectiveFps(const FlagMap &flags, const FlagMap &defaults, const SettingsConf &conf) {
     if (const auto v = effectiveFlag(flags, defaults, kFpsFlag))
         return *v;

@@ -327,6 +327,42 @@ void testPresets() {
     same(effectiveVideoMemory({}, defaults, conf), QString(), "off is Roblox's default");
 }
 
+void testQualityPresets() {
+    const QList<QualityPreset> presets = qualityPresets();
+    QStringList names;
+    for (const QualityPreset &p : presets)
+        names.append(p.name);
+    same(names, QStringList({"Lowest", "Low", "Default", "High", "Competitive"}), "the five presets, in order");
+
+    FlagMap flags{{"FFlagSomethingElse", "True"}};
+    same(matchingQualityPreset(flags), 2, "no graphics flags is Default");
+    applyQualityPreset(presets[0], flags);
+    same(matchingQualityPreset(flags), 0, "Lowest applied reads as Lowest");
+    same(flags.value("FFlagDebugSkyGray"), QString("True"), "Lowest greys the sky");
+    same(flags.value("FFlagSomethingElse"), QString("True"), "an unrelated flag is kept");
+
+    applyQualityPreset(presets[3], flags);
+    same(matchingQualityPreset(flags), 3, "High applied over Lowest reads as High");
+    check(!flags.contains("FFlagDebugSkyGray") && !flags.contains("FIntFRMMaxGrassDistance"),
+          "keys Lowest set and High does not are removed");
+    same(flags.value("DFIntDebugFRMQualityLevelOverride"), QString("21"), "High is quality 21");
+
+    flags.insert("DFIntDebugFRMQualityLevelOverride", "20");
+    same(matchingQualityPreset(flags), -1, "an edited level is a custom mix");
+    flags.insert("DFIntDebugFRMQualityLevelOverride", "021");
+    same(matchingQualityPreset(flags), 3, "021 and 21 are the same value to the client");
+
+    applyQualityPreset(presets[2], flags);
+    same(flags, FlagMap({{"FFlagSomethingElse", "True"}}), "Default removes every graphics flag and nothing else");
+
+    for (const QualityPreset &p : presets)
+        for (const auto &[k, v] : p.flags) {
+            QString normalised;
+            check(checkFlagName(k).isEmpty() && checkFlagValue(k, v, &normalised).isEmpty(),
+                  p.name + " writes a valid " + k);
+        }
+}
+
 void testVideoMemoryDefault() {
     QString error;
     writeAll(settingsConfPath(), "# mine\nINTOXICATED_FULLSCREEN=1\n");
@@ -439,6 +475,7 @@ int runSelfTest() {
     testFlagsFiles();
     testImport();
     testPresets();
+    testQualityPresets();
     testVideoMemoryDefault();
     testProfiles();
     testSndstat();

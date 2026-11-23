@@ -116,9 +116,12 @@ private:
     QFrame *m_banner;
     QLabel *m_bannerText;
     QGroupBox *m_presets;
+    QGroupBox *m_quality = nullptr;
     QGroupBox *m_custom;
     Combo *m_fps;
     Combo *m_videoMemory;
+    QList<QPushButton *> m_qualityButtons;
+    QLabel *m_qualityDesc = nullptr;
     QList<Switch *> m_switches;
     QList<QLabel *> m_switchDescs;
     QLabel *m_defaultsNote;
