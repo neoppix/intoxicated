@@ -10,6 +10,8 @@
 #   intoxicated 'https://www.roblox.com/games/189707/...'
 #                                    # a roblox.com game page link
 #   intoxicated --update-apk         # re-download the Roblox build, then exit
+#   intoxicated --update             # update Intoxicated: install.sh from the
+#                                    # checkout pulls, builds and reinstalls
 # Where the checkout lives; INTOXICATED_REPO overrides it.
 REPO="${INTOXICATED_REPO:-$HOME/intoxicated}"
 BIN="$REPO/target/release/intoxicated-run"
@@ -132,6 +134,7 @@ JOIN=""
 if [ -n "$1" ]; then
   case "$1" in
     --update-apk) fetch_apk; exit $? ;;
+    --update) INTOXICATED_REPO="$REPO" exec /bin/sh "$REPO/install.sh" ;;
   esac
   if [ ! -x "$BIN" ]; then
     echo "intoxicated: $BIN is not built; run cargo build --release in $REPO" >&2

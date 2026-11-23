@@ -55,12 +55,27 @@ Linux-compat filesystem mount to set up. Verified with `ktrace` over a full
 session (sign-in, join, deploy, play): **0** of 52,352 path lookups were under
 `/compat/linux`.
 
+**Quick install.** Paste this into a terminal, as your own user:
+
+```sh
+fetch -qo - https://raw.githubusercontent.com/neoppix/intoxicated/freebsd-port/install.sh | sh
+```
+
+It checks what the system is missing (packages, the GPU driver and its kernel
+module), lists the commands that need root and asks before running them, with
+the password going to sudo, doas or su. Then it clones the checkout to
+`~/intoxicated` (`INTOXICATED_REPO` picks another place), builds it, installs
+the launcher and the desktop entry, offers to open roblox.com's Play button in
+Intoxicated, and fetches the Roblox build. Running it again, or
+`intoxicated --update`, updates an install. It does what the steps below do,
+which stay here for anyone who would rather do them by hand.
+
 **1. Prerequisites** (as root):
 
 ```sh
 # Build tools, native X11, native Vulkan loader, epoll for the engine's event
 # loop, and jq (the launcher edits flags.json)
-pkg install git rust cmake pkgconf libepoll-shim libX11 libXi libXinerama vulkan-loader jq
+pkg install git rust cmake pkgconf libepoll-shim libX11 libXi libXinerama libXrandr libxkbcommon vulkan-loader jq
 
 # Audio needs no packages: the client writes to OSS (/dev/dsp) directly, and
 # sound(4) is part of base. It plays to /dev/dsp, which follows
@@ -99,10 +114,12 @@ intoxicated <placeId>    # straight into a game
 intoxicated '<link>'     # a roblox:// link, roblox.com's Play link, or a
                          # https://www.roblox.com/games/<id> page link
 intoxicated --update-apk # fetch the newest Roblox build, then exit
+intoxicated --update     # update Intoxicated itself (pull, build, reinstall)
 ```
 
-To update Intoxicated itself, pull and rebuild, then install the launcher
-again as in step 3:
+To update Intoxicated itself, run `intoxicated --update` (the installer, from
+the checkout), or by hand pull and rebuild, then install the launcher again as
+in step 3:
 
 ```sh
 cd ~/intoxicated
@@ -111,8 +128,9 @@ cargo build --release    # the client and the APK fetcher
 ```
 
 The git history was restarted on 2026-11-23, so a clone made before then
-cannot pull. Move it aside and clone again; the profile and the downloaded
-Roblox build live outside the checkout and are kept.
+cannot pull. The installer notices, offers to move it aside and clones again;
+by hand, do the same. The profile and the downloaded Roblox build live outside
+the checkout and are kept.
 
 **5. Optional: open roblox.com's Play button in Intoxicated** (the browser asks
 for a handler for `roblox-player` links):
@@ -120,6 +138,7 @@ for a handler for `roblox-player` links):
 ```sh
 # as root
 install -m 644 packaging/freebsd/intoxicated.desktop /usr/local/share/applications/
+install -m 644 packaging/branding/intoxicated-logo.png /usr/local/share/pixmaps/intoxicated.png
 update-desktop-database /usr/local/share/applications
 # as your user
 xdg-mime default intoxicated.desktop x-scheme-handler/roblox-player x-scheme-handler/roblox
