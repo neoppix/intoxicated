@@ -32,17 +32,27 @@
 //! * ETC2/EAC, on a GPU whose driver lacks it: a fixed set of format, image
 //!   and upload calls, answered by `vulkan_etc` and nowhere else.
 //! * Four device-level calls for the screenshot ([`capture_hook`]).
+//! * Only when `INTOXICATED_TRACE_PASSES` or dev control is on: render
+//!   passes, framebuffers, the commands that begin and end a pass, draws,
+//!   copies, image barriers and `vkQueueSubmit` ([`passes`]), and images and
+//!   views through `vulkan_etc`'s own hooks, which then serve every device.
+//!   For the frame trace and devctl's `depthshot`; each records what was
+//!   created, and costs a recording command one relaxed load while nothing
+//!   is watching.
 //!
-//! Nothing else is touched: `vkQueueSubmit` and command recording go straight
-//! to the driver (ETC decodes at submit through its own hook), and this layer
-//! creates no semaphores, fences or command buffers of its own.
+//! Nothing else is touched: without those switches `vkQueueSubmit` and
+//! command recording go straight to the driver (ETC decodes at submit through
+//! its own hook). Vulkan objects of our own are made only for a devctl
+//! capture that was asked for (`frame_capture`, `depth_capture`).
 //!
 //! Every slot below is process-wide and last write wins. The engine builds
 //! three RenderViews per session, each with its own instance, device, surface
 //! and swapchain, one at a time on its render thread; the loader's entry
 //! points are the same for all of them.
 
+pub(super) mod passes;
 mod present_mode;
+pub(super) mod registry;
 
 use std::ffi::{c_char, c_int, c_ulong, c_void, CStr};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
@@ -345,10 +355,13 @@ extern "C" fn vk_get_instance_proc_addr(instance: *mut c_void, name: *const c_ch
         // `vulkan_etc` answers a fixed set of names itself. It declines on any
         // instance whose GPUs all have the feature, so there this arm is the
         // plain forward it always was.
+        //
+        // The render pass and frame hooks of [`passes`] go in front of
+        // whichever of the two that is, when they are wanted at all.
         _ => {
             // SAFETY: the host getter, called with the engine's own arguments.
             let p = unsafe { (h.get_instance_proc_addr)(instance, name) };
-            super::vulkan_etc::instance_hook(instance, bytes, p).unwrap_or(p)
+            passes::hook(bytes, super::vulkan_etc::instance_hook(instance, bytes, p).unwrap_or(p))
         }
     }
 }
@@ -408,7 +421,7 @@ extern "C" fn vk_get_device_proc_addr(device: *mut c_void, name: *const c_char) 
         }
         bytes => {
             let p = host(device, name);
-            super::vulkan_etc::device_hook(device, bytes, p).unwrap_or(p)
+            passes::hook(bytes, super::vulkan_etc::device_hook(device, bytes, p).unwrap_or(p))
         }
     }
 }
@@ -463,6 +476,8 @@ fn capture_hook(name: &[u8], next: *mut c_void) -> *mut c_void {
 
 extern "C" fn vk_destroy_device(device: *mut c_void, allocator: *const c_void) {
     super::frame_capture::device_destroying(device);
+    super::depth_capture::device_destroying(device);
+    passes::device_destroying(device);
     let f = NEXT_DESTROY_DEVICE.load(std::sync::atomic::Ordering::Relaxed);
     if f != 0 {
         // SAFETY: the host's (or `vulkan_etc`'s) `vkDestroyDevice`.
@@ -1243,8 +1258,9 @@ fn is_first_or_power_of_ten(n: u64) -> bool {
 /// `vkQueuePresentKHR`: counted and paced once per engine call, the
 /// screenshot if one is armed, and any result other than success reported.
 extern "C" fn vk_queue_present_khr(queue: *mut c_void, info: *const c_void) -> i32 {
-    super::glcount::QUEUE_PRESENT.fetch_add(1, Relaxed);
+    let presents = super::glcount::QUEUE_PRESENT.fetch_add(1, Relaxed) + 1;
     super::present_stats::record();
+    passes::on_present(presents);
     let f = HOST_QUEUE_PRESENT.load(Relaxed);
     if f == 0 {
         // Not reachable: this hook is handed out only once the host's entry
@@ -1312,6 +1328,19 @@ fn report_present_result(rc: i32) {
 /// `frame_capture::request` for the bounds and what each thread does.
 pub fn request_capture(path: &str) -> Result<String, String> {
     super::frame_capture::request(path)
+}
+
+/// devctl `passes`: the next frame's render passes to stderr, and its
+/// summary line back. See [`passes`].
+pub fn request_pass_trace() -> Result<String, String> {
+    passes::request_trace()
+}
+
+/// devctl `depthshot <path>`: the scene depth of the next frame that has the
+/// expected shape, as a grayscale PNG, and the colour of the same frame
+/// beside it. See `depth_capture`.
+pub fn request_depth_capture(path: &str) -> Result<String, String> {
+    super::depth_capture::request(path)
 }
 
 /// The extent of the most recently created swapchain, for callers reporting

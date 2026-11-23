@@ -1,0 +1,40 @@
+// The depth capture's read of the scene depth: every texel of a depth image
+// (sample 0 of a multisampled one, which is what a SAMPLE_ZERO resolve
+// keeps), written to a buffer as one float per pixel, row by row.
+//
+// Built with the system's glslc (shaderc) into the two files beside it,
+// each the numbers glslc prints wrapped in `&[` and `]`:
+//
+//     glslc -O --target-env=vulkan1.0 -mfmt=num resolve.comp -o -
+//         -> resolve_ms.spv.rs
+//     glslc -O --target-env=vulkan1.0 -mfmt=num -DSINGLE_SAMPLE resolve.comp -o -
+//         -> resolve_1x.spv.rs
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#ifdef SINGLE_SAMPLE
+layout(binding = 0) uniform sampler2D depth_tex;
+#else
+layout(binding = 0) uniform sampler2DMS depth_tex;
+#endif
+
+layout(std430, binding = 1) writeonly buffer Out {
+    float depth[];
+} out_buf;
+
+layout(push_constant) uniform Size {
+    uint width;
+    uint height;
+} size;
+
+void main() {
+    uvec2 xy = gl_GlobalInvocationID.xy;
+    if (xy.x >= size.width || xy.y >= size.height) {
+        return;
+    }
+    // The last argument is the mip level of a single-sample image and the
+    // sample index of a multisampled one: 0 either way.
+    out_buf.depth[xy.y * size.width + xy.x] = texelFetch(depth_tex, ivec2(xy), 0).r;
+}

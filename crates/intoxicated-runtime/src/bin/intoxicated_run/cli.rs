@@ -398,6 +398,18 @@ env:
                                      fail the first n present-mode queries with
                                      VK_ERROR_UNKNOWN and retry them on any GPU,
                                      to watch the NVIDIA retry work. Test only
+  INTOXICATED_TRACE_PASSES=<n>       write one frame's render passes to stderr
+                                     ([passes] lines): attachments, subpasses,
+                                     draw counts, copies, barriers, submits.
+                                     1 traces the frame after present 600, a
+                                     larger number the frame after that
+                                     present. With INTOXICATED_DEV_CONTROL the
+                                     pass hooks are there too, for devctl's
+                                     passes (trace the next frame) and
+                                     depthshot <path> (the scene depth as a
+                                     grayscale PNG, with a screenshot of the
+                                     same frame and the raw floats beside it);
+                                     without either they are not installed
   INTOXICATED_FILES_DIR=<dir>        the engine's data root (default
                                      <profile>/data): its files/ and cache/
   INTOXICATED_EARLY_DIRS=<keys>      directory setters sent before

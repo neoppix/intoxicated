@@ -270,6 +270,7 @@ slots!(
     CREATE_IMAGE,
     DESTROY_IMAGE,
     CREATE_IMAGE_VIEW,
+    DESTROY_IMAGE_VIEW,
     DEVICE_IMAGE_REQS,
     DEVICE_IMAGE_SPARSE_REQS,
     COPY_BUFFER_TO_IMAGE,
@@ -302,9 +303,14 @@ enum Level {
     Device,
 }
 
-/// Which hook answers `name`, if any.
-fn lookup(name: &[u8]) -> Option<(&'static Slot, *const (), Level)> {
+/// Which hook answers `name`, if any, and whether it also keeps the
+/// registry of images and views that render pass tracing reads (see
+/// [`hand_out`]).
+fn lookup(name: &[u8]) -> Option<(&'static Slot, *const (), Level, bool)> {
     use Level::*;
+    if let Some((slot, f)) = image_lookup(name) {
+        return Some((slot, f, Device, true));
+    }
     Some(match name {
         b"vkGetPhysicalDeviceFeatures" => (&FEATURES, get_features as *const (), Physical),
         b"vkGetPhysicalDeviceFeatures2" | b"vkGetPhysicalDeviceFeatures2KHR" => {
@@ -320,9 +326,6 @@ fn lookup(name: &[u8]) -> Option<(&'static Slot, *const (), Level)> {
         b"vkGetPhysicalDeviceImageFormatProperties2" | b"vkGetPhysicalDeviceImageFormatProperties2KHR" => {
             (&IMAGE_FORMAT_PROPS2, get_image_format_props2 as *const (), Physical)
         }
-        b"vkCreateImage" => (&CREATE_IMAGE, create_image as *const (), Device),
-        b"vkDestroyImage" => (&DESTROY_IMAGE, destroy_image as *const (), Device),
-        b"vkCreateImageView" => (&CREATE_IMAGE_VIEW, create_image_view as *const (), Device),
         b"vkGetDeviceImageMemoryRequirements" | b"vkGetDeviceImageMemoryRequirementsKHR" => {
             (&DEVICE_IMAGE_REQS, device_image_reqs as *const (), Device)
         }
@@ -355,6 +358,28 @@ fn lookup(name: &[u8]) -> Option<(&'static Slot, *const (), Level)> {
         b"vkDestroyDevice" => (&DESTROY_DEVICE, destroy_device as *const (), Device),
         _ => return None,
     })
+    .map(|(slot, f, level)| (slot, f, level, false))
+}
+
+/// The four hooks that also keep the image and view registry.
+fn image_lookup(name: &[u8]) -> Option<(&'static Slot, *const ())> {
+    Some(match name {
+        b"vkCreateImage" => (&CREATE_IMAGE, create_image as *const ()),
+        b"vkDestroyImage" => (&DESTROY_IMAGE, destroy_image as *const ()),
+        b"vkCreateImageView" => (&CREATE_IMAGE_VIEW, create_image_view as *const ()),
+        b"vkDestroyImageView" => (&DESTROY_IMAGE_VIEW, destroy_image_view as *const ()),
+        _ => return None,
+    })
+}
+
+/// Whether a hook from [`lookup`] is handed out: on an instance or device
+/// that emulates ETC2, as always, and, for the four image and view hooks,
+/// also wherever the render pass registry is wanted
+/// (`vk_layer::passes::wanted`). Those four are the single hook for their
+/// command either way: on a device that does not emulate, each forwards to
+/// the driver and records what was created, and nothing else.
+fn hand_out(emulating: bool, feeds_registry: bool, registry_wanted: bool) -> bool {
+    emulating || (feeds_registry && registry_wanted)
 }
 
 // -------------------------------------------------------------- the gate
@@ -461,8 +486,8 @@ pub(super) fn instance_hook(instance: *mut c_void, name: &[u8], host: *mut c_voi
     if host.is_null() {
         return None;
     }
-    let (slot, ours, _) = lookup(name)?;
-    if !instance_may_emulate(instance) {
+    let (slot, ours, _, feeds_registry) = lookup(name)?;
+    if !hand_out(instance_may_emulate(instance), feeds_registry, super::vk_layer::passes::wanted()) {
         return None;
     }
     slot.set(host);
@@ -470,13 +495,16 @@ pub(super) fn instance_hook(instance: *mut c_void, name: &[u8], host: *mut c_voi
 }
 
 /// From `vkGetDeviceProcAddr`'s fall-through. A device that is not emulating
-/// gets the driver's own function and never passes through this file.
+/// gets the driver's own function and never passes through this file, except
+/// for the image and view hooks when the registry is wanted ([`hand_out`]).
 pub(super) fn device_hook(device: *mut c_void, name: &[u8], host: *mut c_void) -> Option<*mut c_void> {
-    if host.is_null() || !device_is_emulating(device) {
+    if host.is_null() {
         return None;
     }
-    let (slot, ours, level) = lookup(name)?;
-    if level != Level::Device {
+    let (slot, ours, level, feeds_registry) = lookup(name)?;
+    if level != Level::Device
+        || !hand_out(device_is_emulating(device), feeds_registry, super::vk_layer::passes::wanted())
+    {
         return None;
     }
     slot.set(host);
@@ -999,6 +1027,9 @@ extern "C" fn destroy_device(device: *mut c_void, alloc: *const c_void) {
 
 type CreateFn = extern "C" fn(*mut c_void, *const c_void, *const c_void, *mut u64) -> i32;
 
+/// `vkCreateImage`: an ETC image is created in its substitute format on an
+/// emulating device, and every image that was created is described in the
+/// render pass registry when that is wanted.
 extern "C" fn create_image(
     device: *mut c_void,
     info: *const c_void,
@@ -1006,9 +1037,20 @@ extern "C" fn create_image(
     out: *mut u64,
 ) -> i32 {
     let Some(f) = CREATE_IMAGE.get::<CreateFn>() else { return VK_ERROR_INITIALIZATION_FAILED };
-    if info.is_null() || !device_is_emulating(device) {
-        return f(device, info, alloc, out);
+    let rc = if info.is_null() || !device_is_emulating(device) {
+        f(device, info, alloc, out)
+    } else {
+        create_emulated_image(f, device, info, alloc, out)
+    };
+    if rc == VK_SUCCESS && !out.is_null() {
+        // SAFETY: success means the driver wrote the handle. The engine's
+        // own create info is what is described, ETC format and all.
+        super::vk_layer::passes::image_created(device, info, unsafe { *out });
     }
+    rc
+}
+
+fn create_emulated_image(f: CreateFn, device: *mut c_void, info: *const c_void, alloc: *const c_void, out: *mut u64) -> i32 {
     // SAFETY: `info` is the caller's 88-byte `VkImageCreateInfo`.
     let mut copy: [u64; 11] = unsafe { get(info, 0) };
     let p = copy.as_mut_ptr() as *mut c_void;
@@ -1059,6 +1101,7 @@ extern "C" fn create_image(
 }
 
 extern "C" fn destroy_image(device: *mut c_void, image: u64, alloc: *const c_void) {
+    super::vk_layer::passes::image_destroyed(image);
     if LIVE_IMAGES.load(Relaxed) != 0 && device_is_emulating(device) {
         if let Some(e) = emu().as_mut() {
             if e.images.remove(&image).is_some() {
@@ -1078,6 +1121,8 @@ fn emulated_image(image: u64) -> Option<Image> {
     emu().as_ref()?.images.get(&image).copied()
 }
 
+/// `vkCreateImageView`: a view of an ETC image takes its substitute format,
+/// and every view is described in the registry when that is wanted.
 extern "C" fn create_image_view(
     device: *mut c_void,
     info: *const c_void,
@@ -1085,9 +1130,26 @@ extern "C" fn create_image_view(
     out: *mut u64,
 ) -> i32 {
     let Some(f) = CREATE_IMAGE_VIEW.get::<CreateFn>() else { return VK_ERROR_INITIALIZATION_FAILED };
-    if info.is_null() || !device_is_emulating(device) {
-        return f(device, info, alloc, out);
+    let rc = if info.is_null() || !device_is_emulating(device) {
+        f(device, info, alloc, out)
+    } else {
+        create_emulated_view(f, device, info, alloc, out)
+    };
+    if rc == VK_SUCCESS && !out.is_null() {
+        // SAFETY: success means the driver wrote the handle.
+        super::vk_layer::passes::view_created(device, info, unsafe { *out });
     }
+    rc
+}
+
+extern "C" fn destroy_image_view(device: *mut c_void, view: u64, alloc: *const c_void) {
+    super::vk_layer::passes::view_destroyed(view);
+    if let Some(f) = DESTROY_IMAGE_VIEW.get::<extern "C" fn(*mut c_void, u64, *const c_void)>() {
+        f(device, view, alloc);
+    }
+}
+
+fn create_emulated_view(f: CreateFn, device: *mut c_void, info: *const c_void, alloc: *const c_void, out: *mut u64) -> i32 {
     // SAFETY: `info` is the caller's 80-byte `VkImageViewCreateInfo`: image
     // at 24, format at 36.
     let (image, format): (u64, u32) = unsafe { (get(info, 24), get(info, 36)) };
@@ -2477,5 +2539,25 @@ mod tests {
         assert!(device_hook(emulating, b"vkGetPhysicalDeviceFeatures", host).is_none(), "not a device call");
         assert!(device_hook(emulating, b"vkCmdDraw", host).is_none());
         EMULATING_DEVICE.store(0, Relaxed);
+    }
+
+    /// The image and view hooks are the one hook for their command: handed
+    /// out on an emulating device as before, and on any other device too
+    /// when the render pass registry wants them, where they only forward and
+    /// record. The ETC-only hooks never reach a device that does not emulate.
+    #[test]
+    fn the_image_hooks_serve_the_registry_on_any_device() {
+        assert!(hand_out(true, false, false));
+        assert!(hand_out(true, true, false));
+        assert!(hand_out(false, true, true));
+        assert!(!hand_out(false, true, false));
+        assert!(!hand_out(false, false, true), "an ETC-only hook stays off a native device");
+        for name in [&b"vkCreateImage"[..], b"vkDestroyImage", b"vkCreateImageView", b"vkDestroyImageView"] {
+            let (_, _, level, feeds) = lookup(name).unwrap();
+            assert!(level == Level::Device && feeds, "{}", String::from_utf8_lossy(name));
+        }
+        for name in [&b"vkCmdCopyBufferToImage"[..], b"vkQueueSubmit", b"vkGetPhysicalDeviceFeatures"] {
+            assert!(!lookup(name).unwrap().3, "{}", String::from_utf8_lossy(name));
+        }
     }
 }

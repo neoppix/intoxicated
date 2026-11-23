@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub mod assets;
 pub mod clipboard;
 pub mod config;
+pub mod depth_capture;
 pub mod etc2;
 pub mod frame_capture;
 pub mod gl_probe;

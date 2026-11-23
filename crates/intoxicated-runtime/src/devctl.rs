@@ -16,6 +16,9 @@
 //! - State (`info`, `textbox`, `natives`, `loopers`, `pointerlock`, `latency`)
 //!   is read and answered on the socket thread.
 //! - `screenshot <path>` asks the Vulkan layer for the next frame.
+//!   `depthshot <path>` asks for the next frame's scene depth as a grayscale
+//!   PNG, with a screenshot of the same frame beside it, and `passes` writes
+//!   the next frame's render passes to stderr.
 //! - `bussub`, `buslast` and `deeplink` reach the engine's message bus through
 //!   `deeplink::dev_request`, which blocks this thread for at most 5 s.
 //!
@@ -354,6 +357,20 @@ fn reply(line: &str) -> String {
             },
             None => "err screenshot <path>".into(),
         },
+        // The next frame's render passes, to stderr. See `vk_layer::passes`.
+        "passes" => match crate::android::vk_layer::request_pass_trace() {
+            Ok(summary) => format!("ok {summary}"),
+            Err(reason) => format!("err {reason}"),
+        },
+        // The scene depth of the next frame, beside its colour. See
+        // `android::depth_capture`.
+        "depthshot" => match it.next() {
+            Some(path) => match crate::android::vk_layer::request_depth_capture(path) {
+                Ok(description) => format!("ok {description}"),
+                Err(reason) => format!("err {reason}"),
+            },
+            None => "err depthshot <path>".into(),
+        },
         other => format!("err unknown verb {other:?}"),
     }
 }
@@ -575,6 +592,7 @@ mod tests {
             ("scroll 1 2", "err scroll <x> <y> <detents>", vec![]),
             ("scroll 1 2 -3", "ok", vec![Cmd::Scroll { x: 1.0, y: 2.0, detents: -3.0 }]),
             ("screenshot", "err screenshot <path>", vec![]),
+            ("depthshot", "err depthshot <path>", vec![]),
             ("fakeenginelock maybe", "err fakeenginelock <true|false|clear>", vec![]),
             ("natives", "err natives <java/class/Name>", vec![]),
             ("frobnicate", "err unknown verb \"frobnicate\"", vec![]),

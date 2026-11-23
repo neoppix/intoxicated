@@ -48,9 +48,17 @@
 //! and nothing reports that without the swapchain maintenance extension, so
 //! each capture's semaphore is retired and kept until the device is
 //! destroyed: one small object per screenshot.
+//!
+//! # A screenshot of another capture's frame
+//!
+//! `depth_capture` wants the colour of the frame whose depth it reads.
+//! [`request_gated`] arms a screenshot that presents step over until its gate
+//! is opened (from inside the submit the depth is read after, so the next
+//! present is that frame's), or fail at once if it is cancelled. The Vulkan
+//! structures and helpers `depth_capture` shares are `pub(super)` here.
 
 use std::ffi::{c_void, CStr};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -117,47 +125,47 @@ struct PresentInfo {
 }
 
 #[repr(C)]
-struct SubmitInfo {
-    s_type: i32,
-    p_next: *const c_void,
-    wait_semaphore_count: u32,
-    p_wait_semaphores: *const u64,
-    p_wait_dst_stage_mask: *const u32,
-    command_buffer_count: u32,
-    p_command_buffers: *const *mut c_void,
-    signal_semaphore_count: u32,
-    p_signal_semaphores: *const u64,
+pub(super) struct SubmitInfo {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) wait_semaphore_count: u32,
+    pub(super) p_wait_semaphores: *const u64,
+    pub(super) p_wait_dst_stage_mask: *const u32,
+    pub(super) command_buffer_count: u32,
+    pub(super) p_command_buffers: *const *mut c_void,
+    pub(super) signal_semaphore_count: u32,
+    pub(super) p_signal_semaphores: *const u64,
 }
 
 #[repr(C)]
-struct ImageSubresourceRange {
-    aspect_mask: u32,
-    base_mip_level: u32,
-    level_count: u32,
-    base_array_layer: u32,
-    layer_count: u32,
+pub(super) struct ImageSubresourceRange {
+    pub(super) aspect_mask: u32,
+    pub(super) base_mip_level: u32,
+    pub(super) level_count: u32,
+    pub(super) base_array_layer: u32,
+    pub(super) layer_count: u32,
 }
 
 #[repr(C)]
-struct ImageMemoryBarrier {
-    s_type: i32,
-    p_next: *const c_void,
-    src_access_mask: u32,
-    dst_access_mask: u32,
-    old_layout: i32,
-    new_layout: i32,
-    src_queue_family_index: u32,
-    dst_queue_family_index: u32,
-    image: u64,
-    subresource_range: ImageSubresourceRange,
+pub(super) struct ImageMemoryBarrier {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) src_access_mask: u32,
+    pub(super) dst_access_mask: u32,
+    pub(super) old_layout: i32,
+    pub(super) new_layout: i32,
+    pub(super) src_queue_family_index: u32,
+    pub(super) dst_queue_family_index: u32,
+    pub(super) image: u64,
+    pub(super) subresource_range: ImageSubresourceRange,
 }
 
 #[repr(C)]
-struct MemoryBarrier {
-    s_type: i32,
-    p_next: *const c_void,
-    src_access_mask: u32,
-    dst_access_mask: u32,
+pub(super) struct MemoryBarrier {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) src_access_mask: u32,
+    pub(super) dst_access_mask: u32,
 }
 
 #[repr(C)]
@@ -179,85 +187,85 @@ struct BufferImageCopy {
 }
 
 #[repr(C)]
-struct BufferCreateInfo {
-    s_type: i32,
-    p_next: *const c_void,
-    flags: u32,
-    size: u64,
-    usage: u32,
-    sharing_mode: i32,
-    queue_family_index_count: u32,
-    p_queue_family_indices: *const u32,
+pub(super) struct BufferCreateInfo {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) flags: u32,
+    pub(super) size: u64,
+    pub(super) usage: u32,
+    pub(super) sharing_mode: i32,
+    pub(super) queue_family_index_count: u32,
+    pub(super) p_queue_family_indices: *const u32,
 }
 
 #[repr(C)]
-struct MemoryAllocateInfo {
-    s_type: i32,
-    p_next: *const c_void,
-    allocation_size: u64,
-    memory_type_index: u32,
+pub(super) struct MemoryAllocateInfo {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) allocation_size: u64,
+    pub(super) memory_type_index: u32,
 }
 
 #[repr(C)]
 #[derive(Default)]
-struct MemoryRequirements {
-    size: u64,
-    alignment: u64,
-    memory_type_bits: u32,
+pub(super) struct MemoryRequirements {
+    pub(super) size: u64,
+    pub(super) alignment: u64,
+    pub(super) memory_type_bits: u32,
 }
 
 #[repr(C)]
-struct MappedMemoryRange {
-    s_type: i32,
-    p_next: *const c_void,
-    memory: u64,
-    offset: u64,
-    size: u64,
+pub(super) struct MappedMemoryRange {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) memory: u64,
+    pub(super) offset: u64,
+    pub(super) size: u64,
 }
 
 #[repr(C)]
-struct CommandPoolCreateInfo {
-    s_type: i32,
-    p_next: *const c_void,
-    flags: u32,
-    queue_family_index: u32,
+pub(super) struct CommandPoolCreateInfo {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) flags: u32,
+    pub(super) queue_family_index: u32,
 }
 
 #[repr(C)]
-struct CommandBufferAllocateInfo {
-    s_type: i32,
-    p_next: *const c_void,
-    command_pool: u64,
-    level: i32,
-    command_buffer_count: u32,
+pub(super) struct CommandBufferAllocateInfo {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) command_pool: u64,
+    pub(super) level: i32,
+    pub(super) command_buffer_count: u32,
 }
 
 #[repr(C)]
-struct CommandBufferBeginInfo {
-    s_type: i32,
-    p_next: *const c_void,
-    flags: u32,
-    p_inheritance_info: *const c_void,
+pub(super) struct CommandBufferBeginInfo {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) flags: u32,
+    pub(super) p_inheritance_info: *const c_void,
 }
 
 /// `VkFenceCreateInfo` and `VkSemaphoreCreateInfo`, which share a layout.
 #[repr(C)]
-struct PlainCreateInfo {
-    s_type: i32,
-    p_next: *const c_void,
-    flags: u32,
+pub(super) struct PlainCreateInfo {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) flags: u32,
 }
 
 /// `VkPhysicalDeviceMemoryProperties`: 32 (flags, heap) pairs, then the heaps.
 #[repr(C)]
-struct PhysicalDeviceMemoryProperties {
-    memory_type_count: u32,
-    memory_types: [[u32; 2]; 32],
-    memory_heap_count: u32,
-    memory_heaps: [[u64; 2]; 16],
+pub(super) struct PhysicalDeviceMemoryProperties {
+    pub(super) memory_type_count: u32,
+    pub(super) memory_types: [[u32; 2]; 32],
+    pub(super) memory_heap_count: u32,
+    pub(super) memory_heaps: [[u64; 2]; 16],
 }
 
-type Dev = *mut c_void;
+pub(super) type Dev = *mut c_void;
 
 /// The device-level commands a capture uses, resolved once per device
 /// through the host's `vkGetDeviceProcAddr`. Called directly, so a capture
@@ -302,7 +310,7 @@ struct DeviceFns {
 }
 
 /// One device-level command from the host, or the error naming it.
-fn device_fn<F: Copy>(device: Dev, name: &CStr) -> Result<F, String> {
+pub(super) fn device_fn<F: Copy>(device: Dev, name: &CStr) -> Result<F, String> {
     assert_eq!(std::mem::size_of::<F>(), std::mem::size_of::<*mut c_void>());
     let p = super::vk_layer::host_device_proc(device, name);
     if p.is_null() {
@@ -500,7 +508,17 @@ struct Armed {
     /// Set by the devctl thread when it stops waiting, so a late result does
     /// not write a file after the harness was told the capture failed.
     given_up: Arc<AtomicBool>,
+    /// For a screenshot that belongs to another capture's frame (the depth
+    /// capture's): no present takes it while this reads [`GATE_WAIT`].
+    gate: Option<Arc<AtomicU8>>,
 }
+
+/// A gated screenshot waits for its frame.
+pub(super) const GATE_WAIT: u8 = 0;
+/// The next present takes it.
+pub(super) const GATE_OPEN: u8 = 1;
+/// The next present hands it back as failed: its frame will not come.
+pub(super) const GATE_CANCELLED: u8 = 2;
 
 /// What the devctl thread waiting on a request hears.
 enum Event {
@@ -610,6 +628,9 @@ pub(super) fn queue_obtained(device: *mut c_void, family: u32, queue: *mut c_voi
 pub(super) fn swapchain_created(device: *mut c_void, swapchain: u64, width: u32, height: u32, format: i32) {
     LAST_EXTENT.store(((width as u64) << 32) | height as u64, Relaxed);
     let images = swapchain_images(device, swapchain);
+    if let Ok(list) = &images {
+        super::vk_layer::passes::swapchain_images(device, swapchain, list, width, height, format);
+    }
     let mut list = lock(&SWAPCHAINS);
     list.retain(|s| s.handle != swapchain);
     list.push(Swapchain {
@@ -664,6 +685,7 @@ pub(super) fn swapchain_destroying(device: *mut c_void, swapchain: u64) {
         }
     }
     lock(&SWAPCHAINS).retain(|s| s.handle != swapchain);
+    super::vk_layer::passes::swapchain_destroyed(swapchain);
 }
 
 /// Before `vkDestroyDevice` is forwarded: every object a capture owns goes
@@ -730,6 +752,23 @@ pub(super) fn device_destroying(device: *mut c_void) {
     PRESENT_FAMILY.store(u32::MAX, Relaxed);
 }
 
+/// The device the engine renders with and its physical device, for the
+/// depth capture, which works on the same one.
+pub(super) fn current_device() -> Option<(usize, usize)> {
+    lock(&CTX).as_ref().map(|c| (c.device, c.physical))
+}
+
+/// The family `queue` was fetched from, when the engine fetched it through
+/// the hooks.
+pub(super) fn queue_family(queue: usize) -> Option<u32> {
+    family_of(queue)
+}
+
+/// The family the engine's frames most likely go to.
+pub(super) fn likely_queue_family() -> Option<u32> {
+    lock(&CTX).as_ref().map(likely_family)
+}
+
 /// The extent of the most recently created swapchain, `(0, 0)` before the
 /// first.
 pub fn extent() -> (u32, u32) {
@@ -753,6 +792,10 @@ pub(super) fn present(queue: *mut c_void, info: *const c_void, forward: impl FnO
     let Some(armed) = take_armed() else {
         return forward(info);
     };
+    if armed.gate.as_ref().is_some_and(|g| g.load(Relaxed) == GATE_CANCELLED) {
+        give_back(armed, Why::Failed("the frame this screenshot belonged to was not captured".into()));
+        return forward(info);
+    }
     if info.is_null() {
         give_back(armed, Why::Failed("the present carried no VkPresentInfoKHR".into()));
         return forward(info);
@@ -795,6 +838,10 @@ fn take_armed() -> Option<Armed> {
         Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => return None,
     };
+    if slot.as_ref().is_some_and(|a| a.gate.as_ref().is_some_and(|g| g.load(Relaxed) == GATE_WAIT)) {
+        // Armed for a later frame; this present goes through untouched.
+        return None;
+    }
     let armed = slot.take();
     ARMED.store(false, Relaxed);
     armed
@@ -1011,7 +1058,7 @@ fn ensure_worker() -> Result<(), String> {
 /// Wait for the copy, encode, write, tear down, answer.
 fn finish(job: InFlight) {
     let InFlight { armed, target, render_thread } = job;
-    let Armed { id, path, prep, reply, given_up } = armed;
+    let Armed { id, path, prep, reply, given_up, .. } = armed;
     let fns = prep.fns.clone();
     let waited = Instant::now();
     let rc = (fns.wait_for_fences)(fns.dev(), 1, &prep.fence, 1, FENCE_WAIT_NS);
@@ -1095,20 +1142,28 @@ fn read_and_encode(prep: &Prepared, t: &Target) -> Result<Vec<u8>, String> {
 /// Ask for the next presented frame to be written to `path`, and wait for
 /// it. `Ok` carries `<path> <w>x<h>`, sent only once the file is written.
 pub fn request(path: &str) -> Result<String, String> {
-    let r = run_request(path);
+    request_gated(path, None, || {})
+}
+
+/// [`request`], taken only by a present after `gate` has been opened, and
+/// failed by the first present after it was cancelled. `armed` runs once
+/// the request is armed, so the caller can then let the frame come.
+pub(super) fn request_gated(path: &str, gate: Option<Arc<AtomicU8>>, armed: impl FnOnce()) -> Result<String, String> {
+    let r = run_request(path, gate, armed);
     if let Err(e) = &r {
         println!("[android] vulkan: capture failed: {e}");
     }
     r
 }
 
-fn run_request(path: &str) -> Result<String, String> {
+fn run_request(path: &str, gate: Option<Arc<AtomicU8>>, armed: impl FnOnce()) -> Result<String, String> {
     let deadline = Instant::now() + PRESENT_WAIT;
     let id = NEXT_ID.fetch_add(1, Relaxed);
     let (tx, rx) = mpsc::channel::<Event>();
     let given_up = Arc::new(AtomicBool::new(false));
     ensure_worker()?;
-    arm(id, path, &tx, &given_up, None)?;
+    arm(id, path, &tx, &given_up, &gate, None)?;
+    armed();
     let mut retries = 0;
     loop {
         let wait = deadline.saturating_duration_since(Instant::now());
@@ -1128,7 +1183,7 @@ fn run_request(path: &str) -> Result<String, String> {
                             return Err(NO_FRAME.into());
                         }
                         println!("[android] vulkan: capture prepared again: {reason}");
-                        arm(id, path, &tx, &given_up, Some((width, height, family)))?;
+                        arm(id, path, &tx, &given_up, &gate, Some((width, height, family)))?;
                     }
                 }
             }
@@ -1182,6 +1237,7 @@ fn arm(
     path: &str,
     reply: &Sender<Event>,
     given_up: &Arc<AtomicBool>,
+    gate: &Option<Arc<AtomicU8>>,
     hint: Option<(u32, u32, u32)>,
 ) -> Result<(), String> {
     let mut guard = lock(&CTX);
@@ -1199,7 +1255,14 @@ fn arm(
     };
     let resolved = ctx.resolved.insert(resolved);
     let prep = prepare(resolved, width as u64 * height as u64 * 4, family)?;
-    let armed = Armed { id, path: path.to_string(), prep, reply: reply.clone(), given_up: given_up.clone() };
+    let armed = Armed {
+        id,
+        path: path.to_string(),
+        prep,
+        reply: reply.clone(),
+        given_up: given_up.clone(),
+        gate: gate.clone(),
+    };
     let mut slot = lock(&SLOT);
     // One request at a time: an untaken one is replaced, since the newer
     // frame is the one wanted.
@@ -1357,10 +1420,10 @@ fn prepare(r: &Resolved, bytes: u64, family: u32) -> Result<Prepared, String> {
 // ------------------------------------------------------------ pure parts
 
 #[derive(Debug, PartialEq, Eq)]
-struct MemoryChoice {
-    index: u32,
-    cached: bool,
-    coherent: bool,
+pub(super) struct MemoryChoice {
+    pub index: u32,
+    pub cached: bool,
+    pub coherent: bool,
 }
 
 /// The memory type for the readback buffer, from the device's types (flags
@@ -1368,7 +1431,7 @@ struct MemoryChoice {
 ///
 /// Host-cached first, coherent if such a type exists; otherwise the first
 /// host-visible coherent type, which the worker copies out of in one pass.
-fn readback_memory_type(types: &[u32], allowed: u32) -> Result<MemoryChoice, String> {
+pub(super) fn readback_memory_type(types: &[u32], allowed: u32) -> Result<MemoryChoice, String> {
     let first = |want: u32| {
         (0..types.len().min(32)).find(|&i| allowed & (1 << i) != 0 && types[i] & want == want).map(|i| i as u32)
     };
@@ -1409,15 +1472,56 @@ const STORED_BLOCK: usize = 65_535;
 /// against an earlier one byte for byte.
 pub fn encode_png(pixels: &[u8], width: u32, height: u32, format: i32) -> Result<Vec<u8>, String> {
     let [r, g, b] = channel_order(format)?;
-    if width == 0 || height == 0 {
-        return Err(format!("a {width}x{height} image has no pixels"));
-    }
-    let (w, h) = (width as usize, height as usize);
-    let need = w.checked_mul(h).and_then(|n| n.checked_mul(4)).ok_or("the image is too large")?;
+    let need = pixel_bytes(width, height, 4)?;
     if pixels.len() < need {
         return Err(format!("{} bytes of pixels for a {width}x{height} image", pixels.len()));
     }
-    let row_len = 3 * w + 1;
+    let w = width as usize;
+    encode_rows(width, height, 2, 3, pixels[..need].chunks_exact(4 * w).map(|src| {
+        move |row: &mut [u8]| {
+            for (dst, px) in row.chunks_exact_mut(3).zip(src.chunks_exact(4)) {
+                dst[0] = px[r];
+                dst[1] = px[g];
+                dst[2] = px[b];
+            }
+        }
+    }))
+}
+
+/// One byte per pixel, row after row, to an 8-bit greyscale PNG laid out
+/// the way [`encode_png`] lays out colour: filter None, stored blocks.
+pub(super) fn encode_gray_png(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let need = pixel_bytes(width, height, 1)?;
+    if pixels.len() < need {
+        return Err(format!("{} bytes of pixels for a {width}x{height} image", pixels.len()));
+    }
+    let w = width as usize;
+    encode_rows(width, height, 0, 1, pixels[..need].chunks_exact(w).map(|src| move |row: &mut [u8]| row.copy_from_slice(src)))
+}
+
+/// `width * height * bytes`, or why there is no such image.
+fn pixel_bytes(width: u32, height: u32, bytes: usize) -> Result<usize, String> {
+    if width == 0 || height == 0 {
+        return Err(format!("a {width}x{height} image has no pixels"));
+    }
+    (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|n| n.checked_mul(bytes))
+        .ok_or_else(|| "the image is too large".to_string())
+}
+
+/// The PNG itself: signature, IHDR (8-bit samples of `colour_type`,
+/// `channels` per pixel), one IDAT of stored deflate blocks, IEND. Each item
+/// of `rows` fills one row's pixels; the filter byte before them stays 0.
+fn encode_rows<F: FnOnce(&mut [u8])>(
+    width: u32,
+    height: u32,
+    colour_type: u8,
+    channels: usize,
+    rows: impl Iterator<Item = F>,
+) -> Result<Vec<u8>, String> {
+    let (w, h) = (width as usize, height as usize);
+    let row_len = channels * w + 1;
     let raw = row_len * h;
     let blocks = raw.div_ceil(STORED_BLOCK);
     let idat_len = 2 + raw + 5 * blocks + 4;
@@ -1431,7 +1535,7 @@ pub fn encode_png(pixels: &[u8], width: u32, height: u32, format: i32) -> Result
     ihdr[0..4].copy_from_slice(&width.to_be_bytes());
     ihdr[4..8].copy_from_slice(&height.to_be_bytes());
     ihdr[8] = 8; // bit depth
-    ihdr[9] = 2; // colour type: truecolour
+    ihdr[9] = colour_type; // 2 truecolour, 0 greyscale
     chunk(&mut out, b"IHDR", &ihdr);
 
     out.extend_from_slice(&(idat_len as u32).to_be_bytes());
@@ -1442,13 +1546,9 @@ pub fn encode_png(pixels: &[u8], width: u32, height: u32, format: i32) -> Result
     let mut stored = Stored { left_total: raw, left_in_block: 0 };
     let mut adler = Adler32::default();
     let mut row = vec![0u8; row_len];
-    for src in pixels[..need].chunks_exact(4 * w) {
+    for fill in rows {
         // row[0] stays 0: filter type None.
-        for (dst, px) in row[1..].chunks_exact_mut(3).zip(src.chunks_exact(4)) {
-            dst[0] = px[r];
-            dst[1] = px[g];
-            dst[2] = px[b];
-        }
+        fill(&mut row[1..]);
         adler.update(&row);
         stored.push(&mut out, &row);
     }
@@ -1617,6 +1717,26 @@ mod tests {
         let png = encode_png(&vec![0; 1667 * 1349 * 4], 1667, 1349, 44).unwrap();
         assert_eq!(hex(&png[8..33]), "0000000d49484452000006830000054508020000005cc3277c");
         assert_eq!(png.len(), 6_748_276);
+    }
+
+    #[test]
+    fn a_greyscale_png_has_its_header_and_inflates_to_its_rows() {
+        // More than one stored block's worth of rows.
+        let (w, h) = (300u32, 230u32);
+        let pixels: Vec<u8> = (0..w * h).map(|i| (i % 253) as u8).collect();
+        let png = encode_gray_png(&pixels, w, h).unwrap();
+        assert_eq!(&png[12..16], b"IHDR");
+        assert_eq!((png[24], png[25]), (8, 0), "8-bit greyscale");
+        let raw = (w as usize + 1) * h as usize;
+        assert_eq!(png.len(), 63 + raw + 5 * raw.div_ceil(65_535));
+        let idat_len = u32::from_be_bytes(png[33..37].try_into().unwrap()) as usize;
+        let data = miniz_oxide::inflate::decompress_to_vec_zlib(&png[41..41 + idat_len]).unwrap();
+        for (y, row) in data.chunks_exact(w as usize + 1).enumerate() {
+            assert_eq!(row[0], 0, "filter byte of row {y}");
+            assert_eq!(&row[1..], &pixels[y * w as usize..][..w as usize], "row {y}");
+        }
+        assert!(encode_gray_png(&pixels[..10], w, h).is_err(), "short pixel data");
+        assert!(encode_gray_png(&[], 0, 1).is_err(), "empty image");
     }
 
     #[test]
