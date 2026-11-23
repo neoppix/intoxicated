@@ -12,6 +12,44 @@
 #   intoxicated --update-apk         # re-download the Roblox build, then exit
 #   intoxicated --update             # update Intoxicated: install.sh from the
 #                                    # checkout pulls, builds and reinstalls
+#   intoxicated --default-flags      # print the client's built-in flags as JSON
+#   intoxicated --version            # print the client's version line
+#
+# INTOXICATED_PROFILE=<name> picks the profile (default: default).
+
+# Client options from settings.conf (Intoxicated Settings writes it; it can be
+# edited by hand). Each line KEY=VALUE whose KEY is INTOXICATED_ followed by
+# capitals, digits and _ is exported, the value taken literally; everything
+# else is ignored. The file is read, never sourced, so nothing in it runs. A
+# variable already set in the environment wins; within the file the last line
+# for a key wins.
+SETTINGS_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/intoxicated/settings.conf"
+if [ -f "$SETTINGS_CONF" ] && [ -r "$SETTINGS_CONF" ]; then
+  from_conf=" "
+  while IFS= read -r line || [ -n "$line" ]; do
+    case $line in
+      INTOXICATED_*=*) ;;
+      *) continue ;;
+    esac
+    key=${line%%=*}
+    case $key in
+      *[!ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_]*) continue ;;
+      # Set and cleared by the launcher itself between its own two runs.
+      INTOXICATED_LINK_REWRITTEN) continue ;;
+    esac
+    case $from_conf in
+      *" $key "*) ;;
+      *)
+        # Only a validated name reaches eval; the value never does.
+        eval "[ -n \"\${$key+set}\" ]" && continue
+        from_conf="$from_conf$key "
+        ;;
+    esac
+    export "$key=${line#*=}"
+  done < "$SETTINGS_CONF"
+  unset from_conf line key
+fi
+
 # Where the checkout lives; INTOXICATED_REPO overrides it.
 REPO="${INTOXICATED_REPO:-$HOME/intoxicated}"
 BIN="$REPO/target/release/intoxicated-run"
@@ -82,8 +120,10 @@ fetch_apk() {
 # launch, but only when its key is absent, so a value chosen by hand is left
 # alone and a new or reset profile gets them too. intoxicated-run sends the
 # document again after each of the engine's own settings reloads (every two
-# minutes), so the reloader cannot revert them mid-session.
-FLAGS_FILE="${INTOXICATED_FLAGS:-$DATADIR/profiles/default/flags.json}"
+# minutes), so the reloader cannot revert them mid-session. The profile is
+# checked before anything uses it (see below).
+PROFILE="${INTOXICATED_PROFILE:-default}"
+FLAGS_FILE="${INTOXICATED_FLAGS:-$DATADIR/profiles/$PROFILE/flags.json}"
 
 # ensure_flag NAME VALUE WHAT
 ensure_flag() {
@@ -130,16 +170,37 @@ join_link() {
   printf '%s\n' "$link" | "$BIN" --check-join-url
 }
 
-JOIN=""
-if [ -n "$1" ]; then
-  case "$1" in
-    --update-apk) fetch_apk; exit $? ;;
-    --update) INTOXICATED_REPO="$REPO" exec /bin/sh "$REPO/install.sh" ;;
-  esac
+need_bin() {
   if [ ! -x "$BIN" ]; then
     echo "intoxicated: $BIN is not built; run cargo build --release in $REPO" >&2
     exit 1
   fi
+}
+
+case "${1:-}" in
+  --update-apk) fetch_apk; exit $? ;;
+  --update) INTOXICATED_REPO="$REPO" exec /bin/sh "$REPO/install.sh" ;;
+  # The flags the client sets itself, so Intoxicated Settings can show them
+  # without keeping a copy.
+  --default-flags) need_bin; "$BIN" --print-default-flags; exit $? ;;
+  # The first line of --help is the client's banner: name, version, licence.
+  --version) need_bin; "$BIN" --help 2>/dev/null | head -n 1; exit 0 ;;
+esac
+
+# A profile is one directory under $DATADIR/profiles, so its name is one plain
+# path component: letters, digits, - and _, at most 32 of them.
+case $PROFILE in
+  ''|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-]*) bad_profile=1 ;;
+  *) [ ${#PROFILE} -le 32 ] && bad_profile= || bad_profile=1 ;;
+esac
+if [ -n "$bad_profile" ]; then
+  echo "intoxicated: INTOXICATED_PROFILE=\"$PROFILE\" is not a profile name; use 1 to 32 letters, digits, - and _" >&2
+  exit 2
+fi
+
+JOIN=""
+if [ -n "$1" ]; then
+  need_bin
   JOIN=$(join_link "$1") || exit 2
   # A link the check rewrote (roblox.com's, with its ticket) would otherwise
   # stay in this process's arguments for the whole session. Run again with the
@@ -163,6 +224,7 @@ fi
 ensure_flags
 
 set -- --lib-dir "$APKDIR/lib/x86_64" --apk "$APK" --host-libc --game-activity --run 0
+[ "$PROFILE" != default ] && set -- "$@" --profile "$PROFILE"
 [ -n "$JOIN" ] && set -- "$@" --join-url "$JOIN"
 # The runtime publishes the join link once, when the home page is interactive,
 # and watches the bus for the engine's Game.launch. This adds a bounded retry
