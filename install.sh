@@ -6,14 +6,18 @@
 # Run it as your own user, from a terminal. It checks what the system lacks,
 # shows the commands that need root and asks before running them (the password
 # goes to sudo, doas or su), clones or updates the checkout, builds it,
-# installs the launcher and the desktop entry, and fetches the Roblox build.
-# Running it again updates an install; `intoxicated --update` does the same.
-# README.md has the same steps done by hand.
+# installs the launcher and the desktop entry, offers Intoxicated Settings (a
+# Qt 6 app for flags, client options and profiles) and fetches the Roblox
+# build. Running it again updates an install, the app included when it is
+# there; `intoxicated --update` does the same. README.md has the same steps
+# done by hand.
 #
 #   INTOXICATED_REPO   where the checkout goes (default ~/intoxicated)
 #   INTOXICATED_YES=1  answer yes to every question
 #   PREFIX             where the launcher goes (default /usr/local)
 #   INTOXICATED_GIT_URL  clone from somewhere else than GitHub
+#   SUDO_ASKPASS       with no terminal, sudo asks for the password through
+#                      this program (sudo -A); Intoxicated Settings sets it
 #
 # Nothing runs until main, on the last line, so a download cut short does
 # nothing at all.
@@ -71,7 +75,13 @@ run_batch() {
   if [ "$(id -u)" = 0 ]; then
     /bin/sh "$script"
   elif command -v sudo >/dev/null 2>&1; then
-    sudo /bin/sh "$script"
+    # Run from Intoxicated Settings there is no terminal for the password;
+    # the app's own dialog asks for it instead.
+    if ! has_tty && [ -n "${SUDO_ASKPASS:-}" ]; then
+      sudo -A /bin/sh "$script"
+    else
+      sudo /bin/sh "$script"
+    fi
   elif command -v doas >/dev/null 2>&1; then
     doas /bin/sh "$script"
   else
@@ -106,17 +116,47 @@ check_system() {
   [ -n "$HOME" ] || die "HOME is not set"
 }
 
+# Intoxicated Settings, the optional Qt 6 app (settings/): yes when it is
+# built and installed. Decided while the packages are checked, so Qt joins
+# the first root batch rather than asking for the password again.
+SETTINGS_APP=no
+SETTINGS_PACKAGE=qt6-base
+
+# want_settings HAVE_PKG: an installed app is updated without asking;
+# otherwise ask. HAVE_PKG is yes when pkg is set up, so the size can be looked
+# up (an unbootstrapped pkg would offer to bootstrap itself instead).
+want_settings() {
+  if [ -e "$PREFIX/bin/intoxicated-settings" ]; then
+    note "Intoxicated Settings is installed; it is updated too"
+    SETTINGS_APP=yes
+    return
+  fi
+  size=""
+  [ "$1" = yes ] && size=$(pkg rquery %sh "$SETTINGS_PACKAGE" 2>/dev/null | head -n 1)
+  if ask "Also install Intoxicated Settings (a settings and flags app; needs Qt 6${size:+, about $size})?" y; then
+    SETTINGS_APP=yes
+  else
+    note "Intoxicated Settings left out; running this again offers it again"
+  fi
+}
+
 check_packages() {
   step "Checking packages"
   if ! pkg -N >/dev/null 2>&1; then
     note "pkg is not set up yet"
     queue "env ASSUME_ALWAYS_YES=yes pkg bootstrap"
+    want_settings no
     missing=" $PACKAGES $DESKTOP_PACKAGES"
+    [ "$SETTINGS_APP" = yes ] && missing="$missing $SETTINGS_PACKAGE"
   else
+    want_settings yes
     missing=""
     for p in $PACKAGES $DESKTOP_PACKAGES; do
       installed "$p" || missing="$missing $p"
     done
+    if [ "$SETTINGS_APP" = yes ] && ! installed "$SETTINGS_PACKAGE"; then
+      missing="$missing $SETTINGS_PACKAGE"
+    fi
   fi
   if [ -n "$missing" ]; then
     note "missing:$missing"
@@ -224,13 +264,38 @@ wanted() {
 install -m $1 '$2' '$3'"
 }
 
+# Intoxicated Settings is built as the user, in the checkout. A failed build
+# leaves the app out and the install goes on: the client does not need it.
+SETTINGS_BUILT=no
+build_settings() {
+  step "Building Intoxicated Settings"
+  ncpu=$(sysctl -n hw.ncpu 2>/dev/null)
+  [ -n "$ncpu" ] || ncpu=2
+  if (cd "$REPO" &&
+      cmake -S settings -B settings/build -DCMAKE_BUILD_TYPE=Release &&
+      cmake --build settings/build -j "$ncpu"); then
+    SETTINGS_BUILT=yes
+  else
+    note "Intoxicated Settings did not build (the output above says why); the client is installed without it"
+  fi
+}
+
 install_files() {
-  step "Installing the launcher and the desktop entry"
+  [ "$SETTINGS_APP" = yes ] && build_settings
+  if [ "$SETTINGS_BUILT" = yes ]; then
+    step "Installing the launcher, the desktop entries and Intoxicated Settings"
+  else
+    step "Installing the launcher and the desktop entry"
+  fi
   launcher=$(launcher_copy)
   FILES=""
   wanted 755 "$launcher" "$PREFIX/bin/intoxicated"
   wanted 644 "$REPO/packaging/freebsd/intoxicated.desktop" "$PREFIX/share/applications/intoxicated.desktop"
   wanted 644 "$REPO/packaging/branding/intoxicated-logo.png" "$PREFIX/share/pixmaps/intoxicated.png"
+  if [ "$SETTINGS_BUILT" = yes ]; then
+    wanted 755 "$REPO/settings/build/intoxicated-settings" "$PREFIX/bin/intoxicated-settings"
+    wanted 644 "$REPO/packaging/freebsd/intoxicated-settings.desktop" "$PREFIX/share/applications/intoxicated-settings.desktop"
+  fi
   if [ -n "$FILES" ]; then
     queue "install -d '$PREFIX/bin' '$PREFIX/share/applications' '$PREFIX/share/pixmaps'$FILES"
     command -v update-desktop-database >/dev/null 2>&1 &&
@@ -285,6 +350,7 @@ main() {
   check_session
   note "Start it with: intoxicated"
   note "or straight into a game: intoxicated <placeId>, or a roblox.com game link"
+  [ "$SETTINGS_BUILT" = yes ] && note "Flags, client options and profiles: intoxicated-settings"
   note "Update later with: intoxicated --update"
 }
 

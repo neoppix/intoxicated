@@ -65,8 +65,9 @@ It checks what the system is missing (packages, the GPU driver and its kernel
 module), lists the commands that need root and asks before running them, with
 the password going to sudo, doas or su. Then it clones the checkout to
 `~/intoxicated` (`INTOXICATED_REPO` picks another place), builds it, installs
-the launcher and the desktop entry, offers to open roblox.com's Play button in
-Intoxicated, and fetches the Roblox build. Running it again, or
+the launcher and the desktop entry, offers
+[Intoxicated Settings](#intoxicated-settings) and to open roblox.com's Play
+button in Intoxicated, and fetches the Roblox build. Running it again, or
 `intoxicated --update`, updates an install. It does what the steps below do,
 which stay here for anyone who would rather do them by hand.
 
@@ -115,6 +116,9 @@ intoxicated '<link>'     # a roblox:// link, roblox.com's Play link, or a
                          # https://www.roblox.com/games/<id> page link
 intoxicated --update-apk # fetch the newest Roblox build, then exit
 intoxicated --update     # update Intoxicated itself (pull, build, reinstall)
+intoxicated --default-flags  # print the flags the client sets itself (JSON)
+intoxicated --version    # print the client's version line
+INTOXICATED_PROFILE=alt intoxicated   # run another profile (see below)
 ```
 
 To update Intoxicated itself, run `intoxicated --update` (the installer, from
@@ -165,7 +169,16 @@ certificate**, so a tampered download is caught rather than trusted. It keeps it
 in `~/.cache/intoxicated/apk` and fetches it again if that is ever cleared.
 
 Your sign-in, settings and Roblox's own storage live in the profile,
-`~/.local/share/intoxicated/profiles/default`.
+`~/.local/share/intoxicated/profiles/default`. `INTOXICATED_PROFILE=<name>`
+(1 to 32 letters, digits, `-` and `_`) runs another one, in
+`profiles/<name>`, with its own account, storage and `flags.json`; one client
+runs per profile, so two profiles can play at the same time.
+
+The launcher also reads `~/.config/intoxicated/settings.conf`
+(`$XDG_CONFIG_HOME`): one `INTOXICATED_*=value` line per switch, exported
+unless that variable is already set in the environment, which wins. The value
+is taken literally and the file is never run as shell; other lines are
+ignored.
 
 As on Android, the engine is told this machine's IPv4 addresses when it asks
 (`NetworkUtils.getPublicIPv4Addresseses`): every interface but loopback, so a
@@ -211,6 +224,49 @@ run ends. The engine itself never reports a full disk.
 A new Roblox build can import symbols Intoxicated does not answer yet; if
 `intoxicated` reports `cannot locate symbol`, that is what happened. The raw
 syscall sites the anticheat fix needs are found automatically for every build.
+
+## Intoxicated Settings
+
+An optional desktop app for what is otherwise set by hand. FastFlags: presets
+(frame rate cap, video memory budget, light shadows, GPU memory pooling, 4x
+MSAA), every flag in the profile's `flags.json` with inline editing, import of
+a JSON file (a Bloxstrap export or a `ClientAppSettings.json`) with a preview,
+export and reset. Client options: window, input, graphics, audio and session.
+Profiles: create, delete and pick the default one. And Play, a place id or
+link field, and the two update commands. It is a Qt 6 Widgets program in
+`settings/` that needs `qt6-base` and nothing else.
+
+The installer asks whether to install it (the answer defaults to yes) while it
+checks the packages, so Qt is installed with the rest; it builds the app as
+your user and installs it with the launcher. Once it is installed, every later
+run updates it without asking, and a failed build of the app does not stop the
+rest of the install. By hand:
+
+```sh
+pkg install qt6-base                     # as root
+cmake -S settings -B settings/build -DCMAKE_BUILD_TYPE=Release
+cmake --build settings/build -j "$(sysctl -n hw.ncpu)"
+# as root
+install -m 755 settings/build/intoxicated-settings /usr/local/bin/
+install -m 644 packaging/freebsd/intoxicated-settings.desktop /usr/local/share/applications/
+```
+
+It writes two kinds of file, and both can still be edited by hand:
+
+- `~/.config/intoxicated/settings.conf`: the client options, read by the
+  launcher as above. A control at its default removes its line; lines the app
+  does not manage, comments included, are kept.
+- `~/.local/share/intoxicated/profiles/<profile>/flags.json`: the profile's
+  flags, one JSON object. A file that is not a JSON object is never written
+  over; the app offers to keep it as `flags.json.bad-<time>` and start empty.
+
+Both are written to a temporary file and renamed into place. The presets show
+the client's own flags, which the app reads from `intoxicated --default-flags`.
+A profile shows as in use while a client holds it, and is not deleted then.
+"Update Intoxicated" runs `intoxicated --update` with no terminal, so the
+installer asks for the password through the app's own dialog (`sudo -A` with
+`SUDO_ASKPASS`). `ctest --test-dir settings/build` runs the app's self-test
+of its file handling, against scratch directories.
 
 ## Status: early, but it plays
 

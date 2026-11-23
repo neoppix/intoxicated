@@ -1,9 +1,10 @@
 //! `install.sh`, run for real against stand-ins for the system.
 //!
 //! `pkg`, `pciconf`, `kldstat`, `kldload`, `sysrc`, `pw`, `sudo`, `cargo`,
-//! `xdg-mime` and `update-desktop-database` are scripts that answer from the
-//! environment and write down what they were asked. `sudo` runs the root
-//! batch as the test user, so the files land under a scratch `PREFIX`. git
+//! `cmake`, `xdg-mime` and `update-desktop-database` are scripts that answer
+//! from the environment and write down what they were asked. `sudo` runs the
+//! root batch as the test user, so the files land under a scratch `PREFIX`;
+//! `cmake` "builds" Intoxicated Settings as a one-line script. git
 //! is the real one, cloning a scratch repository through
 //! `INTOXICATED_GIT_URL`. Every run is in a new session with no terminal, so
 //! a question can only be answered by `INTOXICATED_YES=1`.
@@ -32,6 +33,7 @@ const FAKES: &[(&str, &str)] = &[
       -e) for m in $FAKE_MISSING; do [ "$m" = "$3" ] && exit 1; done; exit 0 ;;
       -g) [ -z "$FAKE_NO_NVIDIA_DRIVER" ] ;;
     esac ;;
+  rquery) [ -n "$FAKE_QT_SIZE" ] || exit 1; printf '%s\n' "$FAKE_QT_SIZE" ;;
   *) echo "pkg $*" >> "$RECORD/root" ;;
 esac"#,
     ),
@@ -45,7 +47,8 @@ esac"#,
     ),
     (
         "sudo",
-        r#"n=$(ls "$RECORD" | grep -c '^batch')
+        r#"if [ "$1" = -A ]; then printf '%s\n' "$SUDO_ASKPASS" >> "$RECORD/askpass"; shift; fi
+n=$(ls "$RECORD" | grep -c '^batch')
 cp "$2" "$RECORD/batch$n"
 exec "$@""#,
     ),
@@ -54,6 +57,14 @@ exec "$@""#,
         r#"echo "$PWD $*" >> "$RECORD/cargo"
 mkdir -p target/release
 for b in intoxicated-run intoxicated-fetch; do printf '#!/bin/sh\n' > target/release/$b; chmod 755 target/release/$b; done"#,
+    ),
+    (
+        "cmake",
+        r#"echo "$PWD $*" >> "$RECORD/cmake"
+case "$1" in
+  -S) [ -z "$FAKE_CMAKE_FAIL" ] || exit 1; mkdir -p "$4" ;;
+  --build) printf '#!/bin/sh\necho settings %s\n' "${FAKE_SETTINGS_VERSION:-1}" > "$2/intoxicated-settings"; chmod 755 "$2/intoxicated-settings" ;;
+esac"#,
     ),
     (
         "xdg-mime",
@@ -110,6 +121,8 @@ impl Setup {
             fs::create_dir_all(up.join("packaging/branding")).unwrap();
             self.git(&up, &["init", "-q"]);
             fs::write(up.join("packaging/freebsd/intoxicated.desktop"), "[Desktop Entry]\n").unwrap();
+            fs::write(up.join("packaging/freebsd/intoxicated-settings.desktop"), "[Desktop Entry]\nName=Intoxicated Settings\n")
+                .unwrap();
             fs::write(up.join("packaging/branding/intoxicated-logo.png"), b"png").unwrap();
         }
         fs::write(up.join("packaging/freebsd/intoxicated"), launcher).unwrap();
@@ -162,6 +175,8 @@ impl Setup {
             batches,
             root: read("root"),
             cargo: read("cargo"),
+            cmake: read("cmake"),
+            askpass: read("askpass"),
             user: read("user"),
             launcher: read("launcher"),
         };
@@ -182,6 +197,10 @@ struct Outcome {
     /// What the root batches did to the stand-ins.
     root: String,
     cargo: String,
+    /// Each cmake call as `<cwd> <arguments>`.
+    cmake: String,
+    /// SUDO_ASKPASS, once per `sudo -A`.
+    askpass: String,
     user: String,
     launcher: String,
 }
@@ -212,6 +231,130 @@ fn a_fresh_install_clones_installs_builds_and_fetches() {
     assert!(o.user.contains("xdg-mime default intoxicated.desktop x-scheme-handler/roblox-player"), "{o:#?}");
     assert_eq!(o.launcher.trim(), format!("{} --update-apk", repo.display()));
     assert!(o.stdout.contains("intoxicated --update"), "{o:#?}");
+    // INTOXICATED_YES=1 takes Intoxicated Settings too, in the same batch.
+    assert!(prefix.join("bin/intoxicated-settings").is_file(), "{o:#?}");
+    assert!(o.askpass.is_empty(), "plain sudo without SUDO_ASKPASS: {o:#?}");
+}
+
+/// The app's question comes before the first root batch, so a missing Qt is
+/// installed with the other packages; the app is built as the user with
+/// cmake and installed with the launcher's files.
+#[test]
+fn a_fresh_install_with_intoxicated_settings() {
+    let s = Setup::new("settings-fresh");
+    let o = s.run(&[YES, ("FAKE_MISSING", "jq qt6-base"), ("FAKE_QT_SIZE", "65.9MiB")]);
+    assert_eq!(o.status, 0, "{o:#?}");
+    assert_eq!(o.batches.len(), 2, "{o:#?}");
+    let first: Vec<&str> = o.batches[0].lines().skip(1).collect();
+    assert_eq!(first, ["pkg install -y jq qt6-base"], "{o:#?}");
+
+    let repo = s.home_repo();
+    let cmake: Vec<&str> = o.cmake.lines().collect();
+    assert_eq!(cmake.len(), 2, "{o:#?}");
+    assert_eq!(cmake[0], format!("{} -S settings -B settings/build -DCMAKE_BUILD_TYPE=Release", repo.display()));
+    assert!(cmake[1].starts_with(&format!("{} --build settings/build -j ", repo.display())), "{cmake:?}");
+    let jobs: u32 = cmake[1].rsplit(' ').next().unwrap().parse().expect("a job count");
+    assert!(jobs >= 1);
+
+    let installs: Vec<&str> = o.batches[1].lines().filter(|l| l.starts_with("install -m")).collect();
+    assert_eq!(installs.len(), 5, "{installs:?}");
+    assert!(installs[3].starts_with("install -m 755 ") && installs[3].ends_with("/prefix/bin/intoxicated-settings'"));
+    assert!(installs[4].starts_with("install -m 644 "));
+    assert!(installs[4].ends_with("/prefix/share/applications/intoxicated-settings.desktop'"), "{installs:?}");
+    let prefix = s.root.join("prefix");
+    assert_eq!(fs::read_to_string(prefix.join("bin/intoxicated-settings")).unwrap(), "#!/bin/sh\necho settings 1\n");
+    let mode = fs::metadata(prefix.join("bin/intoxicated-settings")).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o755);
+    assert!(prefix.join("share/applications/intoxicated-settings.desktop").is_file());
+    assert!(o.stdout.contains("intoxicated-settings"), "{o:#?}");
+}
+
+/// Once installed, the app is rebuilt on every run without a question, and
+/// only a binary that changed is installed again.
+#[test]
+fn an_installed_intoxicated_settings_is_updated_without_asking() {
+    let s = Setup::new("settings-update");
+    assert_eq!(s.run(&[YES]).status, 0);
+    let apk = s.root.join("cache/intoxicated/apk");
+    fs::create_dir_all(apk.join("lib/x86_64")).unwrap();
+    fs::write(apk.join("candidate-0.apk"), b"").unwrap();
+    fs::write(apk.join("lib/x86_64/libroblox.so"), b"").unwrap();
+
+    // No INTOXICATED_YES and no terminal: any question would fail the run.
+    let o = s.run(&[("FAKE_HANDLER", "intoxicated.desktop")]);
+    assert_eq!(o.status, 0, "{o:#?}");
+    assert!(!o.stderr.contains("no terminal to ask"), "{o:#?}");
+    assert!(o.stdout.contains("Intoxicated Settings is installed; it is updated too"), "{o:#?}");
+    assert_eq!(o.cmake.lines().count(), 2, "rebuilt: {o:#?}");
+    assert!(o.batches.is_empty(), "an identical build is not installed again: {o:#?}");
+
+    let o = s.run(&[YES, ("FAKE_HANDLER", "intoxicated.desktop"), ("FAKE_SETTINGS_VERSION", "2")]);
+    assert_eq!(o.status, 0, "{o:#?}");
+    assert_eq!(o.batches.len(), 1, "{o:#?}");
+    let installs: Vec<&str> = o.batches[0].lines().filter(|l| l.starts_with("install -m")).collect();
+    assert_eq!(installs.len(), 1, "{installs:?}");
+    assert!(installs[0].ends_with("/prefix/bin/intoxicated-settings'"), "{installs:?}");
+    assert_eq!(
+        fs::read_to_string(s.root.join("prefix/bin/intoxicated-settings")).unwrap(),
+        "#!/bin/sh\necho settings 2\n"
+    );
+}
+
+/// Declined (here by having no terminal to answer on), nothing of the app is
+/// built or installed and Qt is not added to the packages.
+#[test]
+fn intoxicated_settings_can_be_declined() {
+    let s = Setup::new("settings-declined");
+    // A first install, then the app removed, so the second run has no file
+    // to install and needs no root batch at all.
+    assert_eq!(s.run(&[YES]).status, 0);
+    fs::remove_file(s.root.join("prefix/bin/intoxicated-settings")).unwrap();
+    let apk = s.root.join("cache/intoxicated/apk");
+    fs::create_dir_all(apk.join("lib/x86_64")).unwrap();
+    fs::write(apk.join("candidate-0.apk"), b"").unwrap();
+    fs::write(apk.join("lib/x86_64/libroblox.so"), b"").unwrap();
+
+    let o = s.run(&[("FAKE_HANDLER", "intoxicated.desktop"), ("FAKE_MISSING", "qt6-base"), ("FAKE_QT_SIZE", "65.9MiB")]);
+    assert_eq!(o.status, 0, "{o:#?}");
+    assert!(
+        o.stderr.contains(
+            "no terminal to ask \"Also install Intoxicated Settings (a settings and flags app; needs Qt 6, about 65.9MiB)?\""
+        ),
+        "{o:#?}"
+    );
+    assert!(o.stdout.contains("Intoxicated Settings left out"), "{o:#?}");
+    assert!(o.cmake.is_empty(), "{o:#?}");
+    assert!(o.batches.is_empty(), "no qt6-base and nothing to install: {o:#?}");
+    assert!(!s.root.join("prefix/bin/intoxicated-settings").exists());
+    assert!(!o.stdout.contains("intoxicated-settings"), "{o:#?}");
+
+    // Without a size from pkg the question leaves the number out.
+    let o = s.run(&[("FAKE_HANDLER", "intoxicated.desktop")]);
+    assert!(o.stderr.contains("(a settings and flags app; needs Qt 6)?"), "{o:#?}");
+}
+
+#[test]
+fn a_failed_settings_build_leaves_the_app_out_and_installs_the_rest() {
+    let s = Setup::new("settings-fails");
+    let o = s.run(&[YES, ("FAKE_CMAKE_FAIL", "1")]);
+    assert_eq!(o.status, 0, "{o:#?}");
+    assert!(o.stdout.contains("Intoxicated Settings did not build"), "{o:#?}");
+    assert!(s.root.join("prefix/bin/intoxicated").is_file());
+    assert!(!s.root.join("prefix/bin/intoxicated-settings").exists());
+    assert!(!o.batches[0].contains("intoxicated-settings"), "{o:#?}");
+}
+
+/// Started from Intoxicated Settings there is no terminal; with SUDO_ASKPASS
+/// set the root batch goes through `sudo -A`, which asks through that program.
+#[test]
+fn without_a_terminal_sudo_asks_through_sudo_askpass() {
+    let s = Setup::new("askpass");
+    let askpass = s.root.join("askpass-helper");
+    let o = s.run(&[YES, ("SUDO_ASKPASS", askpass.to_str().unwrap())]);
+    assert_eq!(o.status, 0, "{o:#?}");
+    assert_eq!(o.batches.len(), 1, "{o:#?}");
+    assert_eq!(o.askpass.trim(), askpass.to_str().unwrap(), "{o:#?}");
+    assert!(s.root.join("prefix/bin/intoxicated").is_file());
 }
 
 #[test]
@@ -249,7 +392,7 @@ fn an_unbootstrapped_pkg_is_bootstrapped_and_everything_installed() {
     let first: Vec<&str> = o.batches[0].lines().skip(1).collect();
     assert_eq!(first[0], "env ASSUME_ALWAYS_YES=yes pkg bootstrap");
     assert!(first[1].starts_with("pkg install -y git rust cmake "), "{first:?}");
-    assert!(first[1].ends_with(" jq xdg-utils desktop-file-utils"), "{first:?}");
+    assert!(first[1].ends_with(" jq xdg-utils desktop-file-utils qt6-base"), "{first:?}");
 }
 
 #[test]
