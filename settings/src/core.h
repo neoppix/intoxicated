@@ -130,13 +130,17 @@ void applyPreset(const SwitchPreset &preset, bool on, FlagMap &flags, const Flag
 
 // --- Quality presets -------------------------------------------------------
 
-// A whole-profile graphics level. Only flags Roblox allows on its own Windows
-// client are used, so no preset gives an edge another player could not have.
+// A whole-profile graphics level. Lowest to High use only flags Roblox allows
+// on its own Windows client. Potato goes below Lowest with any rendering flag
+// the 2.748 engine has that lowers cost, and can break game content. No
+// preset touches network, physics or camera flags.
 struct QualityPreset {
     QString name;
     QString description;
     // Set by the preset; every other key in qualityPresetKeys() is removed.
     QList<QPair<QString, QString>> flags;
+    // Shown as a warning, and confirmed before the preset is applied.
+    QString warning = {};
 };
 
 QList<QualityPreset> qualityPresets();

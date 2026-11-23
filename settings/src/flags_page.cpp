@@ -281,6 +281,15 @@ FlagsPage::FlagsPage(AppState *state) : m_state(state) {
         m_qualityButtons.append(btn);
         connect(btn, &QPushButton::clicked, this, [this, i] {
             const QualityPreset preset = qualityPresets().at(i);
+            if (!preset.warning.isEmpty() && matchingQualityPreset(m_flags) != i) {
+                const auto answer = QMessageBox::warning(
+                    this, preset.name, preset.warning + QStringLiteral("\n\nUse it anyway?"),
+                    QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
+                if (answer != QMessageBox::Yes) {
+                    fillPresets();
+                    return;
+                }
+            }
             edit([&](FlagMap &flags) { applyQualityPreset(preset, flags); });
         });
     }
@@ -289,6 +298,11 @@ FlagsPage::FlagsPage(AppState *state) : m_state(state) {
     m_qualityDesc->setObjectName(QStringLiteral("note"));
     m_qualityDesc->setWordWrap(true);
     qv->addWidget(m_qualityDesc);
+    m_qualityWarning = new QLabel;
+    m_qualityWarning->setObjectName(QStringLiteral("error"));
+    m_qualityWarning->setWordWrap(true);
+    m_qualityWarning->hide();
+    qv->addWidget(m_qualityWarning);
     m_quality = quality.box;
     b->addWidget(quality.box);
     b->addSpacing(8);
@@ -442,7 +456,9 @@ void FlagsPage::fillPresets() {
 
     const QString fps = effectiveFps(m_flags, defaults, conf);
     m_fps->clear();
-    m_fps->addItem(QStringLiteral("Unlimited"), QStringLiteral("9999"));
+    // The engine still stops at 240: measured on 2.748 with the target at 9999,
+    // and with each cap flag and the saved FramerateCap tried; none moved it.
+    m_fps->addItem(QStringLiteral("Unlimited (the engine stops at 240)"), QStringLiteral("9999"));
     for (const char *n : {"60", "144", "165", "240"})
         m_fps->addItem(QStringLiteral("%1 fps").arg(QLatin1String(n)), QString::fromLatin1(n));
     int at = m_fps->findData(fps);
@@ -473,6 +489,9 @@ void FlagsPage::fillPresets() {
     m_qualityDesc->setText(quality >= 0 ? qualities[quality].description
                                         : QStringLiteral("Custom: this profile's flags match none of the presets. "
                                                          "Picking one replaces the graphics flags it covers."));
+    const bool warned = quality >= 0 && !qualities[quality].warning.isEmpty();
+    m_qualityWarning->setText(warned ? qualities[quality].warning : QString());
+    m_qualityWarning->setVisible(warned);
 
     const QList<SwitchPreset> presets = switchPresets();
     for (int i = 0; i < presets.size(); ++i) {

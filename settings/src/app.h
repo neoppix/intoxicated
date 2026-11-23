@@ -122,6 +122,7 @@ private:
     Combo *m_videoMemory;
     QList<QPushButton *> m_qualityButtons;
     QLabel *m_qualityDesc = nullptr;
+    QLabel *m_qualityWarning = nullptr;
     QList<Switch *> m_switches;
     QList<QLabel *> m_switchDescs;
     QLabel *m_defaultsNote;

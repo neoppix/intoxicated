@@ -332,17 +332,24 @@ void testQualityPresets() {
     QStringList names;
     for (const QualityPreset &p : presets)
         names.append(p.name);
-    same(names, QStringList({"Lowest", "Low", "Default", "High", "Competitive"}), "the five presets, in order");
+    same(names, QStringList({"Potato", "Lowest", "Low", "Default", "High", "Competitive"}), "the six presets, in order");
+    check(!presets[0].warning.isEmpty(), "Potato carries a warning");
+    for (int i = 1; i < presets.size(); ++i)
+        check(presets[i].warning.isEmpty(), presets[i].name + " has no warning");
 
     FlagMap flags{{"FFlagSomethingElse", "True"}};
-    same(matchingQualityPreset(flags), 2, "no graphics flags is Default");
+    same(matchingQualityPreset(flags), 3, "no graphics flags is Default");
     applyQualityPreset(presets[0], flags);
-    same(matchingQualityPreset(flags), 0, "Lowest applied reads as Lowest");
+    same(matchingQualityPreset(flags), 0, "Potato applied reads as Potato");
+    same(flags.value("FIntViewportFrameMaxSize"), QString("0"), "Potato turns viewport frames off");
+    applyQualityPreset(presets[1], flags);
+    same(matchingQualityPreset(flags), 1, "Lowest applied over Potato reads as Lowest");
+    check(!flags.contains("FIntViewportFrameMaxSize"), "and drops Potato's own keys");
     same(flags.value("FFlagDebugSkyGray"), QString("True"), "Lowest greys the sky");
     same(flags.value("FFlagSomethingElse"), QString("True"), "an unrelated flag is kept");
 
-    applyQualityPreset(presets[3], flags);
-    same(matchingQualityPreset(flags), 3, "High applied over Lowest reads as High");
+    applyQualityPreset(presets[4], flags);
+    same(matchingQualityPreset(flags), 4, "High applied over Lowest reads as High");
     check(!flags.contains("FFlagDebugSkyGray") && !flags.contains("FIntFRMMaxGrassDistance"),
           "keys Lowest set and High does not are removed");
     same(flags.value("DFIntDebugFRMQualityLevelOverride"), QString("21"), "High is quality 21");
@@ -350,9 +357,9 @@ void testQualityPresets() {
     flags.insert("DFIntDebugFRMQualityLevelOverride", "20");
     same(matchingQualityPreset(flags), -1, "an edited level is a custom mix");
     flags.insert("DFIntDebugFRMQualityLevelOverride", "021");
-    same(matchingQualityPreset(flags), 3, "021 and 21 are the same value to the client");
+    same(matchingQualityPreset(flags), 4, "021 and 21 are the same value to the client");
 
-    applyQualityPreset(presets[2], flags);
+    applyQualityPreset(presets[3], flags);
     same(flags, FlagMap({{"FFlagSomethingElse", "True"}}), "Default removes every graphics flag and nothing else");
 
     for (const QualityPreset &p : presets)
