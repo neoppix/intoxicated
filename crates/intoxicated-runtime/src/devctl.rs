@@ -18,7 +18,9 @@
 //! - `screenshot <path>` asks the Vulkan layer for the next frame.
 //!   `depthshot <path>` asks for the next frame's scene depth as a grayscale
 //!   PNG, with a screenshot of the same frame beside it, and `passes` writes
-//!   the next frame's render passes to stderr.
+//!   the next frame's render passes to stderr. `ssr on|off|stats|get|reset|
+//!   intensity <x>|set <name> <value>` drives the screen-space reflections
+//!   and answers with their state, their looks and their GPU time.
 //! - `bussub`, `buslast` and `deeplink` reach the engine's message bus through
 //!   `deeplink::dev_request`, which blocks this thread for at most 5 s.
 //!
@@ -371,6 +373,15 @@ fn reply(line: &str) -> String {
             },
             None => "err depthshot <path>".into(),
         },
+        // Screen-space reflections: on, off, their settings and GPU cost.
+        // See `android::ssr`.
+        "ssr" => {
+            let args: Vec<&str> = it.collect();
+            match crate::android::ssr::control(&args) {
+                Ok(state) => format!("ok {state}"),
+                Err(reason) => format!("err {reason}"),
+            }
+        }
         other => format!("err unknown verb {other:?}"),
     }
 }

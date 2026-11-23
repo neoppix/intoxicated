@@ -2,8 +2,9 @@
 // (sample 0 of a multisampled one, which is what a SAMPLE_ZERO resolve
 // keeps), written to a buffer as one float per pixel, row by row.
 //
-// Built with the system's glslc (shaderc) into the two files beside it,
-// each the numbers glslc prints wrapped in `&[` and `]`:
+// Built by build.rs with the system's glslc (shaderc) when there is one,
+// and otherwise taken from the two files beside it, each the numbers glslc
+// prints wrapped in `&[` and `]`:
 //
 //     glslc -O --target-env=vulkan1.0 -mfmt=num resolve.comp -o -
 //         -> resolve_ms.spv.rs

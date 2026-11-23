@@ -295,177 +295,178 @@ const COMMAND_BUFFER_ONE_TIME_SUBMIT: u32 = 0x1;
 const VIEW_TYPE_2D: u32 = 1;
 
 /// Layouts a sampled depth image may be read in.
-fn sampleable(layout: u32) -> bool {
+pub(super) fn sampleable(layout: u32) -> bool {
     matches!(layout, 1 | 4 | 5 | 1_000_117_000 | 1_000_241_001 | 1_000_314_000)
 }
 
 /// The aspects a layout transition of `format` has to name.
-fn barrier_aspects(format: u32) -> u32 {
+pub(super) fn barrier_aspects(format: u32) -> u32 {
     match format {
         128..=130 => ASPECT_DEPTH | ASPECT_STENCIL,
         _ => ASPECT_DEPTH,
     }
 }
 
-/// `depth_capture/resolve.comp` for a multisampled depth image.
-const SPIRV_MS: &[u32] = include!("depth_capture/resolve_ms.spv.rs");
+/// `depth_capture/resolve.comp` for a multisampled depth image, as build.rs
+/// made it (glslc, or the committed `resolve_ms.spv.rs` without it).
+const SPIRV_MS: &[u32] = include!(concat!(env!("OUT_DIR"), "/depth_capture_resolve_ms.spv.rs"));
 /// The same for a single-sample one.
-const SPIRV_1X: &[u32] = include!("depth_capture/resolve_1x.spv.rs");
+const SPIRV_1X: &[u32] = include!(concat!(env!("OUT_DIR"), "/depth_capture_resolve_1x.spv.rs"));
 
 #[repr(C)]
-struct ImageViewCreateInfo {
-    s_type: i32,
-    p_next: *const c_void,
-    flags: u32,
-    image: u64,
-    view_type: u32,
-    format: u32,
-    components: [u32; 4],
-    range: ImageSubresourceRange,
+pub(super) struct ImageViewCreateInfo {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) flags: u32,
+    pub(super) image: u64,
+    pub(super) view_type: u32,
+    pub(super) format: u32,
+    pub(super) components: [u32; 4],
+    pub(super) range: ImageSubresourceRange,
 }
 
 #[repr(C)]
-struct SamplerCreateInfo {
-    s_type: i32,
-    p_next: *const c_void,
-    flags: u32,
-    mag_filter: u32,
-    min_filter: u32,
-    mipmap_mode: u32,
-    address: [u32; 3],
-    mip_lod_bias: f32,
-    anisotropy_enable: u32,
-    max_anisotropy: f32,
-    compare_enable: u32,
-    compare_op: u32,
-    min_lod: f32,
-    max_lod: f32,
-    border_color: u32,
-    unnormalized: u32,
+pub(super) struct SamplerCreateInfo {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) flags: u32,
+    pub(super) mag_filter: u32,
+    pub(super) min_filter: u32,
+    pub(super) mipmap_mode: u32,
+    pub(super) address: [u32; 3],
+    pub(super) mip_lod_bias: f32,
+    pub(super) anisotropy_enable: u32,
+    pub(super) max_anisotropy: f32,
+    pub(super) compare_enable: u32,
+    pub(super) compare_op: u32,
+    pub(super) min_lod: f32,
+    pub(super) max_lod: f32,
+    pub(super) border_color: u32,
+    pub(super) unnormalized: u32,
 }
 
 #[repr(C)]
-struct DescriptorSetLayoutBinding {
-    binding: u32,
-    kind: u32,
-    count: u32,
-    stages: u32,
-    immutable_samplers: *const u64,
+pub(super) struct DescriptorSetLayoutBinding {
+    pub(super) binding: u32,
+    pub(super) kind: u32,
+    pub(super) count: u32,
+    pub(super) stages: u32,
+    pub(super) immutable_samplers: *const u64,
 }
 
 #[repr(C)]
-struct DescriptorSetLayoutCreateInfo {
-    s_type: i32,
-    p_next: *const c_void,
-    flags: u32,
-    count: u32,
-    bindings: *const DescriptorSetLayoutBinding,
+pub(super) struct DescriptorSetLayoutCreateInfo {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) flags: u32,
+    pub(super) count: u32,
+    pub(super) bindings: *const DescriptorSetLayoutBinding,
 }
 
 #[repr(C)]
-struct PushConstantRange {
-    stages: u32,
-    offset: u32,
-    size: u32,
+pub(super) struct PushConstantRange {
+    pub(super) stages: u32,
+    pub(super) offset: u32,
+    pub(super) size: u32,
 }
 
 #[repr(C)]
-struct PipelineLayoutCreateInfo {
-    s_type: i32,
-    p_next: *const c_void,
-    flags: u32,
-    set_layout_count: u32,
-    set_layouts: *const u64,
-    push_constant_count: u32,
-    push_constants: *const PushConstantRange,
+pub(super) struct PipelineLayoutCreateInfo {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) flags: u32,
+    pub(super) set_layout_count: u32,
+    pub(super) set_layouts: *const u64,
+    pub(super) push_constant_count: u32,
+    pub(super) push_constants: *const PushConstantRange,
 }
 
 #[repr(C)]
-struct ShaderModuleCreateInfo {
-    s_type: i32,
-    p_next: *const c_void,
-    flags: u32,
-    code_size: usize,
-    code: *const u32,
+pub(super) struct ShaderModuleCreateInfo {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) flags: u32,
+    pub(super) code_size: usize,
+    pub(super) code: *const u32,
 }
 
 #[repr(C)]
-struct PipelineShaderStageCreateInfo {
-    s_type: i32,
-    p_next: *const c_void,
-    flags: u32,
-    stage: u32,
-    module: u64,
-    name: *const c_char,
-    specialization: *const c_void,
+pub(super) struct PipelineShaderStageCreateInfo {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) flags: u32,
+    pub(super) stage: u32,
+    pub(super) module: u64,
+    pub(super) name: *const c_char,
+    pub(super) specialization: *const c_void,
 }
 
 #[repr(C)]
-struct ComputePipelineCreateInfo {
-    s_type: i32,
-    p_next: *const c_void,
-    flags: u32,
-    stage: PipelineShaderStageCreateInfo,
-    layout: u64,
-    base_pipeline: u64,
-    base_pipeline_index: i32,
+pub(super) struct ComputePipelineCreateInfo {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) flags: u32,
+    pub(super) stage: PipelineShaderStageCreateInfo,
+    pub(super) layout: u64,
+    pub(super) base_pipeline: u64,
+    pub(super) base_pipeline_index: i32,
 }
 
 #[repr(C)]
-struct DescriptorPoolSize {
-    kind: u32,
-    count: u32,
+pub(super) struct DescriptorPoolSize {
+    pub(super) kind: u32,
+    pub(super) count: u32,
 }
 
 #[repr(C)]
-struct DescriptorPoolCreateInfo {
-    s_type: i32,
-    p_next: *const c_void,
-    flags: u32,
-    max_sets: u32,
-    count: u32,
-    sizes: *const DescriptorPoolSize,
+pub(super) struct DescriptorPoolCreateInfo {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) flags: u32,
+    pub(super) max_sets: u32,
+    pub(super) count: u32,
+    pub(super) sizes: *const DescriptorPoolSize,
 }
 
 #[repr(C)]
-struct DescriptorSetAllocateInfo {
-    s_type: i32,
-    p_next: *const c_void,
-    pool: u64,
-    count: u32,
-    layouts: *const u64,
+pub(super) struct DescriptorSetAllocateInfo {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) pool: u64,
+    pub(super) count: u32,
+    pub(super) layouts: *const u64,
 }
 
 #[repr(C)]
-struct DescriptorImageInfo {
-    sampler: u64,
-    view: u64,
-    layout: i32,
+pub(super) struct DescriptorImageInfo {
+    pub(super) sampler: u64,
+    pub(super) view: u64,
+    pub(super) layout: i32,
 }
 
 #[repr(C)]
-struct DescriptorBufferInfo {
-    buffer: u64,
-    offset: u64,
-    range: u64,
+pub(super) struct DescriptorBufferInfo {
+    pub(super) buffer: u64,
+    pub(super) offset: u64,
+    pub(super) range: u64,
 }
 
 #[repr(C)]
-struct WriteDescriptorSet {
-    s_type: i32,
-    p_next: *const c_void,
-    set: u64,
-    binding: u32,
-    element: u32,
-    count: u32,
-    kind: u32,
-    image: *const DescriptorImageInfo,
-    buffer: *const DescriptorBufferInfo,
-    texel_views: *const u64,
+pub(super) struct WriteDescriptorSet {
+    pub(super) s_type: i32,
+    pub(super) p_next: *const c_void,
+    pub(super) set: u64,
+    pub(super) binding: u32,
+    pub(super) element: u32,
+    pub(super) count: u32,
+    pub(super) kind: u32,
+    pub(super) image: *const DescriptorImageInfo,
+    pub(super) buffer: *const DescriptorBufferInfo,
+    pub(super) texel_views: *const u64,
 }
 
-type CreateFn<T> = extern "C" fn(Dev, *const T, *const c_void, *mut u64) -> i32;
-type DestroyFn = extern "C" fn(Dev, u64, *const c_void);
+pub(super) type CreateFn<T> = extern "C" fn(Dev, *const T, *const c_void, *mut u64) -> i32;
+pub(super) type DestroyFn = extern "C" fn(Dev, u64, *const c_void);
 
 /// The device-level commands a depth capture uses, straight from the
 /// driver, so none of them passes through the layer's own hooks.

@@ -1,0 +1,38 @@
+// The first of the reflections' two dispatches (see `ssr.rs`): sample 0 of
+// the engine's scene depth (the only mip of a single-sample one) copied into
+// a single-sample R32F image of ours, which `ssr.comp` then marches through.
+// A texel of the copy is 4 bytes where a texel of the 4x depth spans 16, so
+// the march's scattered reads hit the cache far more often.
+//
+// Built by build.rs with the system's glslc when there is one, and
+// otherwise taken from the two files beside this one, each the numbers
+// glslc prints wrapped in `&[` and `]`:
+//
+//     glslc -O --target-env=vulkan1.0 -mfmt=num depth.comp -o -
+//         -> depth_ms.spv.rs
+//     glslc -O --target-env=vulkan1.0 -mfmt=num -DSINGLE_SAMPLE depth.comp -o -
+//         -> depth_1x.spv.rs
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#ifdef SINGLE_SAMPLE
+layout(binding = 1) uniform sampler2D depth_tex;
+#else
+layout(binding = 1) uniform sampler2DMS depth_tex;
+#endif
+layout(binding = 2, r32f) uniform writeonly image2D depth_copy;
+
+// The first field of `ssr.comp`'s push constants, which both share.
+layout(push_constant) uniform Params {
+    uvec2 size;
+} pc;
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(p), pc.size))) {
+        return;
+    }
+    imageStore(depth_copy, p, vec4(texelFetch(depth_tex, p, 0).r));
+}

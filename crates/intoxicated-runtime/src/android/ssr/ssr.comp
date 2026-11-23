@@ -1,0 +1,301 @@
+// Screen-space reflections on the engine's resolved scene colour (see
+// `ssr.rs`), the second of two dispatches: `depth.comp` has copied the
+// scene depth into `depth_copy`. One invocation per pixel: it reads the
+// scene colour and that depth, and writes the pixel, with a reflection
+// blended in or unchanged, packed bit for bit in the engine's colour format
+// into a 32-bit image of ours that is then copied over the engine's.
+//
+// Every look is a parameter in the push constant block below, set from the
+// INTOXICATED_SSR_* variables and devctl `ssr set` while the game runs;
+// nothing about how the reflections look is a constant here.
+//
+// Built by build.rs with the system's glslc when there is one, and
+// otherwise taken from the file beside this one, the numbers glslc prints
+// wrapped in `&[` and `]`:
+//
+//     glslc -O --target-env=vulkan1.0 -mfmt=num ssr.comp -o -
+//         -> ssr.spv.rs
+//
+// A test compiles this file again and compares, whenever glslc is there.
+//
+// Depth is reversed-Z with the far plane at infinity: depth = near / z, the
+// sky is 0. Positions are kept in units of the near plane (z = 1 / depth),
+// which is all that is needed: the near plane cancels out of every direction
+// and of every projection, and the thickness test and the ray length are
+// relative. Inverse depth is affine in screen space, so along a reflected
+// ray drawn on the screen it is interpolated linearly, and a ray towards
+// infinity ends at its vanishing point with inverse depth 0.
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D color_tex;
+layout(binding = 2, r32f) uniform readonly image2D depth_copy;
+layout(binding = 3, r32ui) uniform writeonly uimage2D out_img;
+
+// std430, as push constants are laid out; `ssr::Params` mirrors it.
+layout(push_constant) uniform Params {
+    uvec2 size;
+    // tan of half the horizontal and of half the vertical field of view.
+    vec2 tan_half;
+    // Wet surfaces are multiplied by tint.rgb (and by 1 - darken).
+    vec4 tint;
+    // How much of the reflection is blended in, 0 to 1.
+    float intensity;
+    // Bit 0: only surfaces that face up are wet. Bits 8 to 11: how the
+    // engine's format packs a pixel (see `pack`).
+    uint flags;
+    // Steps along the ray before the binary search.
+    uint steps;
+    // How far behind the drawn surface a ray may be and still hit it, as a
+    // fraction of that surface's distance.
+    float thickness;
+    // 0: a sharp reflection; up to 1: blurred, more the further the ray went.
+    float roughness;
+    // 0: the same strength at every angle, like a mirror; 1: strong only at
+    // grazing angles (Schlick, reflectance 0.04 head on).
+    float fresnel;
+    // The view-space normal's y (towards the top of the screen) at which a
+    // surface counts as facing up, faded in over 0.15 either side.
+    float up_threshold;
+    // How far a ray goes, in multiples of the surface's distance from the
+    // camera; 0 to infinity (and the sky).
+    float max_distance;
+    // Reflections fade out towards the screen edges over this fraction of
+    // the smaller side.
+    float edge_fade;
+    // Wet surfaces are this much darker, 0 to 1.
+    float darken;
+} pc;
+
+const int REFINE_STEPS = 6;
+const float UP_SOFTNESS = 0.15;
+
+float depth_at(ivec2 p) {
+    return imageLoad(depth_copy, clamp(p, ivec2(0), ivec2(pc.size) - 1)).r;
+}
+
+// View space: x right, y up, z away from the camera.
+vec3 view_pos(vec2 pixel, float d) {
+    vec2 ndc = pixel / vec2(pc.size) * 2.0 - 1.0;
+    return vec3(ndc.x * pc.tan_half.x, -ndc.y * pc.tan_half.y, 1.0) / d;
+}
+
+// Where a view-space point, or a direction (its point at infinity), lands.
+vec2 to_pixel(vec3 v) {
+    vec2 ndc = vec2(v.x / (v.z * pc.tan_half.x), -v.y / (v.z * pc.tan_half.y));
+    return (ndc * 0.5 + 0.5) * vec2(pc.size);
+}
+
+// The surface normal from the depth of the four neighbours, each axis from
+// the side whose depth is closer to this pixel's, so an edge does not bend
+// it. Zero when a whole axis is sky.
+vec3 normal_at(ivec2 p, vec3 P) {
+    vec2 c = vec2(p) + 0.5;
+    float dl = depth_at(p + ivec2(-1, 0));
+    float dr = depth_at(p + ivec2(1, 0));
+    float du = depth_at(p + ivec2(0, -1));
+    float dd = depth_at(p + ivec2(0, 1));
+    if ((dl <= 0.0 && dr <= 0.0) || (du <= 0.0 && dd <= 0.0)) {
+        return vec3(0.0);
+    }
+    vec3 dx, dy;
+    if (dl <= 0.0 || (dr > 0.0 && abs(1.0 / dr - P.z) < abs(1.0 / dl - P.z))) {
+        dx = view_pos(c + vec2(1.0, 0.0), dr) - P;
+    } else {
+        dx = P - view_pos(c - vec2(1.0, 0.0), dl);
+    }
+    if (du <= 0.0 || (dd > 0.0 && abs(1.0 / dd - P.z) < abs(1.0 / du - P.z))) {
+        dy = view_pos(c + vec2(0.0, 1.0), dd) - P;
+    } else {
+        dy = P - view_pos(c - vec2(0.0, 1.0), du);
+    }
+    vec3 n = cross(dx, dy);
+    float l = length(n);
+    if (l <= 0.0) {
+        return vec3(0.0);
+    }
+    n /= l;
+    // Towards the camera.
+    return dot(n, P) > 0.0 ? -n : n;
+}
+
+// Interleaved gradient noise: a fixed per-pixel offset for the march, which
+// trades its banding for fine grain, and the angle of the blur taps.
+float jitter(ivec2 p) {
+    return fract(52.9829189 * fract(dot(vec2(p), vec2(0.06711056, 0.00583715))));
+}
+
+// The engine's colour format, bit for bit, as a 32-bit word; a pixel read
+// and written back unchanged keeps every bit.
+uint pack(vec4 c) {
+    c = clamp(c, 0.0, 1.0);
+    uint mode = (pc.flags >> 8) & 0xfu;
+    if (mode == 2u) {
+        return packUnorm4x8(c);          // R8G8B8A8_UNORM
+    }
+    if (mode == 3u) {
+        return packUnorm4x8(c.bgra);     // B8G8R8A8_UNORM
+    }
+    uvec4 q = uvec4(round(c * vec4(1023.0, 1023.0, 1023.0, 3.0)));
+    if (mode == 1u) {
+        q = q.bgra;                       // A2R10G10B10_UNORM_PACK32
+    }
+    return q.r | (q.g << 10) | (q.b << 20) | (q.a << 30); // A2B10G10R10
+}
+
+// How wet the surface is: 1 everywhere, or by how much it faces up.
+float wetness(vec3 N) {
+    if ((pc.flags & 1u) == 0u) {
+        return 1.0;
+    }
+    return smoothstep(pc.up_threshold - UP_SOFTNESS, pc.up_threshold + UP_SOFTNESS, N.y);
+}
+
+// The scene colour around `at`: one tap, or four on a disc that grows with
+// roughness and with how far the ray went.
+vec3 reflected_color(vec2 at, float pixels, float angle) {
+    vec2 inv = 1.0 / vec2(pc.size);
+    if (pc.roughness <= 0.0) {
+        return textureLod(color_tex, at * inv, 0.0).rgb;
+    }
+    float radius = min(pc.roughness * (1.5 + 0.08 * pixels), 48.0);
+    vec3 c = vec3(0.0);
+    for (int i = 0; i < 4; ++i) {
+        float a = 6.2831853 * angle + 1.5707963 * float(i);
+        float r = radius * (i % 2 == 0 ? 0.5 : 1.0);
+        c += textureLod(color_tex, (at + r * vec2(cos(a), sin(a))) * inv, 0.0).rgb;
+    }
+    return 0.25 * c;
+}
+
+// The reflection at pixel `p` (view position P, normal N): its colour and
+// how much of it to blend in.
+vec4 reflection(ivec2 p, vec3 P, vec3 N, float wet) {
+    vec3 V = normalize(P);
+    float cos_v = clamp(dot(-V, N), 0.0, 1.0);
+    float schlick = 0.04 + 0.96 * pow(1.0 - cos_v, 5.0);
+    float w = pc.intensity * mix(1.0, schlick, pc.fresnel) * wet;
+    if (w < 1.0 / 1024.0) {
+        return vec4(0.0);
+    }
+    vec3 R = reflect(V, N);
+    vec2 s0 = vec2(p) + 0.5;
+
+    // The ray on the screen: to its vanishing point (inverse depth 0) when
+    // it goes on for ever, else to where it ends: max_distance, or most of
+    // the way to the camera plane for a ray that comes back towards it.
+    bool endless = R.z > 1e-4 && pc.max_distance <= 0.0;
+    vec2 s1;
+    float k0 = 1.0 / P.z, k1;
+    if (endless) {
+        s1 = to_pixel(R);
+        k1 = 0.0;
+    } else {
+        float len = pc.max_distance > 0.0 ? pc.max_distance * length(P) : 1e4 * P.z;
+        if (R.z < -1e-4) {
+            len = min(len, 0.9 * P.z / -R.z);
+        }
+        vec3 E = P + R * len;
+        s1 = to_pixel(E);
+        k1 = 1.0 / E.z;
+    }
+    vec2 delta = s1 - s0;
+    // Clipped to the screen.
+    vec2 lo = vec2(0.5), hi = vec2(pc.size) - 0.5;
+    float t_max = 1.0;
+    if (delta.x > 0.0) t_max = min(t_max, (hi.x - s0.x) / delta.x);
+    if (delta.x < 0.0) t_max = min(t_max, (lo.x - s0.x) / delta.x);
+    if (delta.y > 0.0) t_max = min(t_max, (hi.y - s0.y) / delta.y);
+    if (delta.y < 0.0) t_max = min(t_max, (lo.y - s0.y) / delta.y);
+    if (t_max <= 0.0 || length(delta) * t_max < 3.0) {
+        return vec4(0.0);
+    }
+
+    // Steps that start two pixels out, so the surface does not hit itself,
+    // and grow with the square of their number, so the part of the ray near
+    // the surface (contact reflections, the most visible) is sampled finely
+    // and the far part coarsely; then a binary search of the step that went
+    // behind the drawn depth. A crossing more than `thickness` behind it
+    // passed behind something, and the march goes on, as it does past the
+    // back of a surface.
+    float t_start = 2.0 / length(delta);
+    float span = t_max - t_start;
+    float t_prev = t_start;
+    float t_hit = -1.0;
+    float offset = jitter(p);
+    for (uint i = 0u; i < pc.steps; ++i) {
+        float u = (float(i) + offset) / float(pc.steps);
+        float t = t_start + span * u * u;
+        float k_ray = mix(k0, k1, t);
+        if (depth_at(ivec2(s0 + delta * t)) > k_ray) {
+            float a = t_prev, b = t;
+            for (int j = 0; j < REFINE_STEPS; ++j) {
+                float m = 0.5 * (a + b);
+                if (depth_at(ivec2(s0 + delta * m)) > mix(k0, k1, m)) {
+                    b = m;
+                } else {
+                    a = m;
+                }
+            }
+            float kr = mix(k0, k1, b);
+            ivec2 q = ivec2(s0 + delta * b);
+            float ks = depth_at(q);
+            if (kr > 0.0 && ks / kr - 1.0 < pc.thickness) {
+                // A ray can only meet the front of a surface: one it reaches
+                // from behind (water far below a ray that climbs over it, on
+                // the screen) is not a hit.
+                vec3 n = normal_at(q, view_pos(vec2(q) + 0.5, ks));
+                if (dot(n, R) <= 0.0) {
+                    t_hit = b;
+                    break;
+                }
+            }
+        }
+        t_prev = t;
+    }
+
+    vec2 at;
+    float fade = 1.0;
+    if (t_hit >= 0.0) {
+        at = s0 + delta * t_hit;
+        // A ray that ends somewhere fades out over the last 40% of it.
+        if (!endless) {
+            fade = 1.0 - smoothstep(0.6, 1.0, t_hit);
+        }
+    } else if (endless && t_max >= 1.0 && depth_at(ivec2(s1)) <= 0.0) {
+        // Nothing in the way and the vanishing point is on the screen, in
+        // the sky: the reflection is the sky there.
+        at = s1;
+    } else {
+        return vec4(0.0);
+    }
+
+    vec2 margin = min(at, vec2(pc.size) - at) / max(pc.edge_fade * float(min(pc.size.x, pc.size.y)), 1e-3);
+    float edge = smoothstep(0.0, 1.0, clamp(min(margin.x, margin.y), 0.0, 1.0));
+    float facing = smoothstep(-0.25, 0.05, R.z);
+    w *= edge * fade * facing;
+    vec3 c = reflected_color(at, length(at - s0), offset);
+    return vec4(c, clamp(w, 0.0, 1.0));
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(p), pc.size))) {
+        return;
+    }
+    vec4 base = texelFetch(color_tex, p, 0);
+    float d = depth_at(p);
+    if (d > 0.0) {
+        vec3 P = view_pos(vec2(p) + 0.5, d);
+        vec3 N = normal_at(p, P);
+        float wet = N == vec3(0.0) ? 0.0 : wetness(N);
+        if (wet > 0.0) {
+            base.rgb *= mix(vec3(1.0), pc.tint.rgb * (1.0 - pc.darken), wet);
+            vec4 r = reflection(p, P, N, wet);
+            base.rgb = mix(base.rgb, r.rgb, r.a);
+        }
+    }
+    imageStore(out_img, p, uvec4(pack(base), 0u, 0u, 0u));
+}

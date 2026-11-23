@@ -1,5 +1,6 @@
-//! Build script: the stub table (`src/stub_table.rs` includes what this writes)
-//! and the commit stamp for the window title.
+//! Build script: the stub table (`src/stub_table.rs` includes what this writes),
+//! the compute shaders of the Vulkan layer and the commit stamp for the window
+//! title.
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
@@ -10,7 +11,59 @@ const LINKER_PROVIDED: [&str; 7] = ["dlopen", "dlsym", "dlclose", "dlerror", "dl
 
 fn main() {
     generate_stub_table();
+    compile_shaders();
     stamp_commit();
+}
+
+/// Where glslc is looked for. Only this path: the build must not pick up a
+/// glslc from anywhere else (a Linux one under /compat, say).
+const GLSLC: &str = "/usr/local/bin/glslc";
+
+/// The GLSL compute shaders under `src/android`: the source, the committed
+/// SPIR-V beside it (without `.spv.rs`), and the defines of that variant.
+/// Each is written to `OUT_DIR` as `<stem with / as _>.spv.rs`, which its
+/// module includes. The flags are the ones each source's header names; a
+/// test (`ssr::tests`) compiles every entry again and compares it with the
+/// committed file.
+const SHADERS: [(&str, &str, &[&str]); 5] = [
+    ("depth_capture/resolve.comp", "depth_capture/resolve_ms", &[]),
+    ("depth_capture/resolve.comp", "depth_capture/resolve_1x", &["-DSINGLE_SAMPLE"]),
+    ("ssr/depth.comp", "ssr/depth_ms", &[]),
+    ("ssr/depth.comp", "ssr/depth_1x", &["-DSINGLE_SAMPLE"]),
+    ("ssr/ssr.comp", "ssr/ssr", &[]),
+];
+
+/// Each shader compiled by glslc when it is installed, so an edited source is
+/// what runs; the committed SPIR-V otherwise, so a build without glslc
+/// works. A source glslc rejects stops the build.
+fn compile_shaders() {
+    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"));
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
+    let android = manifest.join("src/android");
+    let have_glslc = std::path::Path::new(GLSLC).is_file();
+    for (source, stem, defines) in SHADERS {
+        let src = android.join(source);
+        let committed = android.join(format!("{stem}.spv.rs"));
+        println!("cargo:rerun-if-changed={}", src.display());
+        println!("cargo:rerun-if-changed={}", committed.display());
+        let dest = out.join(format!("{}.spv.rs", stem.replace('/', "_")));
+        let words = if have_glslc {
+            let run = std::process::Command::new(GLSLC)
+                .args(["-O", "--target-env=vulkan1.0", "-mfmt=num"])
+                .args(defines)
+                .arg(&src)
+                .args(["-o", "-"])
+                .output()
+                .unwrap_or_else(|e| panic!("cannot run {GLSLC}: {e}"));
+            if !run.status.success() {
+                panic!("{GLSLC} rejected {}:\n{}", src.display(), String::from_utf8_lossy(&run.stderr));
+            }
+            format!("&[\n{}]\n", String::from_utf8(run.stdout).expect("glslc prints ASCII"))
+        } else {
+            std::fs::read_to_string(&committed).unwrap_or_else(|e| panic!("cannot read {}: {e}", committed.display()))
+        };
+        std::fs::write(&dest, words).unwrap_or_else(|e| panic!("cannot write {}: {e}", dest.display()));
+    }
 }
 
 /// `__start_<section>` and `__stop_<section>` are the bounds a static linker

@@ -1028,8 +1028,10 @@ extern "C" fn destroy_device(device: *mut c_void, alloc: *const c_void) {
 type CreateFn = extern "C" fn(*mut c_void, *const c_void, *const c_void, *mut u64) -> i32;
 
 /// `vkCreateImage`: an ETC image is created in its substitute format on an
-/// emulating device, and every image that was created is described in the
-/// render pass registry when that is wanted.
+/// emulating device, every image that was created is described in the
+/// render pass registry when that is wanted, and with the screen-space
+/// reflections on, a candidate for the scene colour gets the usage they need
+/// (`ssr::widen_usage`).
 extern "C" fn create_image(
     device: *mut c_void,
     info: *const c_void,
@@ -1037,6 +1039,10 @@ extern "C" fn create_image(
     out: *mut u64,
 ) -> i32 {
     let Some(f) = CREATE_IMAGE.get::<CreateFn>() else { return VK_ERROR_INITIALIZATION_FAILED };
+    // The widened copy keeps every pointer of the engine's, and lives until
+    // the image is described below.
+    let widened = super::ssr::widen_usage(device, info);
+    let info = widened.as_ref().map_or(info, |w| w.as_ptr() as *const c_void);
     let rc = if info.is_null() || !device_is_emulating(device) {
         f(device, info, alloc, out)
     } else {

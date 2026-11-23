@@ -32,18 +32,21 @@
 //! * ETC2/EAC, on a GPU whose driver lacks it: a fixed set of format, image
 //!   and upload calls, answered by `vulkan_etc` and nowhere else.
 //! * Four device-level calls for the screenshot ([`capture_hook`]).
-//! * Only when `INTOXICATED_TRACE_PASSES` or dev control is on: render
-//!   passes, framebuffers, the commands that begin and end a pass, draws,
-//!   copies, image barriers and `vkQueueSubmit` ([`passes`]), and images and
-//!   views through `vulkan_etc`'s own hooks, which then serve every device.
-//!   For the frame trace and devctl's `depthshot`; each records what was
-//!   created, and costs a recording command one relaxed load while nothing
-//!   is watching.
+//! * Only when `INTOXICATED_TRACE_PASSES`, `INTOXICATED_SSR=1` or dev control
+//!   is on: render passes, framebuffers, the commands that begin and end a
+//!   pass, draws, copies, image barriers, `vkQueueSubmit`, the begin of a
+//!   command buffer and the compute binds ([`passes`]), and images and views
+//!   through `vulkan_etc`'s own hooks, which then serve every device. For the
+//!   frame trace, devctl's `depthshot` and the screen-space reflections
+//!   (`ssr`); each records what was created, and costs a recording command
+//!   one relaxed load while nothing is watching.
 //!
 //! Nothing else is touched: without those switches `vkQueueSubmit` and
 //! command recording go straight to the driver (ETC decodes at submit through
 //! its own hook). Vulkan objects of our own are made only for a devctl
-//! capture that was asked for (`frame_capture`, `depth_capture`).
+//! capture that was asked for (`frame_capture`, `depth_capture`) and for the
+//! reflections while they are on (`ssr`), which are also the one thing that
+//! records commands into the engine's own command buffers.
 //!
 //! Every slot below is process-wide and last write wins. The engine builds
 //! three RenderViews per session, each with its own instance, device, surface
@@ -477,6 +480,7 @@ fn capture_hook(name: &[u8], next: *mut c_void) -> *mut c_void {
 extern "C" fn vk_destroy_device(device: *mut c_void, allocator: *const c_void) {
     super::frame_capture::device_destroying(device);
     super::depth_capture::device_destroying(device);
+    super::ssr::device_destroying(device);
     passes::device_destroying(device);
     let f = NEXT_DESTROY_DEVICE.load(std::sync::atomic::Ordering::Relaxed);
     if f != 0 {

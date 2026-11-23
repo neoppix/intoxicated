@@ -6,15 +6,18 @@
 //!
 //! The hooks here, and the image and view hooks in `vulkan_etc` that feed
 //! the registry, are handed out only when [`wanted`]: `INTOXICATED_TRACE_PASSES`
-//! is set, or dev control is on (devctl `passes` and `depthshot` need them).
-//! Otherwise the getters hand out exactly what they did before.
+//! is set, `INTOXICATED_SSR=1`, or dev control is on (devctl `passes`,
+//! `depthshot` and `ssr` need them). Otherwise the getters hand out exactly
+//! what they did before.
 //!
 //! When they are handed out, the creation hooks (render passes,
 //! framebuffers, images, views) always describe what was created, which is
 //! rare and cheap next to the creation itself. The recording hooks (begin and
-//! end of a pass, draws, copies, barriers, submits) cost one relaxed load of
+//! end of a pass, draws, copies, barriers, submits, and the command buffer
+//! begin and compute binds the reflections follow) cost one relaxed load of
 //! [`WATCH`] and the forward, until something is watching: a trace for one
-//! frame, or a depth capture until it is taken.
+//! frame, a depth capture until it is taken, or the screen-space reflections
+//! (`android::ssr`) while they are on.
 //!
 //! # The trace
 //!
@@ -51,6 +54,7 @@ const DEFAULT_TRACE_AT: u64 = 600;
 pub(crate) static WATCH: AtomicU32 = AtomicU32::new(0);
 pub(crate) const WATCH_TRACE: u32 = 0x1;
 pub(crate) const WATCH_DEPTH: u32 = 0x2;
+pub(crate) const WATCH_SSR: u32 = 0x4;
 
 /// The present count at which the next trace starts; `u64::MAX` for none.
 static TRACE_AT: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -75,7 +79,11 @@ pub(crate) fn wanted() -> bool {
             TRACE_AT.store(n, Relaxed);
             println!("[android] vulkan: the render passes of the frame after present {n} will be traced ({TRACE_ENV})");
         }
-        at.is_some() || crate::devctl::enabled()
+        let ssr = crate::android::ssr::requested_at_start();
+        if ssr {
+            WATCH.fetch_or(WATCH_SSR, Relaxed);
+        }
+        at.is_some() || ssr || crate::devctl::enabled()
     })
 }
 
@@ -100,6 +108,7 @@ pub(crate) fn image_created(device: *mut c_void, info: *const c_void, image: u64
 pub(crate) fn image_destroyed(image: u64) {
     if wanted() && image != 0 {
         registry().images.remove(&image);
+        crate::android::ssr::image_destroyed(image);
     }
 }
 
@@ -343,6 +352,8 @@ pub(crate) fn on_present(presents: u64) {
     if w & WATCH_DEPTH != 0 {
         crate::android::depth_capture::frame_end(presents);
     }
+    // Also while off: objects it replaced are destroyed some presents later.
+    crate::android::ssr::frame_end(presents);
     if presents >= TRACE_AT.load(Relaxed) {
         TRACE_AT.store(u64::MAX, Relaxed);
         *recorder() = Some(Recorder::default());
@@ -673,6 +684,14 @@ slots!(
     PIPELINE_BARRIER2,
     QUEUE_SUBMIT,
     QUEUE_SUBMIT2,
+    BEGIN_COMMAND_BUFFER,
+    BIND_PIPELINE,
+    BIND_DESCRIPTOR_SETS,
+    PUSH_CONSTANTS,
+    PUSH_DESCRIPTOR_SET,
+    PUSH_DESCRIPTOR_SET_WITH_TEMPLATE,
+    BIND_DESCRIPTOR_BUFFERS,
+    BIND_SHADERS,
 );
 
 /// The function in `slot` as `F`, an `extern "C" fn` type matching the
@@ -729,6 +748,16 @@ fn ours(name: &[u8]) -> Option<(&'static AtomicUsize, *const ())> {
         b"vkCmdPipelineBarrier2" | b"vkCmdPipelineBarrier2KHR" => (&PIPELINE_BARRIER2, cmd_pipeline_barrier2 as *const ()),
         b"vkQueueSubmit" => (&QUEUE_SUBMIT, queue_submit as *const ()),
         b"vkQueueSubmit2" | b"vkQueueSubmit2KHR" => (&QUEUE_SUBMIT2, queue_submit2 as *const ()),
+        b"vkBeginCommandBuffer" => (&BEGIN_COMMAND_BUFFER, begin_command_buffer as *const ()),
+        b"vkCmdBindPipeline" => (&BIND_PIPELINE, cmd_bind_pipeline as *const ()),
+        b"vkCmdBindDescriptorSets" => (&BIND_DESCRIPTOR_SETS, cmd_bind_descriptor_sets as *const ()),
+        b"vkCmdPushConstants" => (&PUSH_CONSTANTS, cmd_push_constants as *const ()),
+        b"vkCmdPushDescriptorSetKHR" | b"vkCmdPushDescriptorSet" => (&PUSH_DESCRIPTOR_SET, cmd_push_descriptor_set as *const ()),
+        b"vkCmdPushDescriptorSetWithTemplateKHR" | b"vkCmdPushDescriptorSetWithTemplate" => {
+            (&PUSH_DESCRIPTOR_SET_WITH_TEMPLATE, cmd_push_descriptor_set_with_template as *const ())
+        }
+        b"vkCmdBindDescriptorBuffersEXT" => (&BIND_DESCRIPTOR_BUFFERS, cmd_bind_descriptor_buffers as *const ()),
+        b"vkCmdBindShadersEXT" => (&BIND_SHADERS, cmd_bind_shaders as *const ()),
         _ => return None,
     })
 }
@@ -860,7 +889,12 @@ unsafe fn pass_from_rendering(cmd: usize, info: *const c_void) -> Pass {
     )
 }
 
+/// Before the begin of a pass is forwarded. The reflections, when this is
+/// the pass they go in front of, record their work here.
 fn pass_begun(watch: u32, pass: Pass) {
+    if watch & WATCH_SSR != 0 {
+        crate::android::ssr::pass_begun(&pass);
+    }
     if watch & WATCH_DEPTH != 0 {
         crate::android::depth_capture::pass_begun(&pass);
     }
@@ -1031,6 +1065,13 @@ fn transfer(cmd: *mut c_void, what: &'static str, src: u64, src_layout: u32, dst
     if w & WATCH_DEPTH != 0 && dst != 0 {
         crate::android::depth_capture::written(dst);
     }
+    if w & WATCH_SSR != 0 && dst != 0 {
+        if what.starts_with("vkCmdResolveImage") {
+            crate::android::ssr::resolved(cmd, src, dst, dst_layout);
+        } else {
+            crate::android::ssr::written(cmd, dst);
+        }
+    }
 }
 
 /// `VkCopyImageInfo2`, `VkBlitImageInfo2` and `VkResolveImageInfo2` share
@@ -1121,6 +1162,9 @@ fn cleared(cmd: *mut c_void, what: &'static str, image: u64, layout: u32) {
     if w & WATCH_DEPTH != 0 {
         crate::android::depth_capture::written(image);
     }
+    if w & WATCH_SSR != 0 {
+        crate::android::ssr::written(cmd, image);
+    }
 }
 
 extern "C" fn cmd_clear_color_image(cmd: *mut c_void, image: u64, layout: u32, value: *const c_void, n: u32, ranges: *const c_void) {
@@ -1146,14 +1190,23 @@ extern "C" fn cmd_dispatch(cmd: *mut c_void, x: u32, y: u32, z: u32) {
     }
 }
 
-/// Image barriers, to the trace and to the depth capture, which follows the
-/// layout of the scene depth through them.
+/// Image barriers, to the trace and to the depth capture and the
+/// reflections, which follow the layouts of the scene images through them.
 fn barriers(watch: u32, list: Vec<Event>) {
     if watch & WATCH_DEPTH != 0 {
         for e in &list {
             if let Event::Barrier { image, new, .. } = e {
                 crate::android::depth_capture::barrier(*image, *new);
             }
+        }
+    }
+    if watch & WATCH_SSR != 0 {
+        if let Some(Event::Barrier { cmd, .. }) = list.first() {
+            let layouts = list.iter().filter_map(|e| match e {
+                Event::Barrier { image, new, .. } => Some((*image, *new)),
+                _ => None,
+            });
+            crate::android::ssr::barriers(*cmd as *mut c_void, layouts);
         }
     }
     if watch & WATCH_TRACE != 0 {
@@ -1286,6 +1339,122 @@ extern "C" fn queue_submit2(queue: *mut c_void, count: u32, submits: *const c_vo
     submit(&QUEUE_SUBMIT2, (64, 32, 40, 32, 16), queue, count, submits, fence)
 }
 
+// ------------------------------------------------------------ for the reflections
+//
+// The start of a recording, and the engine's compute state, which our
+// dispatch disturbs and puts back (see `android::ssr`). Graphics binds are
+// forwarded after one comparison.
+
+fn ssr_watching() -> bool {
+    WATCH.load(Relaxed) & WATCH_SSR != 0
+}
+
+extern "C" fn begin_command_buffer(cmd: *mut c_void, info: *const c_void) -> i32 {
+    let Some(f) = next::<extern "C" fn(*mut c_void, *const c_void) -> i32>(&BEGIN_COMMAND_BUFFER) else {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    };
+    let rc = f(cmd, info);
+    if rc == VK_SUCCESS && ssr_watching() {
+        crate::android::ssr::cmd_begun(cmd);
+    }
+    rc
+}
+
+extern "C" fn cmd_bind_pipeline(cmd: *mut c_void, bind_point: u32, pipeline: u64) {
+    if bind_point == crate::android::ssr::BIND_POINT_COMPUTE && ssr_watching() {
+        crate::android::ssr::compute(cmd, |c| c.bind_pipeline(pipeline));
+    }
+    if let Some(f) = next::<extern "C" fn(*mut c_void, u32, u64)>(&BIND_PIPELINE) {
+        f(cmd, bind_point, pipeline);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "C" fn cmd_bind_descriptor_sets(
+    cmd: *mut c_void,
+    bind_point: u32,
+    layout: u64,
+    first: u32,
+    count: u32,
+    sets: *const u64,
+    dynamic_count: u32,
+    dynamic: *const u32,
+) {
+    if bind_point == crate::android::ssr::BIND_POINT_COMPUTE && ssr_watching() {
+        // SAFETY: the engine's arrays of `count` sets and `dynamic_count`
+        // offsets, read during its own call.
+        let (sets_v, dynamic_v) = unsafe {
+            (
+                if sets.is_null() { Vec::new() } else { std::slice::from_raw_parts(sets, count as usize).to_vec() },
+                if dynamic.is_null() { Vec::new() } else { std::slice::from_raw_parts(dynamic, dynamic_count as usize).to_vec() },
+            )
+        };
+        crate::android::ssr::compute(cmd, |c| {
+            c.bind_sets(crate::android::ssr::SetBind { layout, first, sets: sets_v, dynamic: dynamic_v })
+        });
+    }
+    type Fn_ = extern "C" fn(*mut c_void, u32, u64, u32, u32, *const u64, u32, *const u32);
+    if let Some(f) = next::<Fn_>(&BIND_DESCRIPTOR_SETS) {
+        f(cmd, bind_point, layout, first, count, sets, dynamic_count, dynamic);
+    }
+}
+
+extern "C" fn cmd_push_constants(cmd: *mut c_void, layout: u64, stages: u32, offset: u32, size: u32, values: *const c_void) {
+    if stages & crate::android::ssr::SHADER_STAGE_COMPUTE != 0 && !values.is_null() && ssr_watching() {
+        // SAFETY: the engine's `size` bytes, read during its own call.
+        let bytes = unsafe { std::slice::from_raw_parts(values as *const u8, size as usize) }.to_vec();
+        crate::android::ssr::compute(cmd, |c| c.push(crate::android::ssr::Push { layout, stages, offset, bytes }));
+    }
+    if let Some(f) = next::<extern "C" fn(*mut c_void, u64, u32, u32, u32, *const c_void)>(&PUSH_CONSTANTS) {
+        f(cmd, layout, stages, offset, size, values);
+    }
+}
+
+/// Compute state the reflections cannot put back: the command buffer is
+/// left alone from then on.
+fn unrestorable(cmd: *mut c_void, why: &'static str) {
+    if ssr_watching() {
+        crate::android::ssr::compute(cmd, |c| c.unrestorable = Some(why));
+    }
+}
+
+extern "C" fn cmd_push_descriptor_set(cmd: *mut c_void, bind_point: u32, layout: u64, set: u32, count: u32, writes: *const c_void) {
+    if bind_point == crate::android::ssr::BIND_POINT_COMPUTE {
+        unrestorable(cmd, "the engine pushed descriptors for compute");
+    }
+    if let Some(f) = next::<extern "C" fn(*mut c_void, u32, u64, u32, u32, *const c_void)>(&PUSH_DESCRIPTOR_SET) {
+        f(cmd, bind_point, layout, set, count, writes);
+    }
+}
+
+extern "C" fn cmd_push_descriptor_set_with_template(cmd: *mut c_void, template: u64, layout: u64, set: u32, data: *const c_void) {
+    // The bind point is inside the template, which is not followed.
+    unrestorable(cmd, "the engine pushed descriptors with a template");
+    if let Some(f) = next::<extern "C" fn(*mut c_void, u64, u64, u32, *const c_void)>(&PUSH_DESCRIPTOR_SET_WITH_TEMPLATE) {
+        f(cmd, template, layout, set, data);
+    }
+}
+
+extern "C" fn cmd_bind_descriptor_buffers(cmd: *mut c_void, count: u32, infos: *const c_void) {
+    unrestorable(cmd, "the engine uses descriptor buffers");
+    if let Some(f) = next::<extern "C" fn(*mut c_void, u32, *const c_void)>(&BIND_DESCRIPTOR_BUFFERS) {
+        f(cmd, count, infos);
+    }
+}
+
+extern "C" fn cmd_bind_shaders(cmd: *mut c_void, count: u32, stages: *const u32, shaders: *const u64) {
+    if !stages.is_null() && ssr_watching() {
+        // SAFETY: the engine's array of `count` stages.
+        let list = unsafe { std::slice::from_raw_parts(stages, count as usize) };
+        if list.iter().any(|&s| s & crate::android::ssr::SHADER_STAGE_COMPUTE != 0) {
+            unrestorable(cmd, "the engine binds compute shader objects");
+        }
+    }
+    if let Some(f) = next::<extern "C" fn(*mut c_void, u32, *const u32, *const u64)>(&BIND_SHADERS) {
+        f(cmd, count, stages, shaders);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1387,7 +1556,9 @@ mod tests {
     #[test]
     fn nothing_is_hooked_for_a_name_that_is_not_traced_or_missing() {
         let p = 0x1234 as *mut c_void;
-        assert_eq!(hook(b"vkCmdBindPipeline", p), p);
+        assert_eq!(hook(b"vkCmdSetViewport", p), p);
+        assert!(ours(b"vkCmdSetViewport").is_none() && ours(b"vkCmdBindVertexBuffers").is_none());
+        assert!(ours(b"vkCmdBindPipeline").is_some() && ours(b"vkBeginCommandBuffer").is_some(), "for the reflections");
         assert!(hook(b"vkCmdDraw", std::ptr::null_mut()).is_null());
         assert!(ours(b"vkCmdDraw").is_some() && ours(b"vkCmdBeginRenderPass2KHR").is_some());
         assert!(ours(b"vkCreateImage").is_none(), "images are vulkan_etc's single hook");

@@ -410,6 +410,39 @@ env:
                                      grayscale PNG, with a screenshot of the
                                      same frame and the raw floats beside it);
                                      without either they are not installed
+  INTOXICATED_SSR=1                  screen-space reflections (experimental):
+                                     wet-ground style reflections drawn into
+                                     the 3D scene before the HUD, by compute
+                                     passes of ours recorded into the engine's
+                                     own command buffer. Off by default. With
+                                     INTOXICATED_DEV_CONTROL, devctl's ssr
+                                     on|off|stats|get|reset|set <name> <value>
+                                     changes them live and reports their GPU
+                                     time. The looks below are the names set
+                                     takes, in lower case
+  INTOXICATED_SSR_INTENSITY=<0..1>   how much reflection is blended in (0.5)
+  INTOXICATED_SSR_ROUGHNESS=<0..1>   blur of the reflection, growing with
+                                     distance (0, sharp)
+  INTOXICATED_SSR_FRESNEL=<0..1>     0 the same at every angle like a mirror,
+                                     1 strong only at grazing angles (0.85)
+  INTOXICATED_SSR_UP_ONLY=<0|1>      1 only surfaces facing up are wet, 0
+                                     every surface (1)
+  INTOXICATED_SSR_UP_THRESHOLD=<0..1>
+                                     how upright a surface must be, as the
+                                     cosine of its angle from up (0.6)
+  INTOXICATED_SSR_MAX_DISTANCE=<x>   longest ray in multiples of the
+                                     surface's distance from the camera; 0 no
+                                     limit, sky included (0)
+  INTOXICATED_SSR_EDGE_FADE=<0..0.5> fade at the screen edges, as a fraction
+                                     of the smaller side (0.08)
+  INTOXICATED_SSR_DARKEN=<0..1>      how much darker wet surfaces are (0)
+  INTOXICATED_SSR_TINT=<r,g,b>       colour wet surfaces are multiplied by,
+                                     each 0 to 2 (1,1,1)
+  INTOXICATED_SSR_STEPS=<4..64>      steps along each ray (32)
+  INTOXICATED_SSR_THICKNESS=<x>      how far behind a surface a ray still
+                                     hits it, relative to its distance (0.06)
+  INTOXICATED_SSR_FOV=<degrees>      the camera's vertical field of view the
+                                     reflections assume (70, Roblox's default)
   INTOXICATED_FILES_DIR=<dir>        the engine's data root (default
                                      <profile>/data): its files/ and cache/
   INTOXICATED_EARLY_DIRS=<keys>      directory setters sent before
