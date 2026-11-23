@@ -18,6 +18,7 @@
 
 #include <QApplication>
 #include <QCoreApplication>
+#include <QLoggingCategory>
 
 #include <cstdio>
 #include <cstring>
@@ -31,6 +32,10 @@ const char *kUsage = "usage: intoxicated-settings [--page play|fastflags|client|
 } // namespace
 
 int main(int argc, char **argv) {
+    // Without a desktop portal (i3 and other plain window managers run none)
+    // Qt warns at every start that it could not register with one. Nothing
+    // here needs it: file dialogs fall back to Qt's own.
+    QLoggingCategory::setFilterRules(QStringLiteral("qt.qpa.services.warning=false"));
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--self-test") == 0) {
             QCoreApplication app(argc, argv);
