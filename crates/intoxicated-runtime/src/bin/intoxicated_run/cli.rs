@@ -416,15 +416,21 @@ env:
                                      passes of ours recorded into the engine's
                                      own command buffer. Off by default. With
                                      INTOXICATED_DEV_CONTROL, devctl's ssr
-                                     on|off|stats|get|reset|set <name> <value>
-                                     changes them live and reports their GPU
-                                     time. The looks below are the names set
-                                     takes, in lower case
-  INTOXICATED_SSR_INTENSITY=<0..1>   how much reflection is blended in (0.5)
+                                     on|off|stats|get|reset|look <name>|set
+                                     <name> <value> changes them live and
+                                     reports their GPU time. The looks below
+                                     are the names set takes, in lower case;
+                                     the defaults are a faint, soft look
+                                     tuned on Timebomb Duels
+  INTOXICATED_SSR_LOOK=<name>        start from a named look: competitive
+                                     (the defaults), wet_road, clean_mirror,
+                                     puddles or glossy; the variables below
+                                     change it
+  INTOXICATED_SSR_INTENSITY=<0..1>   how much reflection is blended in (0.4)
   INTOXICATED_SSR_ROUGHNESS=<0..1>   blur of the reflection, growing with
-                                     distance (0, sharp)
+                                     distance (0.4; 0 is still slightly soft)
   INTOXICATED_SSR_FRESNEL=<0..1>     0 the same at every angle like a mirror,
-                                     1 strong only at grazing angles (0.85)
+                                     1 strong only at grazing angles (0.9)
   INTOXICATED_SSR_UP_ONLY=<0|1>      1 only surfaces facing up are wet, 0
                                      every surface (1)
   INTOXICATED_SSR_UP_THRESHOLD=<0..1>
@@ -434,7 +440,7 @@ env:
                                      surface's distance from the camera; 0 no
                                      limit, sky included (0)
   INTOXICATED_SSR_EDGE_FADE=<0..0.5> fade at the screen edges, as a fraction
-                                     of the smaller side (0.08)
+                                     of the smaller side (0.1)
   INTOXICATED_SSR_DARKEN=<0..1>      how much darker wet surfaces are (0)
   INTOXICATED_SSR_TINT=<r,g,b>       colour wet surfaces are multiplied by,
                                      each 0 to 2 (1,1,1)
@@ -443,6 +449,10 @@ env:
                                      hits it, relative to its distance (0.06)
   INTOXICATED_SSR_FOV=<degrees>      the camera's vertical field of view the
                                      reflections assume (70, Roblox's default)
+  INTOXICATED_SSR_KEEP_COLOUR=<0..1> 0 the reflection has the colours it
+                                     reflects, 1 their brightness in the hue
+                                     of the wet surface, so water stays blue
+                                     (0.5)
   INTOXICATED_FILES_DIR=<dir>        the engine's data root (default
                                      <profile>/data): its files/ and cache/
   INTOXICATED_EARLY_DIRS=<keys>      directory setters sent before

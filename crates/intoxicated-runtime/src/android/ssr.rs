@@ -44,11 +44,14 @@
 //! A barrier that waits for the scene; one compute dispatch (`ssr/depth.comp`)
 //! that copies sample 0 of the scene depth into a single-sample R32F image of
 //! ours, which the march reads far faster than the multisampled original;
-//! a second (`ssr/ssr.comp`) that reads the scene colour and that depth and
-//! writes every pixel, with a reflection blended in or unchanged, packed in
-//! the engine's colour format into a 32-bit image of ours; a copy of that
-//! image over the engine's; and a barrier that puts the engine's image back
-//! in the layout it was in. Reading needs `SAMPLED` and the copy
+//! a second (`ssr/ssr.comp`, the trace) that marches every wet pixel's
+//! reflected ray through that depth and writes the colour it found and how
+//! strongly it shows into an RGBA16F image of ours; a third (the same source
+//! with `COMPOSE`) that blurs that over the pixel's own surface, blends it
+//! into the scene colour and writes every pixel, with a reflection blended in
+//! or unchanged, packed in the engine's colour format into a 32-bit image of
+//! ours; a copy of that image over the engine's; and a barrier that puts the
+//! engine's image back in the layout it was in. Reading needs `SAMPLED` and the copy
 //! `TRANSFER_DST` on the engine's image; a resolve target has both (it was
 //! seen with `0x17`), and with SSR on, a candidate image created without them
 //! gets them added at `vkCreateImage` when its format supports them
@@ -78,22 +81,29 @@
 //! Every look is a runtime parameter ([`KNOBS`]): intensity, roughness (a
 //! blur of the reflected colour that grows with the ray's length), Fresnel
 //! strength, up-facing surfaces only or all and the threshold for "up", the
-//! ray's maximum length, the fade at the screen edges, and how much wet
-//! surfaces are darkened and tinted; also the march's steps and thickness
-//! and the camera's field of view. Each has an `INTOXICATED_SSR_*` variable
-//! and is changed live with devctl `ssr set <name> <value>`. They reach the
-//! shader as push constants ([`Params`]), recorded with each frame.
+//! ray's maximum length, the fade at the screen edges, how much wet surfaces
+//! are darkened and tinted and how much of their own colour the reflection
+//! takes; also the march's steps and thickness and the camera's field of
+//! view. Each has an `INTOXICATED_SSR_*` variable and is changed live with
+//! devctl `ssr set <name> <value>`. They reach the shader as push constants
+//! ([`Params`]), recorded with each frame. [`LOOKS`] names whole sets of
+//! them (`INTOXICATED_SSR_LOOK`, devctl `ssr look <name>`).
+//!
+//! Whatever the knobs, a reflection is never sharper than the compose's
+//! blur, and a hit fades rather than cuts out where it is doubtful: behind
+//! the surface it hit, on an edge of it, at the end of a finite ray, near the
+//! screen edge, or on a surface seen nearly edge on.
 //!
 //! # Our objects
 //!
 //! Made on the render thread at the first matched frame of a device and kept
-//! until `vkDestroyDevice`: three pipelines (the depth copy for a
-//! multisampled and a single-sample depth, and the reflections), their
-//! layout, two samplers, a descriptor pool, a query pool, the depth copy and
-//! the 32-bit image. Views of the engine's images and the descriptor sets
+//! until `vkDestroyDevice`: four pipelines (the depth copy for a
+//! multisampled and a single-sample depth, the trace and the compose), their
+//! layout, two samplers, a descriptor pool, a query pool, the depth copy, the
+//! trace and the 32-bit image. Views of the engine's images and the descriptor sets
 //! that name them are made when first needed and dropped when the engine
 //! destroys the image. When the scene changes size (a swapchain resize) our
-//! two images are made again and the old ones destroyed some presents
+//! three images are made again and the old ones destroyed some presents
 //! later, when no frame in flight can still use them.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -147,26 +157,28 @@ const fn knob(name: &'static str, env: &'static str, kind: Kind, default: [f32; 
 }
 
 /// Every look, in the order `ssr get` lists them. The defaults are the
-/// look measured on Natural Disaster Survival; presets are for the settings
-/// app to build from these.
-pub(crate) const KNOBS: [Knob; 12] = [
+/// look measured on Timebomb Duels (place 11379739543), a competitive game:
+/// a faint, soft reflection on floors only that adds depth without drawing
+/// the eye, never a sharp mirror. [`LOOKS`] has the others.
+pub(crate) const KNOBS: [Knob; 13] = [
     // How much of the reflection is blended in.
-    knob("intensity", "INTOXICATED_SSR_INTENSITY", Kind::Number { min: 0.0, max: 1.0 }, [0.5; 3], 0),
-    // Blur of the reflected colour, more the further the ray went.
-    knob("roughness", "INTOXICATED_SSR_ROUGHNESS", Kind::Number { min: 0.0, max: 1.0 }, [0.0; 3], 1),
+    knob("intensity", "INTOXICATED_SSR_INTENSITY", Kind::Number { min: 0.0, max: 1.0 }, [INTENSITY; 3], 0),
+    // Blur of the reflected colour, more the further the ray went, and a
+    // wider spacing of the compose's blur.
+    knob("roughness", "INTOXICATED_SSR_ROUGHNESS", Kind::Number { min: 0.0, max: 1.0 }, [ROUGHNESS; 3], 1),
     // 0: the same at every angle, like a mirror; 1: strong only at grazing
     // angles.
-    knob("fresnel", "INTOXICATED_SSR_FRESNEL", Kind::Number { min: 0.0, max: 1.0 }, [0.85; 3], 2),
+    knob("fresnel", "INTOXICATED_SSR_FRESNEL", Kind::Number { min: 0.0, max: 1.0 }, [FRESNEL; 3], 2),
     // 1: only surfaces that face up are wet; 0: every surface.
     knob("up_only", "INTOXICATED_SSR_UP_ONLY", Kind::Switch, [1.0; 3], 3),
     // The cosine of the angle from straight up at which a surface counts as
     // facing up (faded over 0.15 either side), in view space.
-    knob("up_threshold", "INTOXICATED_SSR_UP_THRESHOLD", Kind::Number { min: 0.0, max: 1.0 }, [0.6; 3], 4),
+    knob("up_threshold", "INTOXICATED_SSR_UP_THRESHOLD", Kind::Number { min: 0.0, max: 1.0 }, [UP_THRESHOLD; 3], 4),
     // The longest ray, in multiples of the surface's distance from the
     // camera; 0 for no limit (and the sky).
     knob("max_distance", "INTOXICATED_SSR_MAX_DISTANCE", Kind::Number { min: 0.0, max: 1000.0 }, [0.0; 3], 5),
     // Fade towards the screen edges, as a fraction of the smaller side.
-    knob("edge_fade", "INTOXICATED_SSR_EDGE_FADE", Kind::Number { min: 0.0, max: 0.5 }, [0.08; 3], 6),
+    knob("edge_fade", "INTOXICATED_SSR_EDGE_FADE", Kind::Number { min: 0.0, max: 0.5 }, [EDGE_FADE; 3], 6),
     // How much darker wet surfaces are.
     knob("darken", "INTOXICATED_SSR_DARKEN", Kind::Number { min: 0.0, max: 1.0 }, [0.0; 3], 7),
     // The colour wet surfaces are multiplied by.
@@ -175,14 +187,27 @@ pub(crate) const KNOBS: [Knob; 12] = [
     // quality for GPU time.
     knob("steps", "INTOXICATED_SSR_STEPS", Kind::Whole { min: 4, max: 64 }, [32.0; 3], 11),
     // How far behind a drawn surface a ray may be and still hit it, as a
-    // fraction of the surface's distance.
+    // fraction of the surface's distance; hits fade out over the second
+    // half of it.
     knob("thickness", "INTOXICATED_SSR_THICKNESS", Kind::Number { min: 0.005, max: 1.0 }, [0.06; 3], 12),
     // The camera's vertical field of view in degrees; Roblox's default
     // `Camera.FieldOfView` is 70.
     knob("fov", "INTOXICATED_SSR_FOV", Kind::Number { min: 10.0, max: 150.0 }, [70.0; 3], 13),
+    // 0: the reflection has the colours of what it reflects; 1: their
+    // brightness in the hue of the surface it lies on, so water stays blue
+    // (INFERRED: Timebomb Duels has no water to try it on).
+    knob("keep_colour", "INTOXICATED_SSR_KEEP_COLOUR", Kind::Number { min: 0.0, max: 1.0 }, [KEEP_COLOUR; 3], 14),
 ];
 
-const SLOTS: usize = 14;
+// The competitive defaults, shared with the look of that name.
+const INTENSITY: f32 = 0.4;
+const ROUGHNESS: f32 = 0.4;
+const FRESNEL: f32 = 0.9;
+const UP_THRESHOLD: f32 = 0.6;
+const EDGE_FADE: f32 = 0.1;
+const KEEP_COLOUR: f32 = 0.5;
+
+const SLOTS: usize = 15;
 
 static ON: AtomicBool = AtomicBool::new(false);
 
@@ -191,6 +216,88 @@ static VALUES: [AtomicU32; SLOTS] = [const { AtomicU32::new(0) }; SLOTS];
 
 pub(crate) fn find(name: &str) -> Option<&'static Knob> {
     KNOBS.iter().find(|k| k.name == name)
+}
+
+/// The variable that starts from a look; the knobs' own variables then
+/// change it.
+pub const LOOK_ENV: &str = "INTOXICATED_SSR_LOOK";
+
+/// A named set of knob values, for the settings app's Shaders page,
+/// [`LOOK_ENV`] and devctl `ssr look <name>`. A look sets every knob it
+/// names to its value here and every other one to its default, but for the
+/// knobs in [`NOT_A_LOOK`], which stay as they are.
+pub(crate) struct Look {
+    pub name: &'static str,
+    pub values: &'static [(&'static str, [f32; 3])],
+}
+
+/// Quality for GPU time and the camera, not how the reflections look.
+const NOT_A_LOOK: [&str; 3] = ["steps", "thickness", "fov"];
+
+/// The looks, the default first. Only the default was tuned in game, on
+/// Timebomb Duels; the others are starting points whose look is INFERRED
+/// (`ssr look wet_road` was applied live there, not judged).
+pub(crate) const LOOKS: [Look; 5] = [
+    // Faint and soft, floors only: depth without distraction.
+    Look { name: "competitive", values: &[] },
+    // Darker, slightly blue wet tarmac with a clear, fairly strong reflection.
+    Look {
+        name: "wet_road",
+        values: &[
+            ("intensity", [0.55; 3]),
+            ("roughness", [0.25; 3]),
+            ("fresnel", [0.8; 3]),
+            ("darken", [0.3; 3]),
+            ("tint", [0.92, 0.95, 1.0]),
+            ("keep_colour", [0.3; 3]),
+        ],
+    },
+    // As sharp as the compose's blur allows, strong at every angle.
+    Look {
+        name: "clean_mirror",
+        values: &[("intensity", [0.9; 3]), ("roughness", [0.0; 3]), ("fresnel", [0.3; 3]), ("keep_colour", [0.0; 3])],
+    },
+    // Only the flattest floors, darkened, with a strong and fairly clear
+    // reflection.
+    Look {
+        name: "puddles",
+        values: &[
+            ("intensity", [0.7; 3]),
+            ("roughness", [0.15; 3]),
+            ("fresnel", [0.6; 3]),
+            ("up_threshold", [0.85; 3]),
+            ("darken", [0.15; 3]),
+            ("keep_colour", [0.2; 3]),
+        ],
+    },
+    // Every surface a little glossy, walls too, in its own colour.
+    Look {
+        name: "glossy",
+        values: &[("intensity", [0.4; 3]), ("roughness", [0.2; 3]), ("fresnel", [0.9; 3]), ("up_only", [0.0; 3]), ("keep_colour", [0.7; 3])],
+    },
+];
+
+/// What look `name` does to each knob, in [`KNOBS`] order: its new value, or
+/// `None` to leave it.
+pub(crate) fn look_values(name: &str) -> Option<Vec<Option<[f32; 3]>>> {
+    let look = LOOKS.iter().find(|l| l.name == name)?;
+    Some(
+        KNOBS
+            .iter()
+            .map(|k| {
+                let named = look.values.iter().find(|(n, _)| *n == k.name).map(|&(_, v)| v);
+                if NOT_A_LOOK.contains(&k.name) {
+                    named
+                } else {
+                    Some(named.unwrap_or(k.default))
+                }
+            })
+            .collect(),
+    )
+}
+
+fn look_names() -> String {
+    LOOKS.iter().map(|l| l.name).collect::<Vec<_>>().join(" ")
 }
 
 impl Knob {
@@ -273,13 +380,27 @@ pub(crate) fn parse_settings(var: impl Fn(&str) -> Option<String>) -> Settings {
             false
         }
     };
+    let start: Vec<[f32; 3]> = match var(LOOK_ENV).as_deref().map(str::trim) {
+        None | Some("") => KNOBS.iter().map(|k| k.default).collect(),
+        Some(name) => match look_values(name) {
+            Some(look) => KNOBS.iter().zip(look).map(|(k, v)| v.unwrap_or(k.default)).collect(),
+            None => {
+                warnings.push(format!(
+                    "[android] vulkan: ssr: {LOOK_ENV}={name:?} is not a look ({}); using the defaults",
+                    look_names()
+                ));
+                KNOBS.iter().map(|k| k.default).collect()
+            }
+        },
+    };
     let values = KNOBS
         .iter()
-        .map(|k| match var(k.env).filter(|v| !v.trim().is_empty()) {
-            None => k.default,
+        .zip(start)
+        .map(|(k, start)| match var(k.env).filter(|v| !v.trim().is_empty()) {
+            None => start,
             Some(v) => k.parse(&v).unwrap_or_else(|why| {
-                warnings.push(format!("[android] vulkan: ssr: {}: {why}; using {}", k.env, k.show(k.default)));
-                k.default
+                warnings.push(format!("[android] vulkan: ssr: {}: {why}; using {}", k.env, k.show(start)));
+                start
             }),
         })
         .collect();
@@ -332,13 +453,16 @@ pub(crate) enum Command {
     Set(&'static str, [f32; 3]),
     /// Every knob back to its built-in default.
     Reset,
+    /// A look from [`LOOKS`], by name.
+    Look(&'static str),
     /// The knobs' values.
     Get,
     Stats,
 }
 
-pub(crate) const USAGE: &str = "ssr on|off|stats|get|reset|intensity <0..1>|set <name> <value>; names: intensity roughness \
-     fresnel up_only up_threshold max_distance edge_fade darken tint steps thickness fov";
+pub(crate) const USAGE: &str = "ssr on|off|stats|get|reset|look <name>|intensity <0..1>|set <name> <value>; names: \
+     intensity roughness fresnel up_only up_threshold max_distance edge_fade darken tint steps thickness fov keep_colour; \
+     looks: competitive wet_road clean_mirror puddles glossy";
 
 pub(crate) fn parse_command(args: &[&str]) -> Result<Command, String> {
     let set = |name: &str, v: &str| {
@@ -351,6 +475,10 @@ pub(crate) fn parse_command(args: &[&str]) -> Result<Command, String> {
         [] | ["stats"] => Ok(Command::Stats),
         ["get"] => Ok(Command::Get),
         ["reset"] => Ok(Command::Reset),
+        ["look", name] => match LOOKS.iter().find(|l| l.name == *name) {
+            Some(l) => Ok(Command::Look(l.name)),
+            None => Err(format!("no look {name:?}; looks: {}", look_names())),
+        },
         ["intensity", v] => set("intensity", v),
         ["set", name, v] => set(name, v),
         _ => Err(USAGE.into()),
@@ -370,6 +498,14 @@ pub fn control(args: &[&str]) -> Result<String, String> {
         Command::Off => set_on(false),
         Command::Set(name, v) => find(name).expect("parsed from the table").set(v),
         Command::Reset => KNOBS.iter().for_each(|k| k.set(k.default)),
+        Command::Look(name) => {
+            let look = look_values(name).expect("parsed from the table");
+            for (k, v) in KNOBS.iter().zip(look) {
+                if let Some(v) = v {
+                    k.set(v);
+                }
+            }
+        }
         Command::Get => return Ok(format!("on={} {}", u8::from(ON.load(Relaxed)), values_line())),
         Command::Stats => {}
     }
@@ -699,6 +835,7 @@ const FORMAT_A2R10G10B10_UNORM: u32 = 58;
 const FORMAT_A2B10G10R10_UNORM: u32 = 64;
 const FORMAT_R32_UINT: u32 = 98;
 const FORMAT_R32_SFLOAT: u32 = 100;
+const FORMAT_R16G16B16A16_SFLOAT: u32 = 97;
 
 const LAYOUT_UNDEFINED: u32 = 0;
 const LAYOUT_GENERAL: u32 = 1;
@@ -813,6 +950,7 @@ pub(crate) struct Params {
     pub max_distance: f32,
     pub edge_fade: f32,
     pub darken: f32,
+    pub keep_colour: f32,
 }
 
 /// `flags` bit 0.
@@ -851,6 +989,7 @@ pub(crate) fn params(extent: [u32; 2], values: &[[f32; 3]], mode: u32) -> Params
         max_distance: v("max_distance")[0],
         edge_fade: v("edge_fade")[0],
         darken: v("darken")[0],
+        keep_colour: v("keep_colour")[0],
     }
 }
 
@@ -865,8 +1004,10 @@ pub(crate) fn changes_nothing(values: &[[f32; 3]]) -> bool {
 const SPIRV_DEPTH_MS: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_depth_ms.spv.rs"));
 /// The same for a single-sample one.
 const SPIRV_DEPTH_1X: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_depth_1x.spv.rs"));
-/// `ssr/ssr.comp`.
+/// `ssr/ssr.comp`: the trace.
 const SPIRV_SSR: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_ssr.spv.rs"));
+/// `ssr/ssr.comp` with `COMPOSE`.
+const SPIRV_COMPOSE: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_compose.spv.rs"));
 
 /// The device-level commands used here, straight from the driver, so none of
 /// them passes through the layer's own hooks or shows in a trace.
@@ -1046,11 +1187,13 @@ struct Owned {
     view: u64,
 }
 
-/// Our two images of the scene's size: the depth copy `depth.comp` writes
-/// (R32F) and the result `ssr.comp` writes (R32_UINT, copied to the
+/// Our three images of the scene's size: the depth copy `depth.comp` writes
+/// (R32F), the trace (RGBA16F, written by the trace and sampled by the
+/// compose) and the result the compose writes (R32_UINT, copied to the
 /// engine's image).
 struct Output {
     depth: Owned,
+    trace: Owned,
     result: Owned,
     extent: [u32; 2],
 }
@@ -1082,10 +1225,10 @@ struct Gpu {
     sampler_nearest: u64,
     set_layout: u64,
     pipeline_layout: u64,
-    /// The depth copy of a multisampled depth, of a single-sample one, and
-    /// the reflections.
-    shaders: [u64; 3],
-    pipelines: [u64; 3],
+    /// The depth copy of a multisampled depth, of a single-sample one, the
+    /// trace and the compose.
+    shaders: [u64; 4],
+    pipelines: [u64; 4],
     descriptor_pool: u64,
     query_pool: u64,
     pending: [bool; RING],
@@ -1113,6 +1256,7 @@ impl Gpu {
 
     fn destroy_output(&self, o: &Output) {
         self.destroy_owned(&o.depth);
+        self.destroy_owned(&o.trace);
         self.destroy_owned(&o.result);
     }
 
@@ -1195,9 +1339,10 @@ impl Gpu {
             self.sets.retain(|k, _| k.output != view);
             self.retired.push(Retired { at: presents, output: Some(old), sets });
         }
-        let mut o = Output { depth: Owned::default(), result: Owned::default(), extent };
+        let mut o = Output { depth: Owned::default(), trace: Owned::default(), result: Owned::default(), extent };
         let made = self
             .make_image(&mut o.depth, extent, FORMAT_R32_SFLOAT, USAGE_STORAGE)
+            .and_then(|()| self.make_image(&mut o.trace, extent, FORMAT_R16G16B16A16_SFLOAT, USAGE_STORAGE | USAGE_SAMPLED))
             .and_then(|()| self.make_image(&mut o.result, extent, FORMAT_R32_UINT, USAGE_STORAGE | USAGE_TRANSFER_SRC));
         if let Err(e) = made {
             self.destroy_output(&o);
@@ -1262,8 +1407,8 @@ impl Gpu {
         if let Some(&s) = self.sets.get(&key) {
             return Ok(s);
         }
-        let depth_copy = match &self.output {
-            Some(o) if o.result.view == key.output => o.depth.view,
+        let (depth_copy, trace) = match &self.output {
+            Some(o) if o.result.view == key.output => (o.depth.view, o.trace.view),
             _ => return Err("the descriptor set names images of ours that are gone".into()),
         };
         let none = std::ptr::null();
@@ -1279,12 +1424,15 @@ impl Gpu {
         if rc != VK_SUCCESS {
             return Err(format!("vkAllocateDescriptorSets failed ({rc}); {} sets are in use", self.sets.len()));
         }
-        // 0 the engine's colour, 1 its depth, 2 our depth copy, 3 our result.
+        // 0 the engine's colour, 1 its depth, 2 our depth copy, 3 our result,
+        // 4 the trace written and 5 the same read filtered.
         let images = [
             DescriptorImageInfo { sampler: self.sampler_linear, view: self.views[&key.color], layout: key.color_layout as i32 },
             DescriptorImageInfo { sampler: self.sampler_nearest, view: self.views[&key.depth], layout: key.depth_layout as i32 },
             DescriptorImageInfo { sampler: 0, view: depth_copy, layout: LAYOUT_GENERAL as i32 },
             DescriptorImageInfo { sampler: 0, view: key.output, layout: LAYOUT_GENERAL as i32 },
+            DescriptorImageInfo { sampler: 0, view: trace, layout: LAYOUT_GENERAL as i32 },
+            DescriptorImageInfo { sampler: self.sampler_linear, view: trace, layout: LAYOUT_GENERAL as i32 },
         ];
         let write = |binding: u32, kind: u32| WriteDescriptorSet {
             s_type: ST_WRITE_DESCRIPTOR_SET,
@@ -1303,6 +1451,8 @@ impl Gpu {
             write(1, DESCRIPTOR_COMBINED_IMAGE_SAMPLER),
             write(2, DESCRIPTOR_STORAGE_IMAGE),
             write(3, DESCRIPTOR_STORAGE_IMAGE),
+            write(4, DESCRIPTOR_STORAGE_IMAGE),
+            write(5, DESCRIPTOR_COMBINED_IMAGE_SAMPLER),
         ];
         (self.fns.update_descriptor_sets)(self.dev(), writes.len() as u32, writes.as_ptr(), 0, none);
         self.sets.insert(key, set);
@@ -1390,6 +1540,10 @@ fn create_gpu(device: usize) -> Result<Gpu, String> {
         Some(f) if f & FEATURE_STORAGE_IMAGE != 0 => {}
         _ => return Err("R32_SFLOAT cannot be a storage image on this device".into()),
     }
+    match optimal_features(physical, FORMAT_R16G16B16A16_SFLOAT) {
+        Some(f) if f & FEATURE_STORAGE_IMAGE != 0 && f & FEATURE_SAMPLED_IMAGE != 0 => {}
+        _ => return Err("R16G16B16A16_SFLOAT cannot be a storage and a sampled image on this device".into()),
+    }
     let fns = Fns::resolve(device as Dev)?;
     let mp = super::vk_layer::host_instance_proc(c"vkGetPhysicalDeviceMemoryProperties");
     if mp.is_null() {
@@ -1415,8 +1569,8 @@ fn create_gpu(device: usize) -> Result<Gpu, String> {
         sampler_nearest: 0,
         set_layout: 0,
         pipeline_layout: 0,
-        shaders: [0; 3],
-        pipelines: [0; 3],
+        shaders: [0; 4],
+        pipelines: [0; 4],
         descriptor_pool: 0,
         query_pool: 0,
         pending: [false; RING],
@@ -1468,13 +1622,15 @@ fn build(g: &mut Gpu) -> Result<(), String> {
         stages: SHADER_STAGE_COMPUTE,
         immutable_samplers: none.cast(),
     };
-    // One layout for all three pipelines; each shader uses the bindings it
+    // One layout for all four pipelines; each shader uses the bindings it
     // declares (see `set_for`).
     let bindings = [
         binding(0, DESCRIPTOR_COMBINED_IMAGE_SAMPLER),
         binding(1, DESCRIPTOR_COMBINED_IMAGE_SAMPLER),
         binding(2, DESCRIPTOR_STORAGE_IMAGE),
         binding(3, DESCRIPTOR_STORAGE_IMAGE),
+        binding(4, DESCRIPTOR_STORAGE_IMAGE),
+        binding(5, DESCRIPTOR_COMBINED_IMAGE_SAMPLER),
     ];
     let layout = DescriptorSetLayoutCreateInfo {
         s_type: ST_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -1495,7 +1651,7 @@ fn build(g: &mut Gpu) -> Result<(), String> {
         push_constants: &push,
     };
     check((f.create_pipeline_layout)(d, &pipeline_layout, none, &mut g.pipeline_layout), "vkCreatePipelineLayout")?;
-    for (i, code) in [SPIRV_DEPTH_MS, SPIRV_DEPTH_1X, SPIRV_SSR].into_iter().enumerate() {
+    for (i, code) in [SPIRV_DEPTH_MS, SPIRV_DEPTH_1X, SPIRV_SSR, SPIRV_COMPOSE].into_iter().enumerate() {
         let module = ShaderModuleCreateInfo {
             s_type: ST_SHADER_MODULE_CREATE_INFO,
             p_next: none,
@@ -1524,8 +1680,8 @@ fn build(g: &mut Gpu) -> Result<(), String> {
         check((f.create_compute_pipelines)(d, 0, 1, &pipeline, none, &mut g.pipelines[i]), "vkCreateComputePipelines")?;
     }
     let sizes = [
-        DescriptorPoolSize { kind: DESCRIPTOR_COMBINED_IMAGE_SAMPLER, count: 2 * MAX_SETS },
-        DescriptorPoolSize { kind: DESCRIPTOR_STORAGE_IMAGE, count: 2 * MAX_SETS },
+        DescriptorPoolSize { kind: DESCRIPTOR_COMBINED_IMAGE_SAMPLER, count: 3 * MAX_SETS },
+        DescriptorPoolSize { kind: DESCRIPTOR_STORAGE_IMAGE, count: 3 * MAX_SETS },
     ];
     let pool = DescriptorPoolCreateInfo {
         s_type: ST_DESCRIPTOR_POOL_CREATE_INFO,
@@ -1611,7 +1767,8 @@ fn record(g: &mut Gpu, cmd: *mut c_void, slot: usize, f: &Found, compute: &Compu
         depth_layout: depth_read,
         output,
     })?;
-    let (out_image, copy_image) = g.output.as_ref().map(|o| (o.result.image, o.depth.image)).ok_or("no output image")?;
+    let (out_image, copy_image, trace_image) =
+        g.output.as_ref().map(|o| (o.result.image, o.depth.image, o.trace.image)).ok_or("no output image")?;
     let fns = &g.fns;
     let none = std::ptr::null();
     let image_barrier = |image: u64, old: u32, new: u32, src: u32, dst: u32, aspect: u32| ImageMemoryBarrier {
@@ -1638,6 +1795,7 @@ fn record(g: &mut Gpu, cmd: *mut c_void, slot: usize, f: &Found, compute: &Compu
     let mut before = vec![
         image_barrier(out_image, LAYOUT_UNDEFINED, LAYOUT_GENERAL, 0, ACCESS_SHADER_WRITE, ASPECT_COLOR),
         image_barrier(copy_image, LAYOUT_UNDEFINED, LAYOUT_GENERAL, 0, ACCESS_SHADER_WRITE, ASPECT_COLOR),
+        image_barrier(trace_image, LAYOUT_UNDEFINED, LAYOUT_GENERAL, 0, ACCESS_SHADER_WRITE, ASPECT_COLOR),
     ];
     if color_read != color.layout {
         before.push(image_barrier(color.att.image, color.layout, color_read, ACCESS_MEMORY_WRITE, ACCESS_SHADER_READ, ASPECT_COLOR));
@@ -1653,8 +1811,8 @@ fn record(g: &mut Gpu, cmd: *mut c_void, slot: usize, f: &Found, compute: &Compu
     };
     (fns.cmd_pipeline_barrier)(cmd, STAGE_ALL_COMMANDS, STAGE_COMPUTE_SHADER, 0, 1, &memory, 0, none, before.len() as u32, before.as_ptr());
 
-    // The set and the push constants serve both pipelines, which share the
-    // layout.
+    // The set and the push constants serve every pipeline, which all share
+    // the layout.
     let [w, h] = color.att.extent;
     let copy = if depth.att.samples > 1 { g.pipelines[0] } else { g.pipelines[1] };
     (fns.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, copy);
@@ -1676,6 +1834,10 @@ fn record(g: &mut Gpu, cmd: *mut c_void, slot: usize, f: &Found, compute: &Compu
     };
     (fns.cmd_pipeline_barrier)(cmd, STAGE_COMPUTE_SHADER, STAGE_COMPUTE_SHADER, 0, 1, &copied, 0, none, 0, none.cast());
     (fns.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[2]);
+    (fns.cmd_dispatch)(cmd, w.div_ceil(8), h.div_ceil(8), 1);
+    // The trace written, then read by the compose.
+    (fns.cmd_pipeline_barrier)(cmd, STAGE_COMPUTE_SHADER, STAGE_COMPUTE_SHADER, 0, 1, &copied, 0, none, 0, none.cast());
+    (fns.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[3]);
     (fns.cmd_dispatch)(cmd, w.div_ceil(8), h.div_ceil(8), 1);
 
     // Our image to a copy source, the engine's to a copy destination, the
@@ -2391,7 +2553,9 @@ mod tests {
             assert_eq!(k.parse(&k.show(k.default)), Ok(k.default), "{} reads its own default back", k.name);
         }
         assert!(used.iter().all(|&u| u), "no slot left over");
-        for name in ["intensity", "roughness", "fresnel", "up_only", "up_threshold", "max_distance", "edge_fade", "darken", "tint"] {
+        for name in
+            ["intensity", "roughness", "fresnel", "up_only", "up_threshold", "max_distance", "edge_fade", "darken", "tint", "keep_colour"]
+        {
             assert!(find(name).is_some(), "{name}");
             assert!(USAGE.contains(name), "{name}");
         }
@@ -2417,7 +2581,57 @@ mod tests {
         assert_eq!(parse_command(&["stats"]), Ok(Command::Stats));
         assert_eq!(parse_command(&["get"]), Ok(Command::Get));
         assert_eq!(parse_command(&["reset"]), Ok(Command::Reset));
+        assert_eq!(parse_command(&["look", "wet_road"]), Ok(Command::Look("wet_road")));
+        assert!(parse_command(&["look", "shiny"]).unwrap_err().contains("no look \"shiny\"; looks: competitive wet_road"));
+        assert!(parse_command(&["look"]).is_err());
         assert_eq!(parse_command(&["bogus"]), Err(USAGE.to_string()));
+    }
+
+    #[test]
+    fn looks_set_every_look_knob_and_leave_the_rest() {
+        let at = |name: &str| KNOBS.iter().position(|k| k.name == name).unwrap();
+        for look in &LOOKS {
+            assert!(USAGE.contains(look.name), "{}", look.name);
+            let values = look_values(look.name).unwrap();
+            for (name, v) in look.values {
+                let k = find(name).unwrap_or_else(|| panic!("{} names no knob {name}", look.name));
+                assert_eq!(k.parse(&k.show(*v)), Ok(*v), "{} sets {name} out of range", look.name);
+                assert_eq!(values[at(name)], Some(*v));
+            }
+            for k in &KNOBS {
+                let named = look.values.iter().any(|(n, _)| *n == k.name);
+                match values[at(k.name)] {
+                    None => assert!(NOT_A_LOOK.contains(&k.name) && !named, "{} {}", look.name, k.name),
+                    Some(v) if !named => assert_eq!(v, k.default, "{} {}", look.name, k.name),
+                    Some(_) => {}
+                }
+            }
+        }
+        // The default is the first look, and the competitive one.
+        assert_eq!(LOOKS[0].name, "competitive");
+        let defaults: Vec<Option<[f32; 3]>> =
+            KNOBS.iter().map(|k| (!NOT_A_LOOK.contains(&k.name)).then_some(k.default)).collect();
+        assert_eq!(look_values("competitive").unwrap(), defaults);
+        assert!(look_values("shiny").is_none());
+
+        // From the environment: the look, then the knobs' own variables.
+        let env = |name: &str| {
+            Some(match name {
+                "INTOXICATED_SSR_LOOK" => "clean_mirror",
+                "INTOXICATED_SSR_FRESNEL" => "0.5",
+                "INTOXICATED_SSR_STEPS" => "20",
+                _ => return None,
+            }
+            .to_string())
+        };
+        let s = parse_settings(env);
+        assert!(s.warnings.is_empty(), "{:?}", s.warnings);
+        let p = params(FULL, &s.values, 0);
+        assert_eq!((p.intensity, p.roughness, p.fresnel, p.steps, p.keep_colour), (0.9, 0.0, 0.5, 20, 0.0));
+        assert_eq!((p.edge_fade, p.thickness), (EDGE_FADE, 0.06));
+        let s = parse_settings(|name| (name == LOOK_ENV).then(|| "shiny".to_string()));
+        assert_eq!(s.values, KNOBS.iter().map(|k| k.default).collect::<Vec<_>>());
+        assert!(s.warnings[0].contains("is not a look (competitive wet_road clean_mirror puddles glossy)"), "{:?}", s.warnings);
     }
 
     #[test]
@@ -2426,8 +2640,9 @@ mod tests {
         let p = params(FULL, &values, 0);
         assert!((p.tan_half[1] - 0.700_207_5).abs() < 1e-6);
         assert!((p.tan_half[0] - 0.700_207_5 * 1667.0 / 1349.0).abs() < 1e-6);
-        assert_eq!((p.size, p.flags, p.steps, p.intensity, p.fresnel), (FULL, 1, 32, 0.5, 0.85));
-        assert_eq!((p.up_threshold, p.max_distance, p.edge_fade, p.darken, p.roughness), (0.6, 0.0, 0.08, 0.0, 0.0));
+        assert_eq!((p.size, p.flags, p.steps, p.intensity, p.fresnel), (FULL, 1, 32, INTENSITY, FRESNEL));
+        assert_eq!((p.up_threshold, p.max_distance, p.edge_fade, p.darken, p.roughness), (UP_THRESHOLD, 0.0, EDGE_FADE, 0.0, ROUGHNESS));
+        assert_eq!(p.keep_colour, KEEP_COLOUR);
         assert!(!changes_nothing(&values));
         let at = |name: &str| KNOBS.iter().position(|k| k.name == name).unwrap();
         values[at("up_only")] = [0.0; 3];
@@ -2504,12 +2719,13 @@ mod tests {
         assert_eq!(size_of::<QueryPoolCreateInfo>(), 32);
         assert_eq!(offset_of!(QueryPoolCreateInfo, query_count), 24);
         // The std430 offsets spirv-dis prints for ssr.comp's block.
-        assert_eq!(size_of::<Params>(), 72, "the push constant block of ssr.comp");
+        assert_eq!(size_of::<Params>(), 76, "the push constant block of ssr.comp");
         assert_eq!(offset_of!(Params, tint), 16);
         assert_eq!(offset_of!(Params, intensity), 32);
         assert_eq!(offset_of!(Params, steps), 40);
         assert_eq!(offset_of!(Params, roughness), 48);
         assert_eq!(offset_of!(Params, darken), 68);
+        assert_eq!(offset_of!(Params, keep_colour), 72);
     }
 
     /// Every shader build.rs knows, compiled again by glslc and compared
@@ -2531,12 +2747,13 @@ mod tests {
                 .collect()
         };
         // The same list as build.rs's `SHADERS`.
-        let shaders: [(&str, &str, &[&str]); 5] = [
+        let shaders: [(&str, &str, &[&str]); 6] = [
             ("depth_capture/resolve.comp", "depth_capture/resolve_ms", &[]),
             ("depth_capture/resolve.comp", "depth_capture/resolve_1x", &["-DSINGLE_SAMPLE"]),
             ("ssr/depth.comp", "ssr/depth_ms", &[]),
             ("ssr/depth.comp", "ssr/depth_1x", &["-DSINGLE_SAMPLE"]),
             ("ssr/ssr.comp", "ssr/ssr", &[]),
+            ("ssr/ssr.comp", "ssr/compose", &["-DCOMPOSE"]),
         ];
         for (source, stem, defines) in shaders {
             let run = std::process::Command::new(GLSLC)
@@ -2560,7 +2777,9 @@ mod tests {
             }
         }
         // What the build included is the same.
-        for (built, stem) in [(SPIRV_DEPTH_MS, "depth_ms"), (SPIRV_DEPTH_1X, "depth_1x"), (SPIRV_SSR, "ssr")] {
+        for (built, stem) in
+            [(SPIRV_DEPTH_MS, "depth_ms"), (SPIRV_DEPTH_1X, "depth_1x"), (SPIRV_SSR, "ssr"), (SPIRV_COMPOSE, "compose")]
+        {
             assert_eq!(built, &words(&std::fs::read_to_string(android.join(format!("ssr/{stem}.spv.rs"))).unwrap())[..]);
         }
     }

@@ -1,20 +1,33 @@
 // Screen-space reflections on the engine's resolved scene colour (see
-// `ssr.rs`), the second of two dispatches: `depth.comp` has copied the
-// scene depth into `depth_copy`. One invocation per pixel: it reads the
-// scene colour and that depth, and writes the pixel, with a reflection
-// blended in or unchanged, packed bit for bit in the engine's colour format
-// into a 32-bit image of ours that is then copied over the engine's.
+// `ssr.rs`), the second and third of three dispatches: `depth.comp` has
+// copied the scene depth into `depth_copy`. One invocation per pixel in
+// both.
+//
+// The trace (this file as it is) marches the reflected ray of every wet
+// pixel and writes what it found to `trace_img`: the reflected colour
+// premultiplied by how strongly it shows (Fresnel, wetness and how sure the
+// hit is), so a miss is 0 and a doubtful hit fades instead of cutting out.
+//
+// The compose (this file with COMPOSE defined) blurs that over nine taps of
+// the pixel's own surface, which turns the hard edges, the stair steps and
+// the grain of single rays into a soft reflection, blends it into the scene
+// colour and writes the pixel, with a reflection blended in or unchanged,
+// packed bit for bit in the engine's colour format into a 32-bit image of
+// ours that is then copied over the engine's.
 //
 // Every look is a parameter in the push constant block below, set from the
 // INTOXICATED_SSR_* variables and devctl `ssr set` while the game runs;
-// nothing about how the reflections look is a constant here.
+// nothing about how the reflections look is a constant here, only how the
+// edges of a hit fade.
 //
 // Built by build.rs with the system's glslc when there is one, and
-// otherwise taken from the file beside this one, the numbers glslc prints
+// otherwise taken from the files beside this one, the numbers glslc prints
 // wrapped in `&[` and `]`:
 //
 //     glslc -O --target-env=vulkan1.0 -mfmt=num ssr.comp -o -
 //         -> ssr.spv.rs
+//     glslc -O --target-env=vulkan1.0 -mfmt=num -DCOMPOSE ssr.comp -o -
+//         -> compose.spv.rs
 //
 // A test compiles this file again and compares, whenever glslc is there.
 //
@@ -24,7 +37,9 @@
 // and of every projection, and the thickness test and the ray length are
 // relative. Inverse depth is affine in screen space, so along a reflected
 // ray drawn on the screen it is interpolated linearly, and a ray towards
-// infinity ends at its vanishing point with inverse depth 0.
+// infinity ends at its vanishing point with inverse depth 0. For the same
+// reason a plane has no second difference of depth across a pixel, which
+// is how an edge is told from a surface.
 
 #version 450
 
@@ -32,7 +47,12 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform sampler2D color_tex;
 layout(binding = 2, r32f) uniform readonly image2D depth_copy;
+#ifdef COMPOSE
 layout(binding = 3, r32ui) uniform writeonly uimage2D out_img;
+layout(binding = 5) uniform sampler2D trace_tex;
+#else
+layout(binding = 4, rgba16f) uniform writeonly image2D trace_img;
+#endif
 
 // std430, as push constants are laid out; `ssr::Params` mirrors it.
 layout(push_constant) uniform Params {
@@ -49,9 +69,11 @@ layout(push_constant) uniform Params {
     // Steps along the ray before the binary search.
     uint steps;
     // How far behind the drawn surface a ray may be and still hit it, as a
-    // fraction of that surface's distance.
+    // fraction of that surface's distance; hits fade out over the second
+    // half of it.
     float thickness;
-    // 0: a sharp reflection; up to 1: blurred, more the further the ray went.
+    // 0: a reflection only as soft as the compose blur; up to 1: blurred,
+    // more the further the ray went.
     float roughness;
     // 0: the same strength at every angle, like a mirror; 1: strong only at
     // grazing angles (Schlick, reflectance 0.04 head on).
@@ -67,10 +89,23 @@ layout(push_constant) uniform Params {
     float edge_fade;
     // Wet surfaces are this much darker, 0 to 1.
     float darken;
+    // 0: the reflection has the colours of what it reflects; 1: their
+    // brightness in the hue of the surface it lies on (water stays blue).
+    float keep_colour;
 } pc;
 
 const int REFINE_STEPS = 6;
 const float UP_SOFTNESS = 0.15;
+// A second difference of depth, relative to the depth, above which a pixel
+// is on an edge rather than on a surface: hits fade out from LO to HI.
+const float EDGE_LO = 0.01;
+const float EDGE_HI = 0.05;
+// Surfaces seen this close to edge on (the cosine of the view angle) fade
+// out: near the horizon one pixel spans a long stretch of the surface and
+// its normal, from depth, is no longer to be trusted. Meant for the streaks
+// along a sea's horizon, which is INFERRED: Timebomb Duels has no sea.
+const float GRAZING_LO = 0.02;
+const float GRAZING_HI = 0.08;
 
 float depth_at(ivec2 p) {
     return imageLoad(depth_copy, clamp(p, ivec2(0), ivec2(pc.size) - 1)).r;
@@ -82,23 +117,26 @@ vec3 view_pos(vec2 pixel, float d) {
     return vec3(ndc.x * pc.tan_half.x, -ndc.y * pc.tan_half.y, 1.0) / d;
 }
 
-// Where a view-space point, or a direction (its point at infinity), lands.
-vec2 to_pixel(vec3 v) {
-    vec2 ndc = vec2(v.x / (v.z * pc.tan_half.x), -v.y / (v.z * pc.tan_half.y));
-    return (ndc * 0.5 + 0.5) * vec2(pc.size);
-}
+// What depth says about one pixel: its normal (zero when a whole axis is
+// sky) and how far it is from lying on a plane with its four neighbours.
+struct Surface {
+    vec3 n;
+    float edge;
+};
 
-// The surface normal from the depth of the four neighbours, each axis from
-// the side whose depth is closer to this pixel's, so an edge does not bend
-// it. Zero when a whole axis is sky.
-vec3 normal_at(ivec2 p, vec3 P) {
+// The normal from the depth of the four neighbours, each axis from the side
+// whose depth is closer to this pixel's, so an edge does not bend it; the
+// edge measure from the second difference of depth along each axis.
+Surface surface_at(ivec2 p, vec3 P) {
     vec2 c = vec2(p) + 0.5;
+    float dc = 1.0 / P.z;
     float dl = depth_at(p + ivec2(-1, 0));
     float dr = depth_at(p + ivec2(1, 0));
     float du = depth_at(p + ivec2(0, -1));
     float dd = depth_at(p + ivec2(0, 1));
+    float edge = max(abs(dl + dr - 2.0 * dc), abs(du + dd - 2.0 * dc)) / dc;
     if ((dl <= 0.0 && dr <= 0.0) || (du <= 0.0 && dd <= 0.0)) {
-        return vec3(0.0);
+        return Surface(vec3(0.0), edge);
     }
     vec3 dx, dy;
     if (dl <= 0.0 || (dr > 0.0 && abs(1.0 / dr - P.z) < abs(1.0 / dl - P.z))) {
@@ -114,18 +152,22 @@ vec3 normal_at(ivec2 p, vec3 P) {
     vec3 n = cross(dx, dy);
     float l = length(n);
     if (l <= 0.0) {
-        return vec3(0.0);
+        return Surface(vec3(0.0), edge);
     }
     n /= l;
     // Towards the camera.
-    return dot(n, P) > 0.0 ? -n : n;
+    return Surface(dot(n, P) > 0.0 ? -n : n, edge);
 }
 
-// Interleaved gradient noise: a fixed per-pixel offset for the march, which
-// trades its banding for fine grain, and the angle of the blur taps.
-float jitter(ivec2 p) {
-    return fract(52.9829189 * fract(dot(vec2(p), vec2(0.06711056, 0.00583715))));
+// How wet the surface is: 1 everywhere, or by how much it faces up.
+float wetness(vec3 N) {
+    if ((pc.flags & 1u) == 0u) {
+        return 1.0;
+    }
+    return smoothstep(pc.up_threshold - UP_SOFTNESS, pc.up_threshold + UP_SOFTNESS, N.y);
 }
+
+#ifdef COMPOSE
 
 // The engine's colour format, bit for bit, as a 32-bit word; a pixel read
 // and written back unchanged keeps every bit.
@@ -145,38 +187,113 @@ uint pack(vec4 c) {
     return q.r | (q.g << 10) | (q.b << 20) | (q.a << 30); // A2B10G10R10
 }
 
-// How wet the surface is: 1 everywhere, or by how much it faces up.
-float wetness(vec3 N) {
-    if ((pc.flags & 1u) == 0u) {
-        return 1.0;
+float luma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// The trace around pixel `p` (view position P, normal N), over a 3 by 3
+// tent of taps spaced 1 to 2.5 pixels apart with roughness, each between
+// four texels. A tap counts only as far as its depth lies on this pixel's
+// plane, so nothing of a neighbouring object is blurred in. The sum of the
+// premultiplied colours and of the strengths, both over the weights.
+vec4 gathered(ivec2 p, vec3 P, vec3 N) {
+    vec2 inv = 1.0 / vec2(pc.size);
+    vec2 c = vec2(p) + 0.5;
+    float spacing = 1.0 + 1.5 * pc.roughness;
+    float plane = dot(N, P);
+    vec4 sum = vec4(0.0);
+    float weights = 0.0;
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            vec2 at = c + spacing * vec2(i, j);
+            float k = (i == 0 ? 2.0 : 1.0) * (j == 0 ? 2.0 : 1.0);
+            if (i != 0 || j != 0) {
+                // Where this pixel's plane is along the tap's view ray, and
+                // where the drawn surface is.
+                vec3 ray = view_pos(at, 1.0);
+                float along = dot(N, ray);
+                float d = depth_at(ivec2(at));
+                if (d <= 0.0 || along >= 0.0) {
+                    continue;
+                }
+                float z = 1.0 / d;
+                float expected = plane / along;
+                k *= 1.0 - smoothstep(0.01, 0.03, abs(z - expected) / expected);
+            }
+            sum += k * textureLod(trace_tex, at * inv, 0.0);
+            weights += k;
+        }
     }
-    return smoothstep(pc.up_threshold - UP_SOFTNESS, pc.up_threshold + UP_SOFTNESS, N.y);
+    return sum / max(weights, 1e-6);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(p), pc.size))) {
+        return;
+    }
+    vec4 base = texelFetch(color_tex, p, 0);
+    float d = depth_at(p);
+    if (d > 0.0) {
+        vec3 P = view_pos(vec2(p) + 0.5, d);
+        vec3 N = surface_at(p, P).n;
+        float wet = N == vec3(0.0) ? 0.0 : wetness(N);
+        if (wet > 0.0) {
+            vec3 own = base.rgb;
+            base.rgb *= mix(vec3(1.0), pc.tint.rgb * (1.0 - pc.darken), wet);
+            vec4 r = gathered(p, P, N);
+            if (r.a > 1.0 / 1024.0) {
+                vec3 c = r.rgb / r.a;
+                vec3 hue = own / max(luma(own), 0.02);
+                c = mix(c, luma(c) * hue, pc.keep_colour);
+                base.rgb = mix(base.rgb, c, clamp(r.a, 0.0, 1.0));
+            }
+        }
+    }
+    imageStore(out_img, p, uvec4(pack(base), 0u, 0u, 0u));
+}
+
+#else
+
+// Where a view-space point, or a direction (its point at infinity), lands.
+vec2 to_pixel(vec3 v) {
+    vec2 ndc = vec2(v.x / (v.z * pc.tan_half.x), -v.y / (v.z * pc.tan_half.y));
+    return (ndc * 0.5 + 0.5) * vec2(pc.size);
+}
+
+// Which of the four pixels of its 2 by 2 block `p` is, numbered so that
+// neighbours differ most: the march's start offset (an eighth, three, five
+// or seven eighths of a step) and the angle of the blur taps. The compose's
+// 3 by 3 blur always covers all four, so the pattern averages out instead of
+// showing as grain, as a different offset for every pixel did.
+int cell(ivec2 p) {
+    return (p.x & 1) * 2 + ((p.x ^ p.y) & 1);
 }
 
 // The scene colour around `at`: one tap, or four on a disc that grows with
-// roughness and with how far the ray went.
-vec3 reflected_color(vec2 at, float pixels, float angle) {
+// roughness and with how far the ray went, turned by the pixel's cell.
+vec3 reflected_color(vec2 at, float pixels, int cell) {
     vec2 inv = 1.0 / vec2(pc.size);
     if (pc.roughness <= 0.0) {
         return textureLod(color_tex, at * inv, 0.0).rgb;
     }
-    float radius = min(pc.roughness * (1.5 + 0.08 * pixels), 48.0);
+    float radius = min(pc.roughness * (1.0 + 0.06 * pixels), 32.0);
     vec3 c = vec3(0.0);
     for (int i = 0; i < 4; ++i) {
-        float a = 6.2831853 * angle + 1.5707963 * float(i);
+        float a = 0.3926991 * float(cell) + 1.5707963 * float(i);
         float r = radius * (i % 2 == 0 ? 0.5 : 1.0);
         c += textureLod(color_tex, (at + r * vec2(cos(a), sin(a))) * inv, 0.0).rgb;
     }
     return 0.25 * c;
 }
 
-// The reflection at pixel `p` (view position P, normal N): its colour and
-// how much of it to blend in.
+// The reflection at pixel `p` (view position P, normal N): its colour
+// premultiplied by how much of it to blend in, and that amount.
 vec4 reflection(ivec2 p, vec3 P, vec3 N, float wet) {
     vec3 V = normalize(P);
     float cos_v = clamp(dot(-V, N), 0.0, 1.0);
     float schlick = 0.04 + 0.96 * pow(1.0 - cos_v, 5.0);
-    float w = pc.intensity * mix(1.0, schlick, pc.fresnel) * wet;
+    float w = pc.intensity * mix(1.0, schlick, pc.fresnel) * wet * smoothstep(GRAZING_LO, GRAZING_HI, cos_v);
     if (w < 1.0 / 1024.0) {
         return vec4(0.0);
     }
@@ -217,14 +334,17 @@ vec4 reflection(ivec2 p, vec3 P, vec3 N, float wet) {
     // and grow with the square of their number, so the part of the ray near
     // the surface (contact reflections, the most visible) is sampled finely
     // and the far part coarsely; then a binary search of the step that went
-    // behind the drawn depth. A crossing more than `thickness` behind it
-    // passed behind something, and the march goes on, as it does past the
-    // back of a surface.
+    // behind the drawn depth, the same for every pixel. A crossing more than
+    // `thickness` behind it passed behind something, and the march goes on,
+    // as it does past the back of a surface. A hit counts in part: less the
+    // further behind the surface it is and the closer to an edge of it.
+    int k = cell(p);
     float t_start = 2.0 / length(delta);
     float span = t_max - t_start;
     float t_prev = t_start;
     float t_hit = -1.0;
-    float offset = jitter(p);
+    float sure = 0.0;
+    float offset = (float(k) + 0.5) * 0.25;
     for (uint i = 0u; i < pc.steps; ++i) {
         float u = (float(i) + offset) / float(pc.steps);
         float t = t_start + span * u * u;
@@ -242,13 +362,16 @@ vec4 reflection(ivec2 p, vec3 P, vec3 N, float wet) {
             float kr = mix(k0, k1, b);
             ivec2 q = ivec2(s0 + delta * b);
             float ks = depth_at(q);
-            if (kr > 0.0 && ks / kr - 1.0 < pc.thickness) {
+            float behind = ks / kr - 1.0;
+            if (kr > 0.0 && behind < pc.thickness) {
                 // A ray can only meet the front of a surface: one it reaches
                 // from behind (water far below a ray that climbs over it, on
                 // the screen) is not a hit.
-                vec3 n = normal_at(q, view_pos(vec2(q) + 0.5, ks));
-                if (dot(n, R) <= 0.0) {
+                Surface s = surface_at(q, view_pos(vec2(q) + 0.5, ks));
+                if (dot(s.n, R) <= 0.0) {
                     t_hit = b;
+                    sure = (1.0 - smoothstep(0.5 * pc.thickness, pc.thickness, behind))
+                        * (1.0 - smoothstep(EDGE_LO, EDGE_HI, s.edge));
                     break;
                 }
             }
@@ -257,17 +380,17 @@ vec4 reflection(ivec2 p, vec3 P, vec3 N, float wet) {
     }
 
     vec2 at;
-    float fade = 1.0;
     if (t_hit >= 0.0) {
         at = s0 + delta * t_hit;
         // A ray that ends somewhere fades out over the last 40% of it.
         if (!endless) {
-            fade = 1.0 - smoothstep(0.6, 1.0, t_hit);
+            sure *= 1.0 - smoothstep(0.6, 1.0, t_hit);
         }
     } else if (endless && t_max >= 1.0 && depth_at(ivec2(s1)) <= 0.0) {
         // Nothing in the way and the vanishing point is on the screen, in
         // the sky: the reflection is the sky there.
         at = s1;
+        sure = 1.0;
     } else {
         return vec4(0.0);
     }
@@ -275,9 +398,9 @@ vec4 reflection(ivec2 p, vec3 P, vec3 N, float wet) {
     vec2 margin = min(at, vec2(pc.size) - at) / max(pc.edge_fade * float(min(pc.size.x, pc.size.y)), 1e-3);
     float edge = smoothstep(0.0, 1.0, clamp(min(margin.x, margin.y), 0.0, 1.0));
     float facing = smoothstep(-0.25, 0.05, R.z);
-    w *= edge * fade * facing;
-    vec3 c = reflected_color(at, length(at - s0), offset);
-    return vec4(c, clamp(w, 0.0, 1.0));
+    w = clamp(w * sure * edge * facing, 0.0, 1.0);
+    vec3 c = reflected_color(at, length(at - s0), k);
+    return vec4(c * w, w);
 }
 
 void main() {
@@ -285,17 +408,17 @@ void main() {
     if (any(greaterThanEqual(uvec2(p), pc.size))) {
         return;
     }
-    vec4 base = texelFetch(color_tex, p, 0);
+    vec4 r = vec4(0.0);
     float d = depth_at(p);
     if (d > 0.0) {
         vec3 P = view_pos(vec2(p) + 0.5, d);
-        vec3 N = normal_at(p, P);
+        vec3 N = surface_at(p, P).n;
         float wet = N == vec3(0.0) ? 0.0 : wetness(N);
         if (wet > 0.0) {
-            base.rgb *= mix(vec3(1.0), pc.tint.rgb * (1.0 - pc.darken), wet);
-            vec4 r = reflection(p, P, N, wet);
-            base.rgb = mix(base.rgb, r.rgb, r.a);
+            r = reflection(p, P, N, wet);
         }
     }
-    imageStore(out_img, p, uvec4(pack(base), 0u, 0u, 0u));
+    imageStore(trace_img, p, r);
 }
+
+#endif

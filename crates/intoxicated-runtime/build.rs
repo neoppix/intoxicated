@@ -25,12 +25,13 @@ const GLSLC: &str = "/usr/local/bin/glslc";
 /// module includes. The flags are the ones each source's header names; a
 /// test (`ssr::tests`) compiles every entry again and compares it with the
 /// committed file.
-const SHADERS: [(&str, &str, &[&str]); 5] = [
+const SHADERS: [(&str, &str, &[&str]); 6] = [
     ("depth_capture/resolve.comp", "depth_capture/resolve_ms", &[]),
     ("depth_capture/resolve.comp", "depth_capture/resolve_1x", &["-DSINGLE_SAMPLE"]),
     ("ssr/depth.comp", "ssr/depth_ms", &[]),
     ("ssr/depth.comp", "ssr/depth_1x", &["-DSINGLE_SAMPLE"]),
     ("ssr/ssr.comp", "ssr/ssr", &[]),
+    ("ssr/ssr.comp", "ssr/compose", &["-DCOMPOSE"]),
 ];
 
 /// Each shader compiled by glslc when it is installed, so an edited source is

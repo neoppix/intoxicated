@@ -222,10 +222,15 @@ Screen-space reflections are an experimental extra, off by default:
 that face up look wet and reflect what is on screen. The client draws them
 into the 3D scene before the HUD, with compute passes of its own recorded into
 the engine's command buffer through Vulkan; nothing of the game itself is read
-or changed. Every look is a switch (`INTOXICATED_SSR_INTENSITY`, `_ROUGHNESS`,
+or changed. The default look, tuned on Timebomb Duels, is meant for
+competitive play: faint, slightly blurred reflections on floors only, never a
+sharp mirror. `INTOXICATED_SSR_LOOK` starts from another named look
+(`competitive`, `wet_road`, `clean_mirror`, `puddles` or `glossy`), and every
+look is a switch of its own (`INTOXICATED_SSR_INTENSITY`, `_ROUGHNESS`,
 `_FRESNEL`, `_UP_ONLY`, `_UP_THRESHOLD`, `_MAX_DISTANCE`, `_EDGE_FADE`,
-`_DARKEN`, `_TINT` and more; `--help` lists them with their defaults). On an
-RTX 4070 Ti at 1667x1349 they took 0.35 to 0.7 ms of GPU time per frame. Like
+`_DARKEN`, `_TINT`, `_KEEP_COLOUR` and more; `--help` lists them with their
+defaults). On an RTX 4070 Ti they took about 0.55 ms of GPU time per frame at
+3362x1349 and 0.6 ms at 3440x1440. Like
 any screen-space effect they can only show what is on screen: anything off
 screen or hidden behind something else is missing from the reflection, which
 fades out towards the screen edges.
