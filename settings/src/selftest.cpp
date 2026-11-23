@@ -370,6 +370,37 @@ void testQualityPresets() {
         }
 }
 
+void testProfileFiles() {
+    const FlagMap flags{{"DFIntTaskSchedulerTargetFps", "9999"}, {"FFlagDebugSkyGray", "True"}};
+    const QByteArray doc = profileDocument("alt", flags);
+    check(!doc.contains("cookie") && !doc.contains("session"), "an export holds no sign-in");
+    ProfileFile file;
+    QString error;
+    check(parseProfileDocument(doc, &file, &error), "an export reads back: " + error);
+    same(file.name, QString("alt"), "the name comes back");
+    same(file.flags, flags, "the flags come back");
+
+    check(!parseProfileDocument("[1,2]", &file, &error), "a JSON array is refused");
+    check(!parseProfileDocument("{\"flags\":{}}", &file, &error), "a file without the marker is refused");
+    check(!parseProfileDocument("{\"intoxicated-profile\":1}", &file, &error), "a file without flags is refused");
+
+    const QByteArray odd = "{\"intoxicated-profile\":1,\"name\":\"../evil\",\"flags\":"
+                           "{\"FFlagGood\":true,\"FIntNumber\":12,\"NotAFlag\":\"x\",\"FFlagBad\":\"maybe\","
+                           "\"FStringList\":[1]}}";
+    check(parseProfileDocument(odd, &file, &error), "a file with odd entries still reads: " + error);
+    same(file.name, QString("imported"), "an unusable name becomes imported");
+    same(file.flags, FlagMap({{"FFlagGood", "True"}, {"FIntNumber", "12"}}), "only valid flags are kept");
+    same(file.skipped.size(), 3, "three are reported as left out");
+
+    check(importProfile("imp1", flags, &error), "import creates a profile: " + error);
+    same(loadFlags(flagsPath("imp1")).values, flags, "with the flags in its flags.json");
+    check(!importProfile("imp1", flags, &error), "importing over an existing profile is refused");
+    same(freeProfileName("imp1"), QString("imp1-2"), "a taken name gets a suffix");
+    same(freeProfileName("fresh"), QString("fresh"), "a free name is kept");
+    QString err2;
+    deleteProfile("imp1", &err2);
+}
+
 void testVideoMemoryDefault() {
     QString error;
     writeAll(settingsConfPath(), "# mine\nINTOXICATED_FULLSCREEN=1\n");
@@ -483,6 +514,7 @@ int runSelfTest() {
     testImport();
     testPresets();
     testQualityPresets();
+    testProfileFiles();
     testVideoMemoryDefault();
     testProfiles();
     testSndstat();

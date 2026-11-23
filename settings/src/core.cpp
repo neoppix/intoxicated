@@ -680,6 +680,80 @@ bool deleteProfile(const QString &name, QString *error) {
     return true;
 }
 
+QByteArray profileDocument(const QString &name, const FlagMap &flags) {
+    QJsonObject f;
+    for (auto it = flags.cbegin(); it != flags.cend(); ++it)
+        f.insert(it.key(), it.value());
+    QJsonObject root;
+    root.insert(QStringLiteral("intoxicated-profile"), 1);
+    root.insert(QStringLiteral("name"), name);
+    root.insert(QStringLiteral("flags"), f);
+    return QJsonDocument(root).toJson(QJsonDocument::Indented);
+}
+
+bool parseProfileDocument(const QByteArray &data, ProfileFile *out, QString *error) {
+    QJsonParseError perr;
+    const QJsonDocument doc = QJsonDocument::fromJson(data, &perr);
+    if (perr.error != QJsonParseError::NoError || !doc.isObject()) {
+        *error = QStringLiteral("This is not an Intoxicated profile file (not a JSON object).");
+        return false;
+    }
+    const QJsonObject root = doc.object();
+    if (root.value(QStringLiteral("intoxicated-profile")).toInt() != 1) {
+        *error = QStringLiteral("This is not an Intoxicated profile file.");
+        return false;
+    }
+    if (!root.value(QStringLiteral("flags")).isObject()) {
+        *error = QStringLiteral("The profile file has no flags object.");
+        return false;
+    }
+    ProfileFile result;
+    result.name = root.value(QStringLiteral("name")).toString();
+    if (!isValidProfileName(result.name))
+        result.name = QStringLiteral("imported");
+    const QJsonObject flags = root.value(QStringLiteral("flags")).toObject();
+    for (auto it = flags.begin(); it != flags.end(); ++it) {
+        QString value;
+        if (it.value().isString())
+            value = it.value().toString();
+        else if (it.value().isBool())
+            value = it.value().toBool() ? QStringLiteral("True") : QStringLiteral("False");
+        else if (it.value().isDouble())
+            value = QString::number(it.value().toDouble(), 'g', 17);
+        else {
+            result.skipped.append(it.key());
+            continue;
+        }
+        QString normalised;
+        if (!checkFlagName(it.key()).isEmpty() || !checkFlagValue(it.key(), value, &normalised).isEmpty()) {
+            result.skipped.append(it.key());
+            continue;
+        }
+        result.flags.insert(it.key(), normalised);
+    }
+    *out = result;
+    return true;
+}
+
+QString freeProfileName(const QString &wanted) {
+    const QString base = isValidProfileName(wanted) ? wanted : QStringLiteral("imported");
+    if (!QFileInfo::exists(profileDir(base)))
+        return base;
+    for (int n = 2; n < 1000; ++n) {
+        const QString suffix = QStringLiteral("-%1").arg(n);
+        const QString candidate = base.left(32 - suffix.size()) + suffix;
+        if (!QFileInfo::exists(profileDir(candidate)))
+            return candidate;
+    }
+    return QString();
+}
+
+bool importProfile(const QString &name, const FlagMap &flags, QString *error) {
+    if (!createProfile(name, error))
+        return false;
+    return saveFlags(flagsPath(name), flags, error);
+}
+
 QString defaultProfileName(const SettingsConf &conf) {
     const auto set = conf.value(QStringLiteral("INTOXICATED_PROFILE"));
     if (set && isValidProfileName(*set))

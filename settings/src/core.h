@@ -209,6 +209,29 @@ bool deleteProfile(const QString &name, QString *error);
 // settings.conf's INTOXICATED_PROFILE when usable, else `default`.
 QString defaultProfileName(const SettingsConf &conf);
 
+// --- Profile files ----------------------------------------------------------
+
+// What Export writes and Import reads: one JSON object,
+// {"intoxicated-profile": 1, "name": "<profile>", "flags": {...}}. The
+// sign-in and Roblox's storage are never in it: a session cookie in a file
+// that gets passed around is someone else's way into the account.
+QByteArray profileDocument(const QString &name, const FlagMap &flags);
+
+struct ProfileFile {
+    QString name;
+    FlagMap flags;
+    // Flags left out because their name or value would be refused.
+    QStringList skipped;
+};
+
+// Parse a profile file; false with ERROR for anything that is not one.
+bool parseProfileDocument(const QByteArray &data, ProfileFile *out, QString *error);
+// A free profile name from WANTED: itself if free and valid, else with
+// -2, -3, ... appended (cut to stay within 32 characters).
+QString freeProfileName(const QString &wanted);
+// Create profile NAME holding FLAGS. Refused if it already exists.
+bool importProfile(const QString &name, const FlagMap &flags, QString *error);
+
 // --- Sound devices ---------------------------------------------------------
 
 struct SoundDevice {

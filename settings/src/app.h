@@ -185,11 +185,15 @@ private:
     void newProfile();
     void setDefault();
     void deleteSelected();
+    void importFile();
+    void exportSelected();
 
     AppState *m_state;
     QTableWidget *m_table;
     QPushButton *m_new;
     QPushButton *m_setDefault;
+    QPushButton *m_import;
+    QPushButton *m_export;
     QPushButton *m_delete;
     QTimer *m_poll;
     QList<ProfileInfo> m_profiles;

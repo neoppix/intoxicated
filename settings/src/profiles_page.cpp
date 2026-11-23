@@ -4,6 +4,9 @@
 #include "app.h"
 #include "style.h"
 
+#include <QFileDialog>
+#include <QSaveFile>
+#include <QFile>
 #include <QDir>
 #include <QFileInfo>
 #include <QGroupBox>
@@ -63,13 +66,19 @@ ProfilesPage::ProfilesPage(AppState *state) : m_state(state) {
     m_new = new QPushButton(QStringLiteral("New..."));
     m_new->setObjectName(QStringLiteral("addBtn"));
     m_setDefault = new QPushButton(QStringLiteral("Set as default"));
+    m_import = new QPushButton(QStringLiteral("Import..."));
+    m_export = new QPushButton(QStringLiteral("Export..."));
+    m_import->setToolTip(QStringLiteral("Make a new profile from an exported profile file"));
+    m_export->setToolTip(QStringLiteral("Save this profile's name and flags to a file. The sign-in is not included."));
     m_delete = new QPushButton(QStringLiteral("Delete..."));
-    for (QPushButton *button : {m_new, m_setDefault, m_delete}) {
+    for (QPushButton *button : {m_new, m_setDefault, m_import, m_export, m_delete}) {
         button->setCursor(Qt::PointingHandCursor);
         button->setFocusPolicy(Qt::NoFocus);
     }
     buttons->addWidget(m_new);
     buttons->addWidget(m_setDefault);
+    buttons->addWidget(m_import);
+    buttons->addWidget(m_export);
     buttons->addStretch(1);
     buttons->addWidget(m_delete);
     v->addLayout(buttons);
@@ -89,6 +98,8 @@ ProfilesPage::ProfilesPage(AppState *state) : m_state(state) {
     connect(m_new, &QPushButton::clicked, this, &ProfilesPage::newProfile);
     connect(m_setDefault, &QPushButton::clicked, this, &ProfilesPage::setDefault);
     connect(m_delete, &QPushButton::clicked, this, &ProfilesPage::deleteSelected);
+    connect(m_import, &QPushButton::clicked, this, &ProfilesPage::importFile);
+    connect(m_export, &QPushButton::clicked, this, &ProfilesPage::exportSelected);
     connect(state, &AppState::settingsChanged, this, &ProfilesPage::reload);
 
     // A client may start or stop while the page is open.
@@ -158,6 +169,7 @@ void ProfilesPage::reload() {
 void ProfilesPage::updateButtons() {
     const QString name = selected();
     m_setDefault->setEnabled(!name.isEmpty() && name != m_default);
+    m_export->setEnabled(!name.isEmpty());
     m_delete->setEnabled(!name.isEmpty() && name != kDefaultProfile);
     m_delete->setToolTip(name == kDefaultProfile ? QStringLiteral("The default profile cannot be deleted")
                                                  : QString());
@@ -188,6 +200,81 @@ void ProfilesPage::newProfile() {
         if (m_table->item(r, 0)->text() == dialog.text())
             m_table->selectRow(r);
     }
+}
+
+void ProfilesPage::exportSelected() {
+    const QString name = selected();
+    if (name.isEmpty())
+        return;
+    const FlagsFile flags = loadFlags(flagsPath(name));
+    if (!flags.error.isEmpty()) {
+        QMessageBox::warning(this, QStringLiteral("Export profile"),
+                             QStringLiteral("The flags of %1 cannot be read: %2").arg(name, flags.error));
+        return;
+    }
+    const QString path = QFileDialog::getSaveFileName(
+        this, QStringLiteral("Export profile"),
+        QDir::home().filePath(name + QStringLiteral(".intoxicated-profile.json")),
+        QStringLiteral("Intoxicated profiles (*.json)"));
+    if (path.isEmpty())
+        return;
+    QSaveFile out(path);
+    if (!out.open(QIODevice::WriteOnly) || out.write(profileDocument(name, flags.values)) < 0 || !out.commit()) {
+        QMessageBox::warning(this, QStringLiteral("Export profile"),
+                             QStringLiteral("Could not write %1: %2").arg(path, out.errorString()));
+        return;
+    }
+    QMessageBox::information(this, QStringLiteral("Export profile"),
+                             QStringLiteral("Saved %1's name and %2 flags to %3. The sign-in is not in the file.")
+                                 .arg(name)
+                                 .arg(flags.values.size())
+                                 .arg(path));
+}
+
+void ProfilesPage::importFile() {
+    const QString path = QFileDialog::getOpenFileName(this, QStringLiteral("Import profile"), QDir::homePath(),
+                                                      QStringLiteral("Intoxicated profiles (*.json)"));
+    if (path.isEmpty())
+        return;
+    QFile in(path);
+    if (!in.open(QIODevice::ReadOnly)) {
+        QMessageBox::warning(this, QStringLiteral("Import profile"),
+                             QStringLiteral("Could not read %1: %2").arg(path, in.errorString()));
+        return;
+    }
+    ProfileFile file;
+    QString error;
+    if (!parseProfileDocument(in.readAll(), &file, &error)) {
+        QMessageBox::warning(this, QStringLiteral("Import profile"), error);
+        return;
+    }
+    NameDialog dialog(this, QStringLiteral("Import profile"),
+                      QStringLiteral("A name for the imported profile (%1 flags). It starts signed out.")
+                          .arg(file.flags.size()),
+                      freeProfileName(file.name), [](const QString &name) {
+                          if (!isValidProfileName(name))
+                              return QStringLiteral("Use 1 to 32 letters, digits, - and _.");
+                          if (QFileInfo::exists(profileDir(name)))
+                              return QStringLiteral("There is already a profile called %1.").arg(name);
+                          return QString();
+                      });
+    if (dialog.exec() != QDialog::Accepted)
+        return;
+    if (!importProfile(dialog.text(), file.flags, &error)) {
+        QMessageBox::warning(this, QStringLiteral("Import profile"), error);
+        return;
+    }
+    if (!file.skipped.isEmpty())
+        QMessageBox::information(this, QStringLiteral("Import profile"),
+                                 QStringLiteral("Left out %1 flag(s) whose name or value is not valid: %2")
+                                     .arg(file.skipped.size())
+                                     .arg(file.skipped.join(QStringLiteral(", "))));
+    emit m_state->profilesChanged();
+    m_table->clearSelection();
+    reload();
+    for (int r = 0; r < m_table->rowCount(); ++r)
+        if (m_table->item(r, 0)->text() == dialog.text())
+            m_table->selectRow(r);
 }
 
 void ProfilesPage::setDefault() {
