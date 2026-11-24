@@ -262,7 +262,7 @@ pub const LENS_LOOK_ENV: &str = "INTOXICATED_LENS_LOOK";
 
 const ABERRATION: f32 = 1.5;
 const VIGNETTE: f32 = 0.15;
-const HALO: f32 = 0.15;
+const HALO: f32 = 0.3;
 
 /// Every knob of the lens, in the order `lens get` lists them.
 pub(crate) const LENS_KNOBS: [Knob; 3] = [
@@ -288,7 +288,7 @@ pub(crate) const LENS_LOOKS: [Look; 3] = [
     Look {
         name: "prism",
         description: "For clips: a clear colour split at the edges and a rainbow halo round the brightest areas.",
-        values: &[("aberration", [5.0; 3]), ("vignette", [0.3; 3]), ("halo", [0.7; 3])],
+        values: &[("aberration", [5.0; 3]), ("vignette", [0.3; 3]), ("halo", [1.0; 3])],
     },
     Look {
         name: "film",

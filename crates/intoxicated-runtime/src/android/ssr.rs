@@ -526,9 +526,12 @@ impl Effect {
     /// The look whose values every knob has now, if any.
     fn look_now(&self) -> Option<&'static str> {
         let now = self.current();
+        // Only a colour's three values count; another knob keeps one.
+        let same = |k: &Knob, a: [f32; 3], b: [f32; 3]| a[..k.width()] == b[..k.width()];
         self.looks.iter().map(|l| l.name).find(|name| {
-            self.look_values(name)
-                .is_some_and(|look| look.iter().zip(&now).all(|(want, have)| want.is_none_or(|w| w == *have)))
+            self.look_values(name).is_some_and(|look| {
+                self.knobs.iter().zip(look).zip(&now).all(|((k, want), have)| want.is_none_or(|w| same(k, w, *have)))
+            })
         })
     }
 
@@ -3361,7 +3364,7 @@ mod tests {
         };
         let lens = post::LENS.parse_settings(env);
         assert!(lens.on && lens.warnings.is_empty(), "{:?}", lens.warnings);
-        assert_eq!(lens.values, [[5.0; 3], [0.0; 3], [0.7; 3]], "the look, then the knob");
+        assert_eq!(lens.values, [[5.0; 3], [0.0; 3], [1.0; 3]], "the look, then the knob");
         let sharpen = post::SHARPEN.parse_settings(env);
         assert!(sharpen.on);
         assert_eq!(sharpen.warnings.len(), 1, "{:?}", sharpen.warnings);
@@ -3415,13 +3418,28 @@ mod tests {
         assert!(sharpen.on);
         assert_eq!(sharpen.values, [[2.0; 3], [0.2; 3], [1.0; 3]], "crunchy, the limit its own");
         let lens = post::LENS.parse_settings(env);
-        assert!(lens.on && lens.values[2] == [0.7; 3], "prism");
+        assert!(lens.on && lens.values[2] == [1.0; 3], "prism");
 
         let off = |name: &str| (name == MODE_ENV).then(|| "off".to_string());
         assert!(EFFECTS.iter().all(|fx| !fx.parse_settings(off).on));
         let competitive = |name: &str| (name == MODE_ENV).then(|| "competitive".to_string());
         let on: Vec<bool> = EFFECTS.iter().map(|fx| fx.parse_settings(competitive).on).collect();
         assert_eq!(on, [true, true, true, false, true]);
+        // The look the knobs are at, as devctl shaders reports it (seen as
+        // "custom" for every look in game before a knob's unused slots were
+        // left out of the comparison). Only this test touches the lens's
+        // live values.
+        let lens = &post::LENS;
+        for look in ["prism", "subtle"] {
+            for (k, v) in lens.knobs.iter().zip(lens.look_values(look).unwrap()) {
+                lens.set(k, v.unwrap());
+            }
+            assert_eq!(lens.look_now(), Some(look));
+        }
+        lens.set(&lens.knobs[0], [3.0; 3]);
+        assert_eq!(lens.look_now(), None, "tuned");
+        lens.knobs.iter().for_each(|k| lens.set(k, k.default));
+
         let bad = SSR.parse_settings(|name: &str| (name == MODE_ENV).then(|| "fancy".to_string()));
         assert!(!bad.on && bad.warnings.len() == 1 && bad.warnings[0].contains("is not a mode"), "{:?}", bad.warnings);
     }

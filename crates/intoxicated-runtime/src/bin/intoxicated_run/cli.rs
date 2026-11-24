@@ -542,7 +542,7 @@ env:
                                      (1.5); none at the centre
   INTOXICATED_LENS_VIGNETTE=<0..1>   how much darker the corners are (0.15)
   INTOXICATED_LENS_HALO=<0..2>       the rainbow fringe round the brightest
-                                     areas, from the bloom's chain (0.15)
+                                     areas, from the bloom's chain (0.3)
   INTOXICATED_SHARPEN=1              contrast adaptive sharpening
                                      (experimental) of the 3D scene, drawn
                                      before the HUD. Off by default.

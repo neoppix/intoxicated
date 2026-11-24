@@ -290,7 +290,7 @@ sharpened:
   towards the screen edges and not at all in the middle
   (`_ABERRATION`, pixels at 1080p in the corners, default 1.5), a vignette
   (`_VIGNETTE`, 0.15) and a rainbow fringe just outside the brightest areas,
-  taken from the bloom's chain (`_HALO`, 0.15; the lens runs the chain
+  taken from the bloom's chain (`_HALO`, 0.3; the lens runs the chain
   itself when the bloom is off). Looks: `subtle` (the default), `prism`,
   `film`.
 - `INTOXICATED_SHARPEN=1`: contrast adaptive sharpening, written for
@@ -308,10 +308,11 @@ first), the lens about 0.11 ms with the bloom on and about 0.15 ms when it
 runs the bloom chain itself; frame times did not change measurably (p50 4.2
 ms). Neither shows anything that is not drawn: the aberration moves drawn
 colours by a few pixels, the vignette only darkens and the fringe only adds
-light around what is already bright. Limits: the rainbow fringe was made
-stronger after it was last seen in game, so its default strength is
-INFERRED; depth-aware sharpening was not yet compared in game against a
-near outline; and like the other effects both work on the engine's 10-bit
+light around what is already bright. Limits: the fringe shows mostly as a warm
+yellow glow round white surfaces rather than a clear rainbow, faint at the
+default and clear at prism's 1.0; what depth-aware sharpening changes along
+an outline could not be told apart in game, as the character moved between
+the shots; and like the other effects both work on the engine's 10-bit
 picture, not HDR.
 
 `INTOXICATED_SHADERS_MODE` switches all five at once and starts each from a
@@ -324,8 +325,9 @@ look variable wins over the mode, and its knobs change the look as always;
 devctl `shaders mode <name>` does the same while the game runs and `shaders`
 reports each effect's switch and look. At 3362x1349 on the RTX 4070 Ti the
 competitive set took about 1.3 ms of GPU time per frame and the cinematic
-set about 1.5 ms, everything included; frame times did not change
-measurably (p50 4.2 ms either way, as with all off).
+set about 1.5 ms, everything included (at 1667x1349 about 0.6 and 0.7
+ms); frame times did not change measurably (p50 4.2 ms either way, as with
+all off).
 
 When the disk holding the profile's Roblox data runs short, the client says so:
 below 2 GiB free as it hands Roblox its window, below 512 MiB again when the
