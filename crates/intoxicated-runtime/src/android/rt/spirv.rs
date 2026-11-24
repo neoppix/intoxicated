@@ -91,7 +91,7 @@ const MODEL_FRAGMENT: u32 = 4;
 
 /// Bytes per captured vertex: the clip-space position, the colour, the
 /// camera vector, the world position.
-pub(crate) const STRIDE: u32 = 80;
+pub(crate) const STRIDE: u32 = 96;
 /// Where the colour, the camera vector and the world position are in a
 /// captured vertex.
 pub(crate) const COLOUR_OFFSET: u32 = 16;
@@ -99,6 +99,8 @@ pub(crate) const CAMERA_OFFSET: u32 = 32;
 pub(crate) const WORLD_OFFSET: u32 = 48;
 /// Where the texture coordinates are (when the shader has them).
 pub(crate) const UV_OFFSET: u32 = 64;
+/// Where the vertex normal in the world is (when the shader has one).
+pub(crate) const NORMAL_OFFSET: u32 = 80;
 /// The vertex input the engine's shaders take their texture coordinates
 /// from.
 const UV_INPUT_LOCATION: u32 = 4;
@@ -265,8 +267,12 @@ pub(crate) fn instrument_vertex(words: &[u32]) -> Result<Vec<u32>, &'static str>
             id
         }
     };
+    // The world position's w: 1 for a static vertex, plus 2 when the normal
+    // is captured too.
+    let normal = normal_output(words, &list, &flow, camera.output, colour);
     let flag = new_id();
-    globals.push(op(OP_CONSTANT, &[float, flag, if camera.fixed { 1.0f32 } else { 0.0f32 }.to_bits()]));
+    let flag_value = f32::from(u8::from(camera.fixed)) + if normal.is_some() { 2.0 } else { 0.0 };
+    globals.push(op(OP_CONSTANT, &[float, flag, flag_value.to_bits()]));
     let world_out = new_id();
     globals.push(op(OP_VARIABLE, &[pointer, world_out, STORAGE_OUTPUT]));
     let world4 = new_id();
@@ -274,6 +280,9 @@ pub(crate) fn instrument_vertex(words: &[u32]) -> Result<Vec<u32>, &'static str>
     let mut captured = vec![(colour, COLOUR_OFFSET), (camera.output, CAMERA_OFFSET), (world_out, WORLD_OFFSET)];
     if let Some(uv) = uv_output(words, &list, &flow) {
         captured.push((uv.1, UV_OFFSET));
+    }
+    if let Some(n) = normal {
+        captured.push((n, NORMAL_OFFSET));
     }
     for (v, offset) in captured {
         decorations.push(op(OP_DECORATE, &[v, DECORATION_XFB_BUFFER, 0]));
@@ -514,6 +523,41 @@ fn uv_output(words: &[u32], list: &[Inst], flow: &Flow) -> Option<(u32, u32)> {
     flow.outputs_of(Some(vec2))
         .into_iter()
         .find(|&(_, v)| flow.stores.get(&v).is_some_and(|s| s.iter().any(|&x| !flow.memories(x).is_disjoint(&inputs))))
+}
+
+/// The shader's vertex normal output: a `vec3` or `vec4` output (not the
+/// colour or the camera vector), of the lowest location, whose value comes
+/// from a vertex input other than the position, the colour and the texture
+/// coordinates, and not from the position or the coordinates: the normal
+/// (or tangent) the instance's or bone's rotation turned into the world.
+/// Of the engine's lit shaders the lowest such is the normal; the tangent,
+/// where there is one, comes after it.
+fn normal_output(words: &[u32], list: &[Inst], flow: &Flow, camera: u32, colour: u32) -> Option<u32> {
+    let (_, vec3, vec4) = float_types(words, list)?;
+    let excluded: HashSet<u32> = [0, COLOUR_INPUT_LOCATION, UV_INPUT_LOCATION].iter().flat_map(|&l| flow.inputs_at(l)).collect();
+    let position_or_uv: HashSet<u32> = [0, UV_INPUT_LOCATION].iter().flat_map(|&l| flow.inputs_at(l)).collect();
+    let others: HashSet<u32> = flow
+        .vars
+        .iter()
+        .filter(|v| v.2 == STORAGE_INPUT && !excluded.contains(&v.0) && !flow.builtins.contains(&v.0))
+        .map(|v| v.0)
+        .collect();
+    let mut candidates = flow.outputs_of(vec3);
+    candidates.extend(flow.outputs_of(vec4));
+    candidates.sort_unstable();
+    candidates
+        .into_iter()
+        .filter(|&(_, v)| v != camera && v != colour)
+        .find(|&(_, v)| {
+            flow.stores.get(&v).is_some_and(|s| {
+                !s.is_empty()
+                    && s.iter().all(|&x| {
+                        let m = flow.memories(x);
+                        !m.is_disjoint(&others) && m.is_disjoint(&position_or_uv)
+                    })
+            })
+        })
+        .map(|(_, v)| v)
 }
 
 /// What the capture keeps of a vertex shader it instrumented: the locations
@@ -836,9 +880,12 @@ mod tests {
         assert!(after.iter().any(|(o, a)| *o == OP_ENTRY_POINT && a.last() == Some(&world)));
         assert!(after.iter().any(|(o, a)| *o == OP_STORE && a[0] == world));
         // The test shader places its vertex by its instance's matrix:
-        // static, flag 1; skinned, by a bone a vertex input picks: flag 0.
-        assert_eq!(world_flag(&out), 1.0);
-        assert_eq!(world_flag(&instrument_vertex(SKINNED).unwrap()), 0.0);
+        // static, 1; skinned, by a bone a vertex input picks: 0; both pass on
+        // their world normal (`world_normal`, location 0, offset 80): plus 2.
+        assert_eq!(world_flag(&out), 3.0);
+        assert_eq!(world_flag(&instrument_vertex(SKINNED).unwrap()), 2.0);
+        let normal = output_at(&out, 0);
+        assert!(added.contains(&&(OP_DECORATE, vec![normal, DECORATION_OFFSET, NORMAL_OFFSET])));
         validate(&instrument_vertex(SKINNED).unwrap());
         assert!(added.contains(&&(OP_CAPABILITY, vec![CAPABILITY_TRANSFORM_FEEDBACK])));
         assert!(added.iter().any(|(o, a)| *o == OP_EXECUTION_MODE && a[1] == EXECUTION_MODE_XFB));

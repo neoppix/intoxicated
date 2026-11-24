@@ -342,6 +342,17 @@ What to know before turning it on:
 - It may crash or misbehave on other GPUs and drivers: it was only tested on
   an RTX 4070 Ti with NVIDIA 620.70.06, in Timebomb Duels.
 
+Round surfaces reflect smoothly: each reflecting pixel's own triangle is
+found with a ray from the camera and its normal is taken from the vertex
+normals the engine's shader gave its corners; the screen-space reflections,
+which have no captured geometry, even out the depth's normals over a ring of
+neighbours on the same surface instead, which also applies to the ray-traced
+ones where no triangle is found. Rays that meet nothing take the sky in their
+direction from an environment the client builds from the sky the screen has
+shown, kept until a teleport (`INTOXICATED_RT_ENV=0` or devctl `rt env off`
+turns it off). Only parts that stayed in place for a second are kept in the
+cache, so what a moving player wears leaves no trail.
+
 devctl `rt on` and `rt off` switch it while the game runs (with
 `INTOXICATED_RT=1` at start), `rt stats` reports the triangles, the textures,
 the measured camera, the cache and the GPU time, and `rt dump-cache <path>`

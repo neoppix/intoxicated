@@ -179,6 +179,29 @@ Surface surface_at(ivec2 p, vec3 P) {
     return Surface(dot(n, P) > 0.0 ? -n : n, edge);
 }
 
+// The normal for the reflection: the depth's, evened out over a ring of
+// eight neighbours three pixels away whose surface lies on this one's and
+// turns less than 35 degrees from it, so a round surface built of flat
+// triangles reflects smoothly while an edge between two faces stays sharp.
+vec3 smoothed(ivec2 p, vec3 P, vec3 N) {
+    const ivec2 ring[8] = ivec2[8](ivec2(3, 0), ivec2(2, 2), ivec2(0, 3), ivec2(-2, 2),
+                                   ivec2(-3, 0), ivec2(-2, -2), ivec2(0, -3), ivec2(2, -2));
+    vec3 sum = N;
+    for (int i = 0; i < 8; ++i) {
+        ivec2 q = p + ring[i];
+        float dq = depth_at(q);
+        if (dq <= 0.0) {
+            continue;
+        }
+        vec3 Q = view_pos(vec2(q) + 0.5, dq);
+        vec3 n = surface_at(q, Q).n;
+        if (dot(n, N) > 0.82 && abs(dot(N, Q - P)) < 0.03 * P.z) {
+            sum += n;
+        }
+    }
+    return normalize(sum);
+}
+
 // How wet the surface is: 1 everywhere, or by how much it faces up.
 float wetness(vec3 N) {
     if ((pc.flags & 1u) == 0u) {
@@ -494,14 +517,54 @@ layout(std430, set = 1, binding = 6) buffer Globals {
     vec4 right;
     vec4 up;
     vec4 forward;
+    uint gen;
+    uint dropped;
+    uint full;
+    uint inserted;
+    vec4 last_cam;
+    uint cut;
+    uint fit_failures;
+    uint sky_r;
+    uint sky_g;
+    uint sky_b;
+    uint sky_n;
+    vec4 sky;
 };
-// Five vec4 a triangle (see `rt/build.comp`).
+// The environment: what the screen showed in each direction where it showed
+// sky, kept over frames, octahedral around world up, `ENV_SIZE` squared:
+// (red and green, blue and weight as halves, the cache's generation it
+// belongs to, 0). A teleport (a new generation) forgets it.
+layout(std430, set = 1, binding = 12) buffer Env { uvec4 env[]; };
+const uint ENV_SIZE = 256u;
+
+uint env_texel(vec3 d) {
+    d /= abs(d.x) + abs(d.y) + abs(d.z);
+    vec2 e = d.y >= 0.0 ? d.xz : (1.0 - abs(d.zx)) * vec2(d.x >= 0.0 ? 1.0 : -1.0, d.z >= 0.0 ? 1.0 : -1.0);
+    uvec2 t = uvec2(clamp((e * 0.5 + 0.5) * float(ENV_SIZE), 0.0, float(ENV_SIZE - 1u)));
+    return t.y * ENV_SIZE + t.x;
+}
+
+// The sky in world direction `d`: as the screen last showed it there, else
+// the sky's average, else nothing (alpha 0).
+vec4 environment(vec3 d) {
+    // Flags bit 5: the environment is off.
+    if ((pc.flags & 32u) != 0u) {
+        return vec4(0.0);
+    }
+    uvec4 e = env[env_texel(d)];
+    vec2 bw = unpackHalf2x16(e.y);
+    if (e.z == gen && bw.y > 0.0) {
+        return vec4(unpackHalf2x16(e.x), bw.x, 1.0);
+    }
+    return sky.w > 0.0 ? vec4(sky.rgb, 1.0) : vec4(0.0);
+}
+// Six vec4 a triangle (see `rt/build.comp`).
 layout(std430, set = 1, binding = 8) readonly buffer Tris { vec4 tris[]; };
 // This frame's base colour textures, and from a texture's serial to its
 // place among them: 1024 entries (serial, place + 1), by serial.
 layout(set = 2, binding = 0) uniform sampler2D textures[256];
 layout(std430, set = 1, binding = 11) readonly buffer TexMap { uvec2 tex_map[]; };
-const uint TRI_VEC4 = 5u;
+const uint TRI_VEC4 = 6u;
 // Per block: the premultiplied colour and strength as four halves, the
 // pixel the ray left from (x | y << 16, or ~0 for none).
 layout(std430, set = 1, binding = 7) buffer Blocks { uvec4 blocks[]; };
@@ -710,6 +773,34 @@ vec3 hit_colour(uint tri, vec2 uv, float t) {
     return any(isnan(c)) ? vec3(0.5) : clamp(c, 0.0, 1.0);
 }
 
+// The pixel's own triangle's normal, from the normals the engine's vertex
+// shader gave its corners, at the point a ray from the camera meets it:
+// smooth where the engine shades smoothly. N (the depth's) where the ray
+// meets no triangle at the depth's distance, the triangle carries no
+// normals, or they turn more than 60 degrees from N.
+vec3 rt_normal(vec3 P, vec3 N) {
+    float dist = length(P) * g_near;
+    vec3 D = normalize(world_dir(P));
+    uint tri;
+    vec2 uv;
+    float t = trace_ray(cam_pos.xyz, D, 0.5 * g_near, dist * 1.03, tri, uv);
+    if (t < 0.0 || abs(t - dist) > 0.015 * dist) {
+        return N;
+    }
+    uvec4 packed = floatBitsToUint(tris[TRI_VEC4 * tri + 5u]);
+    if (packed.w == 0u) {
+        return N;
+    }
+    vec3 n = unpackSnorm4x8(packed.x).xyz * (1.0 - uv.x - uv.y) + unpackSnorm4x8(packed.y).xyz * uv.x
+        + unpackSnorm4x8(packed.z).xyz * uv.y;
+    if (dot(n, n) < 1e-6) {
+        return N;
+    }
+    n = normalize(vec3(dot(n, right.xyz), dot(n, up.xyz), dot(n, forward.xyz)));
+    n = dot(n, P) > 0.0 ? -n : n;
+    return dot(n, N) > 0.5 ? n : N;
+}
+
 vec4 reflection_rt(ivec2 p, vec3 P, vec3 N, float wet) {
     vec3 V = normalize(P);
     float cos_v = clamp(dot(-V, N), 0.0, 1.0);
@@ -734,13 +825,10 @@ vec4 reflection_rt(ivec2 p, vec3 P, vec3 N, float wet) {
     if (t < 0.0) {
         // Nothing in the way: the sky, where its vanishing point is on the
         // screen and the screen shows sky there.
-        if (R.z > 1e-4) {
-            vec2 s1 = to_pixel(R);
-            if (opaque && all(greaterThanEqual(s1, vec2(0.5))) && all(lessThan(s1, vec2(pc.size) - 0.5)) && depth_at(ivec2(s1)) <= 0.0) {
-                return vec4(opaque_color(s1, length(s1 - vec2(p)), k) * w, w);
-            }
-        }
-        return vec4(0.0);
+        // Nothing in the way: the sky in that direction, as the screen showed
+        // it (now or before).
+        vec4 env = environment(Rw);
+        return vec4(env.rgb * w * env.a, w * env.a);
     }
     vec3 H = to_view_space(O + Rw * t);
     vec3 own = hit_colour(tri, uv, t);
@@ -803,7 +891,37 @@ uint leader(ivec2 b) {
 
 #endif
 
-#if defined(RT) && !defined(UPSAMPLE)
+#if defined(RT) && defined(ENVMAP)
+
+// The environment pass (`-DRT -DENVMAP`): a quarter of the pixels each
+// frame, in turn; where the opaque copy shows sky, its colour into the
+// environment at that world direction, blended over what was there.
+void main() {
+    camera_from_fit();
+    if (!g_fit || (pc.flags & 4u) == 0u || (pc.flags & 32u) != 0u) {
+        return;
+    }
+    ivec2 p = 2 * ivec2(gl_GlobalInvocationID.xy) + ivec2(frame & 1u, (frame >> 1) & 1u);
+    if (any(greaterThanEqual(uvec2(p), pc.size)) || depth_at(p) > 0.0) {
+        return;
+    }
+    vec3 c = texelFetch(opaque_tex, p, 0).rgb;
+    vec3 d = normalize(world_dir(view_pos(vec2(p) + 0.5, 1.0)));
+    uint t = env_texel(d);
+    uvec4 e = env[t];
+    vec2 bw = unpackHalf2x16(e.y);
+    float w = e.z == gen ? bw.y : 0.0;
+    vec3 now = w > 0.0 ? mix(vec3(unpackHalf2x16(e.x), bw.x), c, 0.1) : c;
+    env[t] = uvec4(packHalf2x16(now.rg), packHalf2x16(vec2(now.b, min(w + 1.0, 1000.0))), gen, 0u);
+    if (((p.x ^ p.y) & 15) == 0) {
+        atomicAdd(sky_r, uint(clamp(c.r, 0.0, 1.0) * 256.0));
+        atomicAdd(sky_g, uint(clamp(c.g, 0.0, 1.0) * 256.0));
+        atomicAdd(sky_b, uint(clamp(c.b, 0.0, 1.0) * 256.0));
+        atomicAdd(sky_n, 1u);
+    }
+}
+
+#elif defined(RT) && !defined(UPSAMPLE)
 
 // How much of a block's last result is kept when its pixel is where it was.
 const float HISTORY = 0.6;
@@ -825,7 +943,7 @@ void main() {
         vec3 N = surface_at(p, P).n;
         float wet = N == vec3(0.0) ? 0.0 : wetness(N);
         if (wet > 0.0) {
-            r = reflection_rt(p, P, N, wet);
+            r = reflection_rt(p, P, rt_normal(P, smoothed(p, P, N)), wet);
         }
     }
     uint i = uint(b.y) * hs.x + uint(b.x);
@@ -862,33 +980,50 @@ void main() {
             // plane, by a tent over three pixels of distance.
             uvec2 hs = half_size();
             ivec2 b0 = p / 2;
-            vec4 sum = vec4(0.0);
-            float weights = 0.0;
-            for (int j = -1; j <= 1; ++j) {
-                for (int i = -1; i <= 1; ++i) {
-                    ivec2 b = b0 + ivec2(i, j);
-                    if (any(greaterThanEqual(uvec2(b), hs))) {
-                        continue;
-                    }
-                    uvec4 e = blocks[uint(b.y) * hs.x + uint(b.x)];
-                    if (e.z == NO_PIXEL) {
-                        continue;
-                    }
-                    ivec2 q = ivec2(e.z & 0xffffu, e.z >> 16);
-                    vec3 Q = view_pos(vec2(q) + 0.5, depth_at(q));
-                    float off_plane = abs(dot(N, Q - P)) / P.z;
-                    float k = (1.0 - smoothstep(0.004, 0.02, off_plane)) * max(1.0 - length(vec2(q - p)) / 3.0, 0.0);
-                    if (k > 0.0) {
-                        sum += k * vec4(unpackHalf2x16(e.x), unpackHalf2x16(e.y));
-                        weights += k;
-                    }
+            vec4 samples[9];
+            float ks[9];
+            float weights = 0.0, mean = 0.0;
+            for (int n = 0; n < 9; ++n) {
+                ks[n] = 0.0;
+                samples[n] = vec4(0.0);
+                ivec2 b = b0 + ivec2(n % 3 - 1, n / 3 - 1);
+                if (any(greaterThanEqual(uvec2(b), hs))) {
+                    continue;
+                }
+                uvec4 e = blocks[uint(b.y) * hs.x + uint(b.x)];
+                if (e.z == NO_PIXEL) {
+                    continue;
+                }
+                ivec2 q = ivec2(e.z & 0xffffu, e.z >> 16);
+                vec3 Q = view_pos(vec2(q) + 0.5, depth_at(q));
+                float off_plane = abs(dot(N, Q - P)) / P.z;
+                float k = (1.0 - smoothstep(0.004, 0.02, off_plane)) * max(1.0 - length(vec2(q - p)) / 3.0, 0.0);
+                if (k > 0.0) {
+                    samples[n] = vec4(unpackHalf2x16(e.x), unpackHalf2x16(e.y));
+                    ks[n] = k;
+                    weights += k;
+                    mean += k * dot(samples[n].rgb, vec3(0.2126, 0.7152, 0.0722));
                 }
             }
             if (weights > 1e-3) {
+                // A ray that slipped through a gap the others did not (a
+                // lattice, a thin pole) is held to twice its neighbours'
+                // brightness, so it does not show as a flickering speck.
+                float cap = 2.0 * mean / weights + 0.02;
+                vec4 sum = vec4(0.0);
+                for (int n = 0; n < 9; ++n) {
+                    float l = dot(samples[n].rgb, vec3(0.2126, 0.7152, 0.0722));
+                    vec4 v = samples[n];
+                    if (l > cap) {
+                        v.rgb *= cap / l;
+                    }
+                    sum += ks[n] * v;
+                }
                 r = sum / weights;
             }
+
 #else
-            r = reflection(p, P, N, wet);
+            r = reflection(p, P, smoothed(p, P, N), wet);
 #endif
         }
     }

@@ -84,6 +84,8 @@ const SPIRV_BOUNDS: &[u32] = include!(concat!(env!("OUT_DIR"), "/rt_build_bounds
 /// `ssr/ssr.comp` with `RT`, and with `RT` and `UPSAMPLE`.
 const SPIRV_TRACE: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_trace.spv.rs"));
 const SPIRV_UPSAMPLE: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_upsample.spv.rs"));
+/// `ssr/ssr.comp` with `RT` and `ENVMAP`.
+const SPIRV_ENV: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_env.spv.rs"));
 
 const PREP: usize = 0;
 const SORT_LOCAL: usize = 1;
@@ -95,19 +97,22 @@ const UPSAMPLE: usize = 6;
 const FIT: usize = 7;
 const INSERT: usize = 8;
 const GATHER: usize = 9;
-const PIPELINES: usize = 10;
+const ENV: usize = 10;
+const PIPELINES: usize = 11;
 /// The bindings of our set: 0 the capture, 2 the sorted keys, 3 the nodes,
 /// 4 the parents, 5 the flags, 6 the globals, 7 the traced blocks, 8 the
 /// triangles to trace, 9 the cache, 10 this frame's draws, 11 its textures
-/// by serial.
-const BINDINGS: [u32; 11] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+/// by serial, 12 the environment.
+const BINDINGS: [u32; 12] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+/// The environment: 256 by 256 directions, 16 bytes each.
+const ENV_BYTES: u64 = 16 * 256 * 256;
 /// Slots in the cache of static triangles (128 bytes each).
 const SLOTS: u32 = 1 << 19;
 const SLOT_BYTES: u64 = 128;
-/// Triangles the list to trace holds (80 bytes each): this frame's and the
+/// Triangles the list to trace holds (96 bytes each): this frame's and the
 /// cache's.
 const LISTED: u64 = 1 << 19;
-const TRI_BYTES: u64 = 80;
+const TRI_BYTES: u64 = 96;
 /// Draws a frame can tell the build about (16 bytes each), and the entries
 /// of the serial-to-texture table (8 bytes each).
 const MAX_DRAWS: usize = 4096;
@@ -195,6 +200,24 @@ pub(crate) fn shade_flags() -> u32 {
         2 => 8,
         _ => 0,
     }
+}
+
+/// The environment built from the sky the screen shows, for rays that meet
+/// nothing: on unless `INTOXICATED_RT_ENV=0`; devctl `rt env on|off`.
+pub const ENV_ENV: &str = "INTOXICATED_RT_ENV";
+static ENV_ON: OnceLock<AtomicBool> = OnceLock::new();
+const FLAG_NO_ENV: u32 = 32;
+
+fn env_switch() -> &'static AtomicBool {
+    ENV_ON.get_or_init(|| AtomicBool::new(std::env::var(ENV_ENV).map_or(true, |v| v.trim() != "0")))
+}
+
+pub(crate) fn env_on() -> bool {
+    env_switch().load(Relaxed)
+}
+
+pub(crate) fn set_env(on: bool) {
+    env_switch().store(on, Relaxed);
 }
 
 /// devctl `rt dump-cache <path>`: armed for the next frame, then written.
@@ -340,6 +363,7 @@ struct Gpu {
     slots: Owned,
     draws: Owned,
     tex_map: Owned,
+    env: Owned,
     /// Set 2 of the trace: the frame's textures, one set per ring slot, and
     /// its layout; a 1 by 1 image of ours fills the places no texture takes.
     /// Host-visible: a copy of the cache, made for `rt dump-cache`.
@@ -432,6 +456,7 @@ impl Gpu {
             self.slots,
             self.draws,
             self.tex_map,
+            self.env,
             self.readback,
             self.cache_copy,
         ] {
@@ -519,6 +544,7 @@ fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool, extent: [u32; 2]) -
         slots: Owned::default(),
         draws: Owned::default(),
         tex_map: Owned::default(),
+        env: Owned::default(),
         cache_copy: Owned::default(),
         cache_copy_ptr: 0,
         tex_layout: 0,
@@ -663,6 +689,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
     g.slots = make_buffer(&g.buffers, d, &types, SLOT_BYTES * SLOTS as u64, usage, false)?;
     g.draws = make_buffer(&g.buffers, d, &types, 16 * MAX_DRAWS as u64, usage, false)?;
     g.tex_map = make_buffer(&g.buffers, d, &types, 8 * TEX_MAP as u64, usage, false)?;
+    g.env = make_buffer(&g.buffers, d, &types, ENV_BYTES, usage, false)?;
     make_textures(g, &types)?;
     g.readback = make_buffer(&g.buffers, d, &types, 256, USAGE_TRANSFER_DST, true)?;
     let mut mapped = std::ptr::null_mut();
@@ -727,6 +754,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         SPIRV_FIT,
         SPIRV_INSERT,
         SPIRV_GATHER,
+        SPIRV_ENV,
     ];
     for (i, code) in codes.into_iter().enumerate() {
         g.shaders[i] = shader(f, d, code)?;
@@ -743,7 +771,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
                 name: c"main".as_ptr(),
                 specialization: none,
             },
-            layout: if matches!(i, TRACE | UPSAMPLE | GATHER) { g.trace_layout } else { g.build_layout },
+            layout: if matches!(i, TRACE | UPSAMPLE | GATHER | ENV) { g.trace_layout } else { g.build_layout },
             base_pipeline: 0,
             base_pipeline_index: -1,
         };
@@ -772,6 +800,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         DescriptorBufferInfo { buffer: g.slots.buffer, offset: 0, range: SLOT_BYTES * SLOTS as u64 },
         DescriptorBufferInfo { buffer: g.draws.buffer, offset: 0, range: 16 * MAX_DRAWS as u64 },
         DescriptorBufferInfo { buffer: g.tex_map.buffer, offset: 0, range: 8 * TEX_MAP as u64 },
+        DescriptorBufferInfo { buffer: g.env.buffer, offset: 0, range: ENV_BYTES },
     ];
     let writes: Vec<WriteDescriptorSet> = infos
         .iter()
@@ -913,6 +942,7 @@ pub(crate) fn record(
         (f.cmd_fill_buffer)(cmd, g.blocks.buffer, 0, BLOCK_BYTES * g.block_room, 0);
         (f.cmd_fill_buffer)(cmd, g.globals.buffer, 16, GLOBALS_BYTES - 16, 0);
         (f.cmd_fill_buffer)(cmd, g.slots.buffer, 0, SLOT_BYTES * SLOTS as u64, 0);
+        (f.cmd_fill_buffer)(cmd, g.env.buffer, 0, ENV_BYTES, 0);
     }
     g.barrier(cmd, STAGE_TRANSFER | STAGE_COMPUTE, ACCESS_TRANSFER_WRITE | ACCESS_SHADER_WRITE);
     let current = (triangles.min(capacity / capture::TRIANGLE_BYTES)) as u32;
@@ -1030,16 +1060,25 @@ pub(crate) fn record(
     let region = [0u64, 0, 4 * GLOBALS_READ as u64];
     (g.buffers.copy_buffer)(cmd, g.globals.buffer, g.readback.buffer, 1, region.as_ptr());
     stamp(1);
-    (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[TRACE]);
     (f.cmd_bind_descriptor_sets)(cmd, BIND_POINT_COMPUTE, g.trace_layout, 0, 3, all_sets.as_ptr(), 0, std::ptr::null());
+    let mut tp = *params;
+    if !env_on() {
+        tp.flags |= FLAG_NO_ENV;
+    }
     (f.cmd_push_constants)(
         cmd,
         g.trace_layout,
         SHADER_STAGE_COMPUTE,
         0,
         std::mem::size_of::<super::super::ssr::Params>() as u32,
-        (params as *const super::super::ssr::Params).cast(),
+        (&tp as *const super::super::ssr::Params).cast(),
     );
+    // The sky the opaque copy shows, into the environment, a quarter of the
+    // pixels a frame.
+    (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[ENV]);
+    (f.cmd_dispatch)(cmd, extent[0].div_ceil(2).div_ceil(8), extent[1].div_ceil(2).div_ceil(8), 1);
+    g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
+    (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[TRACE]);
     // One ray per 2 by 2 block, then every pixel from the blocks around it.
     (f.cmd_dispatch)(cmd, extent[0].div_ceil(2).div_ceil(8), extent[1].div_ceil(2).div_ceil(8), 1);
     g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
@@ -1166,10 +1205,11 @@ pub(crate) fn stats_line() -> String {
     let st = state();
     let s = &st.stats;
     format!(
-        "on={} reflections={} shade={} traced={} skipped={} keys={} {} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} gpu_samples={}{}",
+        "on={} reflections={} shade={} environment={} traced={} skipped={} keys={} {} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} gpu_samples={}{}",
         is_on(),
         if super::super::ssr::reflections_on() { "on" } else { "off" },
         SHADES[shade().load(Relaxed)],
+        if env_on() { "on" } else { "off" },
         s.frames,
         s.skipped,
         s.keys,

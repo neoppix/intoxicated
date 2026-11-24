@@ -123,7 +123,7 @@ pub(crate) const MAX_TEXTURES: usize = 256;
 pub(crate) const TRIANGLE_BYTES: u64 = 3 * spirv::STRIDE as u64;
 
 /// The triangles our buffer holds, unless `INTOXICATED_RT_TRIANGLES` says
-/// (120 MiB; Timebomb Duels draws 30000 to 180000 a frame).
+/// (144 MiB; Timebomb Duels draws 30000 to 180000 a frame).
 const DEFAULT_TRIANGLES: u64 = 1 << 19;
 
 pub const DUMP_ENV: &str = "INTOXICATED_RT_DUMP";
@@ -1562,7 +1562,7 @@ mod tests {
         assert!(!covers([100, 0, 1567, 1349], [1667, 1349]));
         assert!(!covers([0, 0, 1667, 1000], [1667, 1349]));
         // A vertex is a position, a colour, a camera vector, a world
-        // position and texture coordinates.
-        assert_eq!(TRIANGLE_BYTES, 240);
+        // position, texture coordinates and a normal.
+        assert_eq!(TRIANGLE_BYTES, 288);
     }
 }

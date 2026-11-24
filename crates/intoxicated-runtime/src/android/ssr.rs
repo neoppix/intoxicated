@@ -3427,7 +3427,7 @@ mod tests {
                 .collect()
         };
         // The same list as build.rs's `SHADERS`.
-        let shaders: [(&str, &str, &[&str]); 24] = [
+        let shaders: [(&str, &str, &[&str]); 25] = [
             ("depth_capture/resolve.comp", "depth_capture/resolve_ms", &[]),
             ("depth_capture/resolve.comp", "depth_capture/resolve_1x", &["-DSINGLE_SAMPLE"]),
             ("ssr/depth.comp", "ssr/depth_ms", &[]),
@@ -3444,6 +3444,7 @@ mod tests {
             ("ssr/post.comp", "ssr/post_bloom_compose", &["-DBLOOM_COMPOSE"]),
             ("ssr/ssr.comp", "ssr/rt_trace", &["-DRT"]),
             ("ssr/ssr.comp", "ssr/rt_upsample", &["-DRT", "-DUPSAMPLE"]),
+            ("ssr/ssr.comp", "ssr/rt_env", &["-DRT", "-DENVMAP"]),
             ("rt/build.comp", "rt/build_fit", &["-DFIT"]),
             ("rt/build.comp", "rt/build_insert", &["-DINSERT"]),
             ("rt/build.comp", "rt/build_gather", &["-DGATHER"]),

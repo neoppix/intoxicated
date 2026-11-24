@@ -63,8 +63,9 @@ layout(set = 0, binding = 2, r32f) uniform readonly image2D depth_copy;
 #endif
 
 // Per captured vertex: the clip-space position, the colour, the vector to
-// the camera (xyz), the world position (xyz, w 1 when static) and the
-// texture coordinates (xy).
+// the camera (xyz), the world position (xyz; w 1 when static, plus 2 when
+// the normal is captured), the texture coordinates (xy) and the normal in
+// the world (xyz).
 layout(std430, set = BUFSET, binding = 0) readonly buffer Xfb { vec4 xfb[]; };
 layout(std430, set = BUFSET, binding = 2) buffer Sorted { uvec2 sorted[]; };
 layout(std430, set = BUFSET, binding = 3) coherent buffer Nodes { vec4 nodes[]; };
@@ -107,11 +108,19 @@ layout(std430, set = BUFSET, binding = 6) buffer Globals {
     // could not measure the camera in, since the start.
     uint cut;
     uint fit_failures;
+    // The sky the screen showed this frame (sums of r, g, b times 256 and a
+    // count, from the environment pass of ssr.comp), and on average (FIT).
+    uint sky_r;
+    uint sky_g;
+    uint sky_b;
+    uint sky_n;
+    vec4 sky;
 };
-// Triangles to trace, five vec4 each: three vertices (world xyz, the colour
+// Triangles to trace, six vec4 each: three vertices (world xyz, the colour
 // packed in w), the texture coordinates of A and B, then those of C, the
 // texture code (see `capture::MODE_*`) and the source (the low bits of the
-// vertex shader's hash, for dumps).
+// vertex shader's hash, for dumps), then the three vertex normals packed
+// (snorm 8-bit xyz) and 1 when they are real.
 layout(std430, set = BUFSET, binding = 8) buffer Tris { vec4 tris[]; };
 // The cache: `SLOT_WORDS` words a slot, at the `S_*` offsets.
 layout(std430, set = BUFSET, binding = 9) buffer Slots { uint slots[]; };
@@ -153,8 +162,8 @@ const float FAR = 512.0;
 // it is dropped, so one frame the engine skips does not drop it.
 const uint MISSES = 8u;
 const uint PROBES = 16u;
-const uint VERTEX_VEC4 = 5u;
-const uint TRI_VEC4 = 5u;
+const uint VERTEX_VEC4 = 6u;
+const uint TRI_VEC4 = 6u;
 const uint SLOT_WORDS = 32u;
 const uint S_TAG = 0u;
 const uint S_KEY = 1u;
@@ -166,6 +175,19 @@ const uint S_BORN = 6u;
 const uint S_POS = 8u;
 const uint S_COL = 17u;
 const uint S_UV = 20u;
+const uint S_NRM = 26u;
+// Frames in a row it was drawn at the same place, and whether that once
+// reached `STABLE` (only such triangles are traced from the cache: a thing
+// that moves, such as what a player wears, never is); frames in a row it
+// was in view, hidden, and not drawn.
+const uint S_STREAK = 7u;
+const uint S_PROMOTED = 29u;
+const uint S_HIDDEN = 30u;
+const uint STABLE = 60u;
+const uint HIDDEN_FRAMES = 240u;
+// Cached triangles further than this from the camera are not traced, and
+// dropped beyond twice it.
+const float REACH = 256.0;
 
 bool usable(vec4 c) {
     return c.z > 0.0 && c.w > 0.0 && !any(isnan(c)) && !any(isinf(c));
@@ -234,12 +256,22 @@ void main() {
     if ((gen & 0xffu) == 0u) {
         gen += 1u;
     }
-    if (lit_colour > 256u * 64u) {
+    // The exposure follows only what enough hits measured, and slowly, so
+    // a frame with few hits on screen does not move it.
+    if (lit_colour > 256u * 512u) {
         float ratio = clamp(float(lit_screen) / float(lit_colour), 0.1, 2.0);
-        exposure = exposure > 0.0 ? mix(exposure, ratio, 0.1) : ratio;
+        exposure = exposure > 0.0 ? mix(exposure, ratio, 0.02) : ratio;
     }
     lit_screen = 0u;
     lit_colour = 0u;
+    if (sky_n > 64u) {
+        vec3 now = vec3(sky_r, sky_g, sky_b) / (256.0 * float(sky_n));
+        sky = vec4(sky.w > 0.0 ? mix(sky.rgb, now, 0.05) : now, 1.0);
+    }
+    sky_r = 0u;
+    sky_g = 0u;
+    sky_b = 0u;
+    sky_n = 0u;
     float n = red[16][0];
     fit_samples = uint(n);
     fit_ok = 0u;
@@ -320,25 +352,31 @@ void main() {
     vec4 W[3];
     uint col[3];
     vec2 uv[3];
-    bool fixed_ = true;
+    uint nrm[3];
+    bool fixed_ = true, normals = true;
     for (uint k = 0u; k < 3u; ++k) {
         uint v = VERTEX_VEC4 * (3u * i + k);
         W[k] = xfb[v + 3u];
         col[k] = pack_colour(xfb[v + 1u]);
         uv[k] = xfb[v + 4u].xy;
-        fixed_ = fixed_ && W[k].w > 0.5 && usable(xfb[v]);
+        vec3 n = xfb[v + 5u].xyz;
+        normals = normals && W[k].w >= 1.5 && dot(n, n) > 1e-8 && !any(isnan(n));
+        nrm[k] = normals ? packSnorm4x8(vec4(normalize(n), 0.0)) : 0u;
+        fixed_ = fixed_ && mod(W[k].w, 2.0) > 0.5 && usable(xfb[v]);
         tris[TRI_VEC4 * i + k] = vec4(W[k].xyz, uintBitsToFloat(col[k]));
     }
     uvec4 d = draw_of(i);
     tris[TRI_VEC4 * i + 3u] = vec4(uv[0], uv[1]);
     tris[TRI_VEC4 * i + 4u] = vec4(uv[2], uintBitsToFloat(d.y), uintBitsToFloat(d.z));
+    tris[TRI_VEC4 * i + 5u] = uintBitsToFloat(uvec4(nrm[0], nrm[1], nrm[2], normals ? 1u : 0u));
     if (!fixed_ || fit_ok == 0u) {
         return;
     }
-    // Two hashes of the nine coordinates' bits.
+    // Two hashes of the nine coordinates, to a sixteenth of a stud: a part
+    // that sways by a hair (a breath of an animation) stays one entry.
     uint h1 = 0x9747b28cu, h2 = 0x85ebca6bu;
     for (uint k = 0u; k < 3u; ++k) {
-        uvec3 b = floatBitsToUint(W[k].xyz);
+        uvec3 b = uvec3(ivec3(round(W[k].xyz * 16.0)));
         h1 = mix_bits(mix_bits(mix_bits(h1, b.x), b.y), b.z);
         h2 = mix_bits(mix_bits(mix_bits(h2, b.z), b.x), b.y);
     }
@@ -355,11 +393,22 @@ void main() {
         uint base = ((h2 + p) & mask) * SLOT_WORDS;
         uint t = slots[base + S_TAG];
         if (t == tag && slots[base + S_KEY] == h2) {
+            uint streak = slots[base + S_SEEN] + 1u == frame ? min(slots[base + S_STREAK] + 1u, 65535u) : 1u;
+            slots[base + S_STREAK] = streak;
+            if (streak >= STABLE) {
+                slots[base + S_PROMOTED] = 1u;
+            }
             slots[base + S_SEEN] = frame;
             slots[base + S_MISSES] = 0u;
+            slots[base + S_HIDDEN] = 0u;
             slots[base + S_CODE] = d.y;
             for (uint k = 0u; k < 3u; ++k) {
                 slots[base + S_COL + k] = col[k];
+                slots[base + S_NRM + k] = nrm[k];
+                uvec3 b = floatBitsToUint(W[k].xyz);
+                slots[base + S_POS + 3u * k] = b.x;
+                slots[base + S_POS + 3u * k + 1u] = b.y;
+                slots[base + S_POS + 3u * k + 2u] = b.z;
             }
             return;
         }
@@ -397,12 +446,16 @@ void main() {
     slots[best + S_CODE] = d.y;
     slots[best + S_SOURCE] = d.z;
     slots[best + S_BORN] = frame;
+    slots[best + S_STREAK] = 1u;
+    slots[best + S_PROMOTED] = 0u;
+    slots[best + S_HIDDEN] = 0u;
     for (uint k = 0u; k < 3u; ++k) {
         uvec3 b = floatBitsToUint(W[k].xyz);
         slots[best + S_POS + 3u * k] = b.x;
         slots[best + S_POS + 3u * k + 1u] = b.y;
         slots[best + S_POS + 3u * k + 2u] = b.z;
         slots[best + S_COL + k] = col[k];
+        slots[best + S_NRM + k] = nrm[k];
         uvec2 u = floatBitsToUint(uv[k]);
         slots[best + S_UV + 2u * k] = u.x;
         slots[best + S_UV + 2u * k + 1u] = u.y;
@@ -459,21 +512,29 @@ void main() {
         W[k] = uintBitsToFloat(uvec3(slots[base + S_POS + 3u * k], slots[base + S_POS + 3u * k + 1u], slots[base + S_POS + 3u * k + 2u]));
     }
     vec3 a = view_of(W[0]), b = view_of(W[1]), c = view_of(W[2]);
-    // Gone: the view showed its place empty for several frames in a row
-    // while the frame (captured whole) did not draw it.
-    if (inside(a) && inside(b) && inside(c) && (pc.flags_ & 1u) != 0u && place_shown((a + b + c) / 3.0)) {
-        uint misses = slots[base + S_MISSES] + 1u;
-        slots[base + S_MISSES] = misses;
-        if (misses >= MISSES) {
+    float distance_ = length((a + b + c) / 3.0);
+    if (distance_ > 2.0 * REACH || (frame - seen > MAX_AGE && distance_ > FAR)) {
+        slots[base + S_TAG] = 0u;
+        return;
+    }
+    // Gone: in view while the frame (captured whole) did not draw it, for
+    // several frames in a row where its place shows empty, for a second
+    // where something is drawn in front of it.
+    if (inside(a) && inside(b) && inside(c) && (pc.flags_ & 1u) != 0u) {
+        bool empty = place_shown((a + b + c) / 3.0);
+        uint at = empty ? S_MISSES : S_HIDDEN;
+        uint n = slots[base + at] + 1u;
+        slots[base + at] = n;
+        if (n >= (empty ? MISSES : HIDDEN_FRAMES)) {
             slots[base + S_TAG] = 0u;
             atomicAdd(dropped, 1u);
             return;
         }
     } else {
         slots[base + S_MISSES] = 0u;
+        slots[base + S_HIDDEN] = 0u;
     }
-    if (frame - seen > MAX_AGE && length(a) > FAR) {
-        slots[base + S_TAG] = 0u;
+    if (slots[base + S_PROMOTED] == 0u || distance_ > REACH) {
         return;
     }
     uint k = atomicAdd(cached, 1u);
@@ -489,6 +550,8 @@ void main() {
     vec2 u2 = uintBitsToFloat(uvec2(slots[base + S_UV + 4u], slots[base + S_UV + 5u]));
     tris[TRI_VEC4 * at + 3u] = vec4(u0, u1);
     tris[TRI_VEC4 * at + 4u] = vec4(u2, uintBitsToFloat(slots[base + S_CODE]), uintBitsToFloat(slots[base + S_SOURCE]));
+    uint nA = slots[base + S_NRM], nB = slots[base + S_NRM + 1u], nC = slots[base + S_NRM + 2u];
+    tris[TRI_VEC4 * at + 5u] = uintBitsToFloat(uvec4(nA, nB, nC, (nA | nB | nC) != 0u ? 1u : 0u));
 }
 
 #endif

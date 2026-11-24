@@ -524,6 +524,10 @@ pub fn control(args: &[&str]) -> Result<String, String> {
         }
         ["dump", path] => capture::dump(path),
         ["dump-cache", path] => trace::dump_cache(path),
+        ["env", w @ ("on" | "off")] => {
+            trace::set_env(*w == "on");
+            Ok(trace::stats_line())
+        }
         ["shade", name] => {
             trace::set_shade(name)?;
             Ok(trace::stats_line())
@@ -549,7 +553,7 @@ pub fn control(args: &[&str]) -> Result<String, String> {
                 trace::stats_line()
             ))
         }
-        _ => Err("rt [stats] | on | off | shade own|mix|screen | draws | dump <path> | dump-cache <path>".into()),
+        _ => Err("rt [stats] | on | off | shade own|mix|screen | env on|off | draws | dump <path> | dump-cache <path>".into()),
     }
 }
 
