@@ -7,6 +7,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
@@ -834,5 +835,291 @@ std::optional<FlagMap> readDefaultFlags(QString *error) {
     }
     return flags;
 }
+
+// --- Reflections -------------------------------------------------------------
+
+const SsrKnob *SsrTable::knob(const QString &name) const {
+    for (const SsrKnob &k : knobs) {
+        if (k.name == name)
+            return &k;
+    }
+    return nullptr;
+}
+
+const SsrLook *SsrTable::look(const QString &name) const {
+    for (const SsrLook &l : looks) {
+        if (l.name == name)
+            return &l;
+    }
+    return nullptr;
+}
+
+namespace {
+
+int ssrWidth(const SsrKnob &knob) { return knob.kind == SsrKind::Rgb ? 3 : 1; }
+
+// A JSON value as a knob's value: a number, or three for an Rgb knob.
+std::optional<SsrValue> ssrJsonValue(const SsrKnob &knob, const QJsonValue &v) {
+    SsrValue out;
+    if (knob.kind == SsrKind::Rgb) {
+        const QJsonArray a = v.toArray();
+        if (!v.isArray() || a.size() != 3)
+            return std::nullopt;
+        for (const QJsonValue &part : a) {
+            if (!part.isDouble())
+                return std::nullopt;
+            out.append(part.toDouble());
+        }
+    } else {
+        if (!v.isDouble())
+            return std::nullopt;
+        out.append(v.toDouble());
+    }
+    return out;
+}
+
+} // namespace
+
+bool parseSsrTable(const QByteArray &json, SsrTable *out, QString *error) {
+    const auto fail = [&](const QString &why) {
+        if (error)
+            *error = why;
+        return false;
+    };
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(json, &parseError);
+    if (doc.isNull())
+        return fail(parseError.errorString());
+    if (!doc.isObject())
+        return fail(QStringLiteral("not a JSON object"));
+    const QJsonObject root = doc.object();
+    if (root.value(QStringLiteral("switch")).toString() != kSsrSetting ||
+        root.value(QStringLiteral("look_env")).toString() != kSsrLookSetting)
+        return fail(QStringLiteral("it names other settings than %1 and %2").arg(kSsrSetting, kSsrLookSetting));
+
+    SsrTable table;
+    for (const QJsonValue &v : root.value(QStringLiteral("knobs")).toArray()) {
+        const QJsonObject o = v.toObject();
+        SsrKnob k;
+        k.name = o.value(QStringLiteral("name")).toString();
+        k.env = o.value(QStringLiteral("env")).toString();
+        const QString kind = o.value(QStringLiteral("kind")).toString();
+        if (kind == QLatin1String("number"))
+            k.kind = SsrKind::Number;
+        else if (kind == QLatin1String("whole"))
+            k.kind = SsrKind::Whole;
+        else if (kind == QLatin1String("switch"))
+            k.kind = SsrKind::Switch;
+        else if (kind == QLatin1String("rgb"))
+            k.kind = SsrKind::Rgb;
+        else
+            return fail(QStringLiteral("knob %1 has a kind this app does not know: %2").arg(k.name, kind));
+        if (k.name.isEmpty() || !isSettingKey(k.env) || !k.env.startsWith(kSsrSetting + QLatin1Char('_')) ||
+            k.env == kSsrLookSetting || table.knob(k.name))
+            return fail(QStringLiteral("a knob without a usable name or variable: %1").arg(k.name));
+        if (!o.value(QStringLiteral("min")).isDouble() || !o.value(QStringLiteral("max")).isDouble())
+            return fail(QStringLiteral("knob %1 has no range").arg(k.name));
+        k.min = o.value(QStringLiteral("min")).toDouble();
+        k.max = o.value(QStringLiteral("max")).toDouble();
+        const auto def = ssrJsonValue(k, o.value(QStringLiteral("default")));
+        if (!(k.min < k.max) || !def)
+            return fail(QStringLiteral("knob %1 has no usable range or default").arg(k.name));
+        k.defaultValue = *def;
+        table.knobs.append(k);
+    }
+    if (table.knobs.isEmpty())
+        return fail(QStringLiteral("it lists no knobs"));
+
+    static const QRegularExpression lookName(QStringLiteral("^[a-z0-9_]+$"));
+    for (const QJsonValue &v : root.value(QStringLiteral("looks")).toArray()) {
+        const QJsonObject o = v.toObject();
+        SsrLook look;
+        look.name = o.value(QStringLiteral("name")).toString();
+        look.description = o.value(QStringLiteral("description")).toString();
+        if (!lookName.match(look.name).hasMatch() || table.look(look.name))
+            return fail(QStringLiteral("a look without a usable name: %1").arg(look.name));
+        const QJsonObject values = o.value(QStringLiteral("values")).toObject();
+        for (const SsrKnob &k : table.knobs) {
+            const auto value = ssrJsonValue(k, values.value(k.name));
+            if (!value)
+                return fail(QStringLiteral("look %1 has no value for %2").arg(look.name, k.name));
+            look.values.insert(k.name, *value);
+        }
+        table.looks.append(look);
+    }
+    table.defaultLook = root.value(QStringLiteral("default_look")).toString();
+    if (!table.look(table.defaultLook))
+        return fail(QStringLiteral("the default look %1 is not listed").arg(table.defaultLook));
+    *out = table;
+    return true;
+}
+
+std::optional<SsrTable> readSsrTable(QString *error) {
+    const auto out = runLauncher({QStringLiteral("--ssr-looks")}, 10000, error);
+    if (!out)
+        return std::nullopt;
+    SsrTable table;
+    QString parseError;
+    if (!parseSsrTable(*out, &table, &parseError)) {
+        *error = QStringLiteral("intoxicated --ssr-looks printed something else: %1").arg(parseError);
+        return std::nullopt;
+    }
+    return table;
+}
+
+QString ssrLookTitle(const QString &name) {
+    QString title = name;
+    title.replace(QLatin1Char('_'), QLatin1Char(' '));
+    if (!title.isEmpty())
+        title[0] = title[0].toUpper();
+    return title;
+}
+
+std::optional<SsrValue> parseSsrValue(const SsrKnob &knob, const QString &text) {
+    const QString t = text.trimmed();
+    // As the client reads a number: an f32, inside the range as an f32.
+    const auto number = [&](const QString &part) -> std::optional<double> {
+        bool ok = false;
+        const double d = QLocale::c().toDouble(part.trimmed(), &ok);
+        const float f = float(d);
+        if (!ok || !(f >= float(knob.min) && f <= float(knob.max)))
+            return std::nullopt;
+        return d;
+    };
+    switch (knob.kind) {
+    case SsrKind::Number:
+        if (const auto v = number(t))
+            return SsrValue{*v};
+        return std::nullopt;
+    case SsrKind::Whole: {
+        static const QRegularExpression digits(QStringLiteral("^\\+?[0-9]{1,10}$"));
+        if (!digits.match(t).hasMatch())
+            return std::nullopt;
+        const qulonglong n = t.toULongLong();
+        if (double(n) < knob.min || double(n) > knob.max)
+            return std::nullopt;
+        return SsrValue{double(n)};
+    }
+    case SsrKind::Switch:
+        if (t == QLatin1String("1"))
+            return SsrValue{1.0};
+        if (t == QLatin1String("0"))
+            return SsrValue{0.0};
+        return std::nullopt;
+    case SsrKind::Rgb: {
+        const QStringList parts = t.split(QLatin1Char(','));
+        if (parts.size() != 1 && parts.size() != 3)
+            return std::nullopt;
+        SsrValue out;
+        for (const QString &part : parts) {
+            const auto v = number(part);
+            if (!v)
+                return std::nullopt;
+            out.append(*v);
+        }
+        if (out.size() == 1)
+            out = {out[0], out[0], out[0]};
+        return out;
+    }
+    }
+    return std::nullopt;
+}
+
+QString shortestFloat(float f) {
+    // Fixed point, with as few decimals as read back as the same float: 0.4
+    // for 0.4f, where the double it widens to would print 0.4000000059604645.
+    for (int decimals = 0; decimals <= 9; ++decimals) {
+        const QString text = QString::number(double(f), 'f', decimals);
+        if (float(text.toDouble()) == f)
+            return text;
+    }
+    return QString::number(double(f), 'g', 9);
+}
+
+QString formatSsrValue(const SsrKnob &knob, const SsrValue &value) {
+    QStringList parts;
+    for (int i = 0; i < ssrWidth(knob) && i < value.size(); ++i) {
+        // The shortest text that reads back as the same f32, as the client
+        // writes its own values.
+        if (knob.kind == SsrKind::Whole || knob.kind == SsrKind::Switch)
+            parts.append(QString::number(qRound64(value[i])));
+        else
+            parts.append(shortestFloat(float(value[i])));
+    }
+    return parts.join(QLatin1Char(','));
+}
+
+bool ssrOn(const SettingsConf &conf) {
+    const auto v = conf.value(kSsrSetting);
+    return v && v->trimmed() == QLatin1String("1");
+}
+
+void setSsrOn(SettingsConf &conf, bool on) {
+    if (on)
+        conf.set(kSsrSetting, QStringLiteral("1"));
+    else
+        conf.remove(kSsrSetting);
+}
+
+QString ssrLook(const SsrTable &table, const SettingsConf &conf, QString *unknown) {
+    const QString name = conf.value(kSsrLookSetting).value_or(QString()).trimmed();
+    if (unknown)
+        unknown->clear();
+    if (name.isEmpty())
+        return table.defaultLook;
+    if (table.look(name))
+        return name;
+    if (unknown)
+        *unknown = name;
+    return table.defaultLook;
+}
+
+std::optional<QString> ssrOverride(const SettingsConf &conf, const SsrKnob &knob) {
+    const auto v = conf.value(knob.env);
+    if (!v || v->trimmed().isEmpty())
+        return std::nullopt;
+    return v;
+}
+
+QStringList ssrOverrides(const SsrTable &table, const SettingsConf &conf) {
+    QStringList out;
+    for (const SsrKnob &k : table.knobs) {
+        if (ssrOverride(conf, k))
+            out.append(k.name);
+    }
+    return out;
+}
+
+SsrValue effectiveSsrValue(const SsrTable &table, const SettingsConf &conf, const SsrKnob &knob) {
+    if (const auto text = ssrOverride(conf, knob)) {
+        if (const auto v = parseSsrValue(knob, *text))
+            return *v;
+    }
+    const SsrLook *look = table.look(ssrLook(table, conf));
+    return look ? look->values.value(knob.name, knob.defaultValue) : knob.defaultValue;
+}
+
+bool applySsrLook(const SsrTable &table, SettingsConf &conf, const QString &look) {
+    if (!table.look(look))
+        return false;
+    if (look == table.defaultLook)
+        conf.remove(kSsrLookSetting);
+    else
+        conf.set(kSsrLookSetting, look);
+    for (const SsrKnob &k : table.knobs)
+        conf.remove(k.env);
+    return true;
+}
+
+bool setSsrKnob(SettingsConf &conf, const SsrKnob &knob, const SsrValue &value) {
+    if (value.size() != ssrWidth(knob))
+        return false;
+    const QString text = formatSsrValue(knob, value);
+    if (!parseSsrValue(knob, text))
+        return false;
+    return conf.set(knob.env, text);
+}
+
+void resetSsrKnob(SettingsConf &conf, const SsrKnob &knob) { conf.remove(knob.env); }
 
 } // namespace intox

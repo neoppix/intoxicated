@@ -257,6 +257,87 @@ std::optional<QByteArray> runLauncher(const QStringList &args, int timeoutMs, QS
 // `intoxicated --default-flags`, parsed.
 std::optional<FlagMap> readDefaultFlags(QString *error);
 
+// --- Reflections (the Shaders page) -----------------------------------------
+
+// The client's screen-space reflections are set by settings.conf lines the
+// client reads at start: INTOXICATED_SSR=1 turns them on,
+// INTOXICATED_SSR_LOOK=<name> starts from a named look and
+// INTOXICATED_SSR_<KNOB>=<value> overrides one knob of it. The knobs and the
+// looks are the client's own, read from `intoxicated --ssr-looks`, so this
+// app keeps no copy of them.
+
+inline const QString kSsrSetting = QStringLiteral("INTOXICATED_SSR");
+inline const QString kSsrLookSetting = QStringLiteral("INTOXICATED_SSR_LOOK");
+
+enum class SsrKind { Number, Whole, Switch, Rgb };
+
+// One value: one number, or three for an Rgb knob.
+using SsrValue = QList<double>;
+
+struct SsrKnob {
+    QString name;
+    QString env;
+    SsrKind kind = SsrKind::Number;
+    double min = 0;
+    double max = 1;
+    SsrValue defaultValue;
+};
+
+struct SsrLook {
+    QString name;
+    QString description;
+    // Every knob's value when the client starts from this look.
+    QMap<QString, SsrValue> values;
+};
+
+struct SsrTable {
+    QList<SsrKnob> knobs;
+    QList<SsrLook> looks;
+    QString defaultLook;
+
+    const SsrKnob *knob(const QString &name) const;
+    const SsrLook *look(const QString &name) const;
+};
+
+// Parse what `intoxicated --ssr-looks` prints; false with ERROR for anything
+// that is not a usable table.
+bool parseSsrTable(const QByteArray &json, SsrTable *out, QString *error);
+std::optional<SsrTable> readSsrTable(QString *error);
+
+// "wet_road" as a button says it: "Wet road".
+QString ssrLookTitle(const QString &name);
+
+// A value as the client reads it: a number in range, a whole number, 0 or 1,
+// or r,g,b (or one number for all three). nullopt when the client would not
+// take TEXT.
+std::optional<SsrValue> parseSsrValue(const SsrKnob &knob, const QString &text);
+// F as the shortest fixed-point text that reads back as the same float.
+QString shortestFloat(float f);
+// A value as written to settings.conf: the shortest text for each number.
+QString formatSsrValue(const SsrKnob &knob, const SsrValue &value);
+
+// Whether INTOXICATED_SSR is 1, the only value that turns reflections on.
+bool ssrOn(const SettingsConf &conf);
+// On writes INTOXICATED_SSR=1, off removes it.
+void setSsrOn(SettingsConf &conf, bool on);
+// The look the client starts from: the one INTOXICATED_SSR_LOOK names, else
+// the default one (also when it names no look). UNKNOWN is set to the
+// setting's text when it names no look.
+QString ssrLook(const SsrTable &table, const SettingsConf &conf, QString *unknown = nullptr);
+// The knob's line in settings.conf, when it has a non-blank one.
+std::optional<QString> ssrOverride(const SettingsConf &conf, const SsrKnob &knob);
+// The knobs that have an override line.
+QStringList ssrOverrides(const SsrTable &table, const SettingsConf &conf);
+// The value the client starts with: a usable override, else the look's.
+SsrValue effectiveSsrValue(const SsrTable &table, const SettingsConf &conf, const SsrKnob &knob);
+// Start from LOOK: the default look removes INTOXICATED_SSR_LOOK, another one
+// writes it. Either way every knob's override is removed. Refused, with CONF
+// unchanged, for a name that is not a look.
+bool applySsrLook(const SsrTable &table, SettingsConf &conf, const QString &look);
+// Write the knob's override; refused for a value the client would not take.
+bool setSsrKnob(SettingsConf &conf, const SsrKnob &knob, const SsrValue &value);
+void resetSsrKnob(SettingsConf &conf, const SsrKnob &knob);
+
 // --- Self-test -------------------------------------------------------------
 
 int runSelfTest();

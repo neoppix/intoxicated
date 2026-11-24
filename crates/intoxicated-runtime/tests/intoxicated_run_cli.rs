@@ -173,6 +173,33 @@ fn print_default_flags_prints_the_built_in_layer_and_nothing_else() {
 }
 
 #[test]
+fn print_ssr_looks_prints_the_knobs_and_looks_and_nothing_else() {
+    let root = scratch("ssr-looks");
+    let out = run(&root, &["--print-ssr-looks"], &[]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(!stdout.contains(BANNER_START), "no banner: {stdout}");
+    assert_eq!(stdout, intoxicated_runtime::android::ssr::looks_json() + "\n");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON object");
+    assert_eq!(doc["switch"], "INTOXICATED_SSR");
+    assert_eq!(doc["look_env"], "INTOXICATED_SSR_LOOK");
+    assert_eq!(doc["default_look"], "competitive");
+    let looks: Vec<&str> = doc["looks"].as_array().unwrap().iter().map(|l| l["name"].as_str().unwrap()).collect();
+    assert_eq!(looks, ["competitive", "wet_road", "clean_mirror", "puddles", "glossy"]);
+    let knobs = doc["knobs"].as_array().unwrap();
+    assert!(knobs.iter().all(|k| k["env"].as_str().unwrap().starts_with("INTOXICATED_SSR_")));
+    // The environment does not change the table: it is the client's own, not
+    // what one run would start with.
+    let again = run(&root, &["--print-ssr-looks"], &[("INTOXICATED_SSR_LOOK", "glossy"), ("INTOXICATED_SSR_INTENSITY", "1")]);
+    assert_eq!(text(&again.stdout), stdout);
+    assert!(!root.join("data/intoxicated").exists(), "no profile was touched");
+
+    let help = run(&root, &["--help"], &[]);
+    assert!(text(&help.stderr).contains("\n  --print-ssr-looks  "), "listed in --help");
+}
+
+#[test]
 fn a_busy_profile_is_refused_with_3() {
     let root = scratch("busy");
     let dir = profile_dir(&root, "default");

@@ -3,8 +3,8 @@
 //!
 //! As in `launcher_links.rs`, `packaging/freebsd/intoxicated` is run with
 //! `/bin/sh` against a scratch checkout whose `target/release/intoxicated-run`
-//! is a script. It hands `--check-join-url`, `--print-default-flags` and
-//! `--help` to the real binary and otherwise writes down its arguments, the
+//! is a script. It hands `--check-join-url`, `--print-default-flags`,
+//! `--print-ssr-looks` and `--help` to the real binary and otherwise writes down its arguments, the
 //! `INTOXICATED_*` variables it was started with and the launcher's own
 //! arguments as `ps` shows them, then exits 0. HOME, XDG_CONFIG_HOME,
 //! XDG_DATA_HOME and XDG_CACHE_HOME all point into the scratch directory.
@@ -21,7 +21,7 @@ fn launcher() -> PathBuf {
 
 const FAKE: &str = r#"#!/bin/sh
 case "$1" in
-  --check-join-url|--print-default-flags|--help) exec "$REAL_INTOXICATED_RUN" "$@" ;;
+  --check-join-url|--print-default-flags|--print-ssr-looks|--help) exec "$REAL_INTOXICATED_RUN" "$@" ;;
 esac
 for a in "$@"; do printf '%s\n' "$a"; done > "$RECORD/args"
 env | grep '^INTOXICATED_' > "$RECORD/env"
@@ -233,7 +233,7 @@ fn an_invalid_profile_name_is_refused_with_2() {
 }
 
 #[test]
-fn default_flags_and_version_come_from_the_client() {
+fn default_flags_ssr_looks_and_version_come_from_the_client() {
     let s = Scratch::new("info");
     let r = s.run(&["--default-flags"], &[]);
     assert_eq!(r.status, 0, "{}", r.stderr);
@@ -245,6 +245,16 @@ fn default_flags_and_version_come_from_the_client() {
     for (key, value) in built_in {
         assert_eq!(object[key].as_str(), Some(value));
     }
+
+    let r = s.run(&["--ssr-looks"], &[]);
+    assert_eq!(r.status, 0, "{}", r.stderr);
+    assert!(r.args.is_none(), "the client was not started");
+    assert_eq!(r.stdout, intoxicated_runtime::android::ssr::looks_json() + "\n");
+    // settings.conf's reflection lines do not change the table.
+    s.settings("INTOXICATED_SSR=1\nINTOXICATED_SSR_LOOK=glossy\nINTOXICATED_SSR_INTENSITY=1\n");
+    let r = s.run(&["--ssr-looks"], &[]);
+    assert_eq!(r.stdout, intoxicated_runtime::android::ssr::looks_json() + "\n");
+    s.settings("");
 
     let r = s.run(&["--version"], &[]);
     assert_eq!(r.status, 0, "{}", r.stderr);

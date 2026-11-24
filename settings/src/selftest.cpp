@@ -491,6 +491,259 @@ void testSndstat() {
     }
 }
 
+// What `intoxicated --ssr-looks` prints, cut down to one knob of each kind
+// and three looks (the client's own table is checked against its source by
+// the runtime's tests).
+const QByteArray kSsrLooks = R"({
+  "default_look": "competitive",
+  "knobs": [
+    {"default": 0.4, "env": "INTOXICATED_SSR_INTENSITY", "kind": "number", "max": 1.0, "min": 0.0, "name": "intensity"},
+    {"default": 1, "env": "INTOXICATED_SSR_UP_ONLY", "kind": "switch", "max": 1, "min": 0, "name": "up_only"},
+    {"default": [1.0, 1.0, 1.0], "env": "INTOXICATED_SSR_TINT", "kind": "rgb", "max": 2.0, "min": 0.0, "name": "tint"},
+    {"default": 32, "env": "INTOXICATED_SSR_STEPS", "kind": "whole", "max": 64, "min": 4, "name": "steps"},
+    {"default": 0.06, "env": "INTOXICATED_SSR_THICKNESS", "kind": "number", "max": 1.0, "min": 0.005, "name": "thickness"}
+  ],
+  "look_env": "INTOXICATED_SSR_LOOK",
+  "looks": [
+    {"description": "Faint and soft.", "name": "competitive",
+     "values": {"intensity": 0.4, "steps": 32, "thickness": 0.06, "tint": [1.0, 1.0, 1.0], "up_only": 1}},
+    {"description": "Wet tarmac.", "name": "wet_road",
+     "values": {"intensity": 0.55, "steps": 32, "thickness": 0.06, "tint": [0.92, 0.95, 1.0], "up_only": 1}},
+    {"description": "Walls too.", "name": "glossy",
+     "values": {"intensity": 0.4, "steps": 32, "thickness": 0.06, "tint": [1.0, 1.0, 1.0], "up_only": 0}}
+  ],
+  "switch": "INTOXICATED_SSR"
+})";
+
+void testSsrTable() {
+    SsrTable table;
+    QString error;
+    check(parseSsrTable(kSsrLooks, &table, &error), "the looks parse: " + error);
+    same(table.knobs.size(), 5, "five knobs");
+    same(table.looks.size(), 3, "three looks");
+    same(table.defaultLook, QString("competitive"), "the default look");
+    if (table.knobs.size() == 5 && table.looks.size() == 3) {
+        check(table.knob("tint")->kind == SsrKind::Rgb && table.knob("tint")->max == 2.0, "tint is a colour 0 to 2");
+        check(table.knob("steps")->kind == SsrKind::Whole && table.knob("steps")->min == 4, "steps is whole from 4");
+        check(table.knob("up_only")->kind == SsrKind::Switch, "up_only is a switch");
+        same(table.knob("intensity")->env, QString("INTOXICATED_SSR_INTENSITY"), "a knob's variable");
+        same(table.look("wet_road")->values.value("tint"), SsrValue({0.92, 0.95, 1.0}), "a look's colour");
+        same(table.look("wet_road")->description, QString("Wet tarmac."), "a look's description");
+        check(!table.knob("nope") && !table.look("nope"), "no such knob or look");
+    }
+
+    const auto refused = [](const QByteArray &json, const QString &what) {
+        SsrTable t;
+        QString why;
+        check(!parseSsrTable(json, &t, &why) && !why.isEmpty(), "refused: " + what);
+    };
+    refused("not json", "not JSON");
+    refused("[]", "not an object");
+    refused(QByteArray(kSsrLooks).replace("\"switch\": \"INTOXICATED_SSR\"", "\"switch\": \"INTOXICATED_FPS\""),
+            "another switch");
+    refused(QByteArray(kSsrLooks).replace("\"kind\": \"whole\"", "\"kind\": \"curve\""), "an unknown kind");
+    refused(QByteArray(kSsrLooks).replace("\"default_look\": \"competitive\"", "\"default_look\": \"shiny\""),
+            "a default look that is not listed");
+    refused(QByteArray(kSsrLooks).replace("\"intensity\": 0.55, ", ""), "a look missing a knob");
+    refused(QByteArray(kSsrLooks).replace("\"tint\": [0.92, 0.95, 1.0]", "\"tint\": 0.92"), "a colour as one number");
+    refused(QByteArray(kSsrLooks).replace("\"env\": \"INTOXICATED_SSR_STEPS\"", "\"env\": \"INTOXICATED_FPS\""),
+            "a knob whose variable is not INTOXICATED_SSR_");
+    refused(QByteArray(kSsrLooks).replace("\"env\": \"INTOXICATED_SSR_STEPS\"", "\"env\": \"INTOXICATED_SSR_LOOK\""),
+            "a knob that would write the look's variable");
+    refused(QByteArray(kSsrLooks).replace("\"name\": \"glossy\"", "\"name\": \"wet_road\""), "a look listed twice");
+    refused(QByteArray(kSsrLooks).replace("\"name\": \"glossy\"", "\"name\": \"Glossy look\""), "a look name with capitals");
+
+    same(ssrLookTitle("wet_road"), QString("Wet road"), "a look's title");
+    same(ssrLookTitle("clean_mirror"), QString("Clean mirror"), "another look's title");
+    same(ssrLookTitle("competitive"), QString("Competitive"), "a one-word title");
+}
+
+void testSsrValues() {
+    SsrTable table;
+    parseSsrTable(kSsrLooks, &table, nullptr);
+    if (table.knobs.size() != 5)
+        return;
+    const SsrKnob &intensity = *table.knob("intensity");
+    const SsrKnob &tint = *table.knob("tint");
+    const SsrKnob &steps = *table.knob("steps");
+    const SsrKnob &upOnly = *table.knob("up_only");
+    const SsrKnob &thickness = *table.knob("thickness");
+    const auto takes = [](const SsrKnob &k, const QString &text) { return parseSsrValue(k, text); };
+
+    same(takes(intensity, "0.5").value_or(SsrValue()), SsrValue({0.5}), "a number in range");
+    same(takes(intensity, " 1 ").value_or(SsrValue()), SsrValue({1.0}), "trimmed, and the top of the range");
+    check(!takes(intensity, "1.5") && !takes(intensity, "-0.1"), "out of range is refused");
+    check(!takes(intensity, "abc") && !takes(intensity, "") && !takes(intensity, "nan"), "not a number is refused");
+    check(takes(thickness, "0.005") && !takes(thickness, "0.004"), "a range that does not start at 0");
+    same(takes(steps, "20").value_or(SsrValue()), SsrValue({20.0}), "a whole number");
+    check(takes(steps, "+8").has_value(), "a whole number with a plus, as the client takes it");
+    check(!takes(steps, "3") && !takes(steps, "65") && !takes(steps, "20.5") && !takes(steps, "-8"),
+          "whole numbers out of range or with a fraction are refused");
+    check(takes(upOnly, "1") && takes(upOnly, "0"), "a switch takes 1 and 0");
+    check(!takes(upOnly, "2") && !takes(upOnly, "true") && !takes(upOnly, "on"), "and nothing else");
+    same(takes(tint, "0.5").value_or(SsrValue()), SsrValue({0.5, 0.5, 0.5}), "one number for all three colours");
+    same(takes(tint, "1, 0.5 ,2").value_or(SsrValue()), SsrValue({1.0, 0.5, 2.0}), "r,g,b");
+    check(!takes(tint, "1,2") && !takes(tint, "1,3,1") && !takes(tint, "1,1,1,1"), "a colour that does not fit");
+
+    same(shortestFloat(0.4f), QString("0.4"), "0.4f is written as 0.4");
+    same(shortestFloat(0.06f), QString("0.06"), "0.06f as 0.06");
+    same(shortestFloat(1000.0f), QString("1000"), "a whole float without decimals");
+    same(formatSsrValue(intensity, {0.1 + 0.2}), QString("0.3"), "the shortest text for a float");
+    same(formatSsrValue(tint, {0.92, 0.95, 1.0}), QString("0.92,0.95,1"), "a colour as r,g,b");
+    same(formatSsrValue(steps, {32.0}), QString("32"), "a whole number");
+    same(formatSsrValue(upOnly, {0.0}), QString("0"), "a switch");
+    same(formatSsrValue(thickness, {0.005}), QString("0.005"), "a small number");
+}
+
+void testSsrSettings() {
+    SsrTable table;
+    parseSsrTable(kSsrLooks, &table, nullptr);
+    if (table.knobs.size() != 5)
+        return;
+    const SsrKnob &intensity = *table.knob("intensity");
+    const SsrKnob &tint = *table.knob("tint");
+    const SsrKnob &steps = *table.knob("steps");
+    const SsrKnob &upOnly = *table.knob("up_only");
+    const QString path = settingsConfPath();
+    const QString dir = QFileInfo(path).absolutePath();
+    QString error;
+    const auto reloaded = [&] {
+        SettingsConf c;
+        c.load(path);
+        return c;
+    };
+
+    writeAll(path, "# mine\nINTOXICATED_FPS=144\n");
+    SettingsConf conf;
+    conf.load(path);
+    check(!ssrOn(conf), "reflections are off without the line");
+    same(ssrLook(table, conf), QString("competitive"), "no look line is the default look");
+    same(effectiveSsrValue(table, conf, intensity), SsrValue({0.4}), "the default look's value");
+    check(ssrOverrides(table, conf).isEmpty(), "no overrides");
+
+    // The switch.
+    setSsrOn(conf, true);
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path), QByteArray("# mine\nINTOXICATED_FPS=144\nINTOXICATED_SSR=1\n"), "on writes INTOXICATED_SSR=1");
+    check(ssrOn(reloaded()), "and reads back as on");
+    for (const char *off : {"0", "", "yes", "2"}) {
+        SettingsConf c;
+        c.set("INTOXICATED_SSR", off);
+        check(!ssrOn(c), QStringLiteral("INTOXICATED_SSR=%1 is off").arg(off));
+    }
+    SettingsConf spaced;
+    spaced.set("INTOXICATED_SSR", " 1 ");
+    check(ssrOn(spaced), "the client trims the value");
+    setSsrOn(conf, false);
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path), QByteArray("# mine\nINTOXICATED_FPS=144\n"), "off removes the line and keeps the rest");
+    setSsrOn(conf, true);
+
+    // The look.
+    check(applySsrLook(table, conf, "wet_road"), "pick wet_road");
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path), QByteArray("# mine\nINTOXICATED_FPS=144\nINTOXICATED_SSR=1\nINTOXICATED_SSR_LOOK=wet_road\n"),
+         "a look other than the default is written");
+    conf = reloaded();
+    same(ssrLook(table, conf), QString("wet_road"), "and read back");
+    same(effectiveSsrValue(table, conf, intensity), SsrValue({0.55}), "its value without an override");
+    same(effectiveSsrValue(table, conf, tint), SsrValue({0.92, 0.95, 1.0}), "its colour");
+    check(applySsrLook(table, conf, "competitive"), "pick the default look");
+    check(!conf.contains("INTOXICATED_SSR_LOOK"), "the default look removes the line");
+    check(!applySsrLook(table, conf, "shiny"), "a name that is not a look is refused");
+    check(!conf.contains("INTOXICATED_SSR_LOOK"), "and changes nothing");
+    QString unknown;
+    conf.set("INTOXICATED_SSR_LOOK", "shiny");
+    same(ssrLook(table, conf, &unknown), QString("competitive"), "an unknown look starts from the default");
+    same(unknown, QString("shiny"), "and is reported");
+    conf.set("INTOXICATED_SSR_LOOK", " glossy ");
+    same(ssrLook(table, conf, &unknown), QString("glossy"), "a look name is trimmed, as the client does");
+    check(unknown.isEmpty(), "and is not reported");
+    same(effectiveSsrValue(table, conf, upOnly), SsrValue({0.0}), "glossy's switch");
+
+    // A knob's override.
+    check(setSsrKnob(conf, intensity, {0.7}), "set intensity");
+    check(setSsrKnob(conf, tint, {0.5, 1.0, 1.5}), "set the tint");
+    check(setSsrKnob(conf, steps, {20.0}), "set steps");
+    check(setSsrKnob(conf, upOnly, {1.0}), "set up_only");
+    check(!setSsrKnob(conf, intensity, {1.5}), "out of range is refused");
+    check(!setSsrKnob(conf, tint, {0.5}), "a colour needs three values");
+    check(!setSsrKnob(conf, steps, {70.0}), "a whole number out of range is refused");
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path),
+         QByteArray("# mine\nINTOXICATED_FPS=144\nINTOXICATED_SSR=1\nINTOXICATED_SSR_LOOK= glossy \n"
+                    "INTOXICATED_SSR_INTENSITY=0.7\nINTOXICATED_SSR_TINT=0.5,1,1.5\nINTOXICATED_SSR_STEPS=20\n"
+                    "INTOXICATED_SSR_UP_ONLY=1\n"),
+         "each override is one line, as the client reads it");
+    conf = reloaded();
+    same(effectiveSsrValue(table, conf, intensity), SsrValue({0.7}), "an override wins over the look");
+    same(effectiveSsrValue(table, conf, upOnly), SsrValue({1.0}), "also for a switch");
+    same(ssrOverrides(table, conf), QStringList({"intensity", "up_only", "tint", "steps"}), "the overrides, in knob order");
+    check(setSsrKnob(conf, intensity, {0.25}), "set intensity again");
+    same(conf.value("INTOXICATED_SSR_INTENSITY").value_or(""), QString("0.25"), "the line is replaced");
+
+    resetSsrKnob(conf, intensity);
+    check(!conf.contains("INTOXICATED_SSR_INTENSITY"), "reset removes the override");
+    same(effectiveSsrValue(table, conf, intensity), SsrValue({0.4}), "and the look's value is back");
+    check(conf.save(&error), "save: " + error);
+    check(!readAll(path).contains("INTOXICATED_SSR_INTENSITY"), "also in the file");
+
+    // Overrides the client would not take, or blank ones.
+    conf.set("INTOXICATED_SSR_INTENSITY", "lots");
+    conf.set("INTOXICATED_SSR_THICKNESS", "  ");
+    check(ssrOverride(conf, intensity).has_value(), "a bad override is still an override");
+    same(effectiveSsrValue(table, conf, intensity), SsrValue({0.4}), "but the client uses the look's value");
+    check(!ssrOverride(conf, *table.knob("thickness")), "a blank line is no override");
+
+    // Picking a look removes every override, duplicates and bad ones too.
+    writeAll(path, "INTOXICATED_SSR=1\nINTOXICATED_SSR_STEPS=8\n# keep\nINTOXICATED_SSR_STEPS=12\n"
+                   "INTOXICATED_SSR_INTENSITY=lots\nINTOXICATED_SSR_TINT=1,1,1\nINTOXICATED_SSR_LOOK=glossy\n"
+                   "INTOXICATED_SSRX=1\n");
+    conf = reloaded();
+    same(ssrOverrides(table, conf), QStringList({"intensity", "tint", "steps"}), "three overrides");
+    check(applySsrLook(table, conf, "wet_road"), "pick wet_road over them");
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path), QByteArray("INTOXICATED_SSR=1\n# keep\nINTOXICATED_SSR_LOOK=wet_road\nINTOXICATED_SSRX=1\n"),
+         "every override is gone, the rest kept");
+    conf = reloaded();
+    check(applySsrLook(table, conf, "competitive"), "and the default look");
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path), QByteArray("INTOXICATED_SSR=1\n# keep\nINTOXICATED_SSRX=1\n"), "leaves no look line");
+    same(strays(dir, {"settings.conf"}), QStringList(), "no temporary file left beside settings.conf");
+    QFile::remove(path);
+}
+
+// readSsrTable runs `intoxicated --ssr-looks`: a fake launcher on PATH, in
+// the scratch directory.
+void testSsrLauncher(const QString &scratch) {
+    const QString bin = scratch + "/bin";
+    QDir().mkpath(bin);
+    writeAll(scratch + "/looks.json", kSsrLooks);
+    const QString launcher = bin + "/intoxicated";
+    const auto fake = [&](const QByteArray &body) {
+        writeAll(launcher, "#!/bin/sh\n" + body);
+        QFile::setPermissions(launcher, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+    };
+    const QByteArray savedPath = qgetenv("PATH");
+    qputenv("PATH", QFile::encodeName(bin) + ":" + savedPath);
+    QString error;
+    fake("[ \"$1\" = --ssr-looks ] && [ $# -eq 1 ] && exec cat '" + QFile::encodeName(scratch) + "/looks.json'\nexit 7\n");
+    same(launcherPath(), launcher, "the fake launcher is the one found");
+    const auto table = readSsrTable(&error);
+    check(table.has_value(), "the looks come from intoxicated --ssr-looks: " + error);
+    if (table)
+        same(table->looks.size(), 3, "all of them");
+
+    fake("echo '{\"looks\": []}'\n");
+    check(!readSsrTable(&error), "something else is refused");
+    check(error.startsWith("intoxicated --ssr-looks printed something else"), "and said: " + error);
+
+    fake("echo 'intoxicated: target/release/intoxicated-run is not built' >&2\nexit 1\n");
+    check(!readSsrTable(&error), "a failed launcher is reported");
+    check(error.contains("is not built"), "with what it said: " + error);
+    qputenv("PATH", savedPath);
+}
+
 } // namespace
 
 int runSelfTest() {
@@ -518,6 +771,10 @@ int runSelfTest() {
     testVideoMemoryDefault();
     testProfiles();
     testSndstat();
+    testSsrTable();
+    testSsrValues();
+    testSsrSettings();
+    testSsrLauncher(root);
 
     std::printf("self-test: %d checks, %d failed (scratch %s)\n", g_checks, g_failures, qPrintable(root));
     return g_failures == 0 ? 0 : 1;

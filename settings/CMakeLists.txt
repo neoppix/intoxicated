@@ -31,6 +31,7 @@ qt_add_executable(intoxicated-settings
   src/style.cpp
   src/flags_page.cpp
   src/client_page.cpp
+  src/shaders_page.cpp
   src/profiles_page.cpp
   src/other_pages.cpp
   src/selftest.cpp

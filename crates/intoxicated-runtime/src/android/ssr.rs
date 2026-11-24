@@ -228,6 +228,8 @@ pub const LOOK_ENV: &str = "INTOXICATED_SSR_LOOK";
 /// knobs in [`NOT_A_LOOK`], which stay as they are.
 pub(crate) struct Look {
     pub name: &'static str,
+    /// One line for the Shaders page, under the look's button.
+    pub description: &'static str,
     pub values: &'static [(&'static str, [f32; 3])],
 }
 
@@ -238,11 +240,14 @@ const NOT_A_LOOK: [&str; 3] = ["steps", "thickness", "fov"];
 /// Timebomb Duels; the others are starting points whose look is INFERRED
 /// (`ssr look wet_road` was applied live there, not judged).
 pub(crate) const LOOKS: [Look; 5] = [
-    // Faint and soft, floors only: depth without distraction.
-    Look { name: "competitive", values: &[] },
-    // Darker, slightly blue wet tarmac with a clear, fairly strong reflection.
+    Look {
+        name: "competitive",
+        description: "Faint and soft, on floors only: depth without drawing the eye. Tuned for competitive play.",
+        values: &[],
+    },
     Look {
         name: "wet_road",
+        description: "Darker, slightly blue wet tarmac with a clear, fairly strong reflection.",
         values: &[
             ("intensity", [0.55; 3]),
             ("roughness", [0.25; 3]),
@@ -252,15 +257,14 @@ pub(crate) const LOOKS: [Look; 5] = [
             ("keep_colour", [0.3; 3]),
         ],
     },
-    // As sharp as the compose's blur allows, strong at every angle.
     Look {
         name: "clean_mirror",
+        description: "As sharp as the reflections get, and strong at every angle.",
         values: &[("intensity", [0.9; 3]), ("roughness", [0.0; 3]), ("fresnel", [0.3; 3]), ("keep_colour", [0.0; 3])],
     },
-    // Only the flattest floors, darkened, with a strong and fairly clear
-    // reflection.
     Look {
         name: "puddles",
+        description: "Only the flattest floors, darkened, with a strong and fairly clear reflection.",
         values: &[
             ("intensity", [0.7; 3]),
             ("roughness", [0.15; 3]),
@@ -270,9 +274,9 @@ pub(crate) const LOOKS: [Look; 5] = [
             ("keep_colour", [0.2; 3]),
         ],
     },
-    // Every surface a little glossy, walls too, in its own colour.
     Look {
         name: "glossy",
+        description: "Every surface a little glossy, walls too, each in its own colour.",
         values: &[("intensity", [0.4; 3]), ("roughness", [0.2; 3]), ("fresnel", [0.9; 3]), ("up_only", [0.0; 3]), ("keep_colour", [0.7; 3])],
     },
 ];
@@ -296,8 +300,78 @@ pub(crate) fn look_values(name: &str) -> Option<Vec<Option<[f32; 3]>>> {
     )
 }
 
+/// Every knob's value at start from look `name` (as [`KNOBS`] orders them),
+/// before the knobs' own variables: what the look sets, the default for the
+/// rest.
+fn start_values(name: &str) -> Option<Vec<[f32; 3]>> {
+    let look = look_values(name)?;
+    Some(KNOBS.iter().zip(look).map(|(k, v)| v.unwrap_or(k.default)).collect())
+}
+
 fn look_names() -> String {
     LOOKS.iter().map(|l| l.name).collect::<Vec<_>>().join(" ")
+}
+
+/// A knob's value as JSON: a number (whole for a whole number or a switch),
+/// or `[r, g, b]` for a colour. Each number is the shortest text that reads
+/// back as the same `f32`, as `ssr get` writes it, not the `f64` the `f32`
+/// widens to (0.4, not 0.4000000059604645).
+fn json_value(k: &Knob, v: [f32; 3]) -> serde_json::Value {
+    match k.kind {
+        Kind::Rgb { .. } => serde_json::Value::Array(v.iter().map(|&f| json_number(f)).collect()),
+        Kind::Whole { .. } | Kind::Switch => serde_json::Value::from(v[0] as u32),
+        Kind::Number { .. } => json_number(v[0]),
+    }
+}
+
+fn json_number(f: f32) -> serde_json::Value {
+    let shortest: f64 = format!("{f}").parse().expect("an f32 prints as a number");
+    serde_json::Number::from_f64(shortest).map_or(serde_json::Value::Null, serde_json::Value::Number)
+}
+
+/// What `intoxicated-run --print-ssr-looks` prints, for Intoxicated
+/// Settings' Shaders page: the switch and look variables, every knob (its
+/// name, variable, kind, range and default) and every look with the value it
+/// starts each knob at, the default look named. One JSON object, so the page
+/// keeps no copy of [`KNOBS`] or [`LOOKS`].
+pub fn looks_json() -> String {
+    use serde_json::{json, Value};
+    let knobs: Vec<Value> = KNOBS
+        .iter()
+        .map(|k| {
+            let (kind, min, max) = match k.kind {
+                Kind::Number { min, max } => ("number", json_number(min), json_number(max)),
+                Kind::Whole { min, max } => ("whole", json!(min), json!(max)),
+                Kind::Switch => ("switch", json!(0), json!(1)),
+                Kind::Rgb { min, max } => ("rgb", json_number(min), json_number(max)),
+            };
+            json!({
+                "name": k.name,
+                "env": k.env,
+                "kind": kind,
+                "min": min,
+                "max": max,
+                "default": json_value(k, k.default),
+            })
+        })
+        .collect();
+    let looks: Vec<Value> = LOOKS
+        .iter()
+        .map(|l| {
+            let start = start_values(l.name).expect("a look of the table");
+            let values: serde_json::Map<String, Value> =
+                KNOBS.iter().zip(start).map(|(k, v)| (k.name.to_string(), json_value(k, v))).collect();
+            json!({ "name": l.name, "description": l.description, "values": values })
+        })
+        .collect();
+    let doc = json!({
+        "switch": ENV,
+        "look_env": LOOK_ENV,
+        "default_look": LOOKS[0].name,
+        "knobs": knobs,
+        "looks": looks,
+    });
+    serde_json::to_string_pretty(&doc).expect("a JSON value always serialises")
 }
 
 impl Knob {
@@ -382,8 +456,8 @@ pub(crate) fn parse_settings(var: impl Fn(&str) -> Option<String>) -> Settings {
     };
     let start: Vec<[f32; 3]> = match var(LOOK_ENV).as_deref().map(str::trim) {
         None | Some("") => KNOBS.iter().map(|k| k.default).collect(),
-        Some(name) => match look_values(name) {
-            Some(look) => KNOBS.iter().zip(look).map(|(k, v)| v.unwrap_or(k.default)).collect(),
+        Some(name) => match start_values(name) {
+            Some(values) => values,
             None => {
                 warnings.push(format!(
                     "[android] vulkan: ssr: {LOOK_ENV}={name:?} is not a look ({}); using the defaults",
@@ -2632,6 +2706,64 @@ mod tests {
         let s = parse_settings(|name| (name == LOOK_ENV).then(|| "shiny".to_string()));
         assert_eq!(s.values, KNOBS.iter().map(|k| k.default).collect::<Vec<_>>());
         assert!(s.warnings[0].contains("is not a look (competitive wet_road clean_mirror puddles glossy)"), "{:?}", s.warnings);
+    }
+
+    #[test]
+    fn the_looks_json_is_the_tables_and_what_the_client_starts_with() {
+        let text = looks_json();
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(doc["switch"], ENV);
+        assert_eq!(doc["look_env"], LOOK_ENV);
+        assert_eq!(doc["default_look"], LOOKS[0].name);
+
+        let knobs = doc["knobs"].as_array().unwrap();
+        assert_eq!(knobs.len(), KNOBS.len());
+        // A JSON value read back as the text a variable would hold.
+        let as_text = |v: &serde_json::Value| match v {
+            serde_json::Value::Array(parts) => parts.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","),
+            other => other.to_string(),
+        };
+        for (k, j) in KNOBS.iter().zip(knobs) {
+            assert_eq!(j["name"], k.name);
+            assert_eq!(j["env"], k.env);
+            let (kind, min, max) = match k.kind {
+                Kind::Number { min, max } => ("number", min, max),
+                Kind::Whole { min, max } => ("whole", min as f32, max as f32),
+                Kind::Switch => ("switch", 0.0, 1.0),
+                Kind::Rgb { min, max } => ("rgb", min, max),
+            };
+            assert_eq!(j["kind"], kind, "{}", k.name);
+            assert_eq!(j["min"].as_f64().unwrap() as f32, min, "{}", k.name);
+            assert_eq!(j["max"].as_f64().unwrap() as f32, max, "{}", k.name);
+            assert_eq!(k.parse(&as_text(&j["default"])), Ok(k.default), "{}", k.name);
+        }
+
+        let looks = doc["looks"].as_array().unwrap();
+        assert_eq!(looks.len(), LOOKS.len());
+        for (l, j) in LOOKS.iter().zip(looks) {
+            assert_eq!(j["name"], l.name);
+            assert!(!l.description.is_empty() && j["description"] == l.description, "{}", l.name);
+            assert!(l.description.is_ascii(), "{}: no dashes or symbols outside ASCII", l.name);
+            // Every knob, at the value the client starts it with for this look.
+            let started = parse_settings(|name| (name == LOOK_ENV).then(|| l.name.to_string()));
+            assert!(started.warnings.is_empty(), "{:?}", started.warnings);
+            let values = j["values"].as_object().unwrap();
+            assert_eq!(values.len(), KNOBS.len(), "{}", l.name);
+            for (k, v) in KNOBS.iter().zip(&started.values) {
+                assert_eq!(k.parse(&as_text(&values[k.name])), Ok(*v), "{} {}", l.name, k.name);
+            }
+        }
+        // The default look starts every knob at its default.
+        let first = looks[0]["values"].as_object().unwrap();
+        for k in &KNOBS {
+            assert_eq!(k.parse(&as_text(&first[k.name])), Ok(k.default), "{}", k.name);
+        }
+
+        // Numbers as short as the client writes them, not widened f32s.
+        assert!(text.contains("\"intensity\": 0.4,"), "{text}");
+        assert!(text.contains("0.92,") && !text.contains("0.9200000"), "{text}");
+        assert!(text.contains("\"steps\": 32"), "{text}");
+        assert!(text.is_ascii());
     }
 
     #[test]

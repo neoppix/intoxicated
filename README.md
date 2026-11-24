@@ -117,6 +117,7 @@ intoxicated '<link>'     # a roblox:// link, roblox.com's Play link, or a
 intoxicated --update-apk # fetch the newest Roblox build, then exit
 intoxicated --update     # update Intoxicated itself (pull, build, reinstall)
 intoxicated --default-flags  # print the flags the client sets itself (JSON)
+intoxicated --ssr-looks  # print the reflections' settings and looks (JSON)
 intoxicated --version    # print the client's version line
 INTOXICATED_PROFILE=alt intoxicated   # run another profile (see below)
 ```
@@ -229,7 +230,10 @@ sharp mirror. `INTOXICATED_SSR_LOOK` starts from another named look
 look is a switch of its own (`INTOXICATED_SSR_INTENSITY`, `_ROUGHNESS`,
 `_FRESNEL`, `_UP_ONLY`, `_UP_THRESHOLD`, `_MAX_DISTANCE`, `_EDGE_FADE`,
 `_DARKEN`, `_TINT`, `_KEEP_COLOUR` and more; `--help` lists them with their
-defaults). On an RTX 4070 Ti they took about 0.55 ms of GPU time per frame at
+defaults), which wins over the look. The Shaders page of
+[Intoxicated Settings](#intoxicated-settings) sets all of them, and
+`intoxicated --ssr-looks` prints every one with its range and the value each
+look gives it. On an RTX 4070 Ti they took about 0.55 ms of GPU time per frame at
 3362x1349 and 0.6 ms at 3440x1440. Like
 any screen-space effect they can only show what is on screen: anything off
 screen or hidden behind something else is missing from the reflection, which
@@ -250,7 +254,11 @@ An optional desktop app for what is otherwise set by hand. FastFlags: presets
 MSAA), every flag in the profile's `flags.json` with inline editing, import of
 a JSON file (a Bloxstrap export or a `ClientAppSettings.json`) with a preview,
 export and reset. Client options: window, input, graphics, audio and session.
-Profiles: create, delete and pick the default one. And Play, a place id or
+Shaders: the screen-space reflections, with a switch, the named looks
+(Competitive, Wet road, Clean mirror, Puddles, Glossy) and a fine-tune row for
+each of their settings; picking a look clears the fine tuning, after asking,
+and each row has its own reset. Like the client options they apply from the
+next launch. Profiles: create, delete and pick the default one. And Play, a place id or
 link field, and the two update commands. It is a Qt 6 Widgets program in
 `settings/` that needs `qt6-base` and nothing else.
 
@@ -279,7 +287,9 @@ It writes two kinds of file, and both can still be edited by hand:
   over; the app offers to keep it as `flags.json.bad-<time>` and start empty.
 
 Both are written to a temporary file and renamed into place. The presets show
-the client's own flags, which the app reads from `intoxicated --default-flags`.
+the client's own flags, which the app reads from `intoxicated --default-flags`,
+and the Shaders page shows the client's own looks and their values, read from
+`intoxicated --ssr-looks`, so the app keeps no copy of either.
 A profile shows as in use while a client holds it, and is not deleted then.
 "Update Intoxicated" runs `intoxicated --update` with no terminal, so the
 installer asks for the password through the app's own dialog (`sudo -A` with

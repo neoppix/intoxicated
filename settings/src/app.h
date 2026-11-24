@@ -18,10 +18,12 @@ class QListWidget;
 class QPlainTextEdit;
 class QProcess;
 class QPushButton;
+class QSlider;
 class QStackedWidget;
 class QTableWidget;
 class QTemporaryDir;
 class QTimer;
+class QVBoxLayout;
 
 namespace intox {
 
@@ -166,6 +168,50 @@ private:
     Combo *m_renderer;
     Combo *m_audio;
     Switch *m_closeOnLeave;
+    bool m_filling = false;
+};
+
+// Effects the client draws itself; today the screen-space reflections. Each
+// control writes settings.conf as it changes.
+class ShadersPage : public QWidget {
+    Q_OBJECT
+public:
+    explicit ShadersPage(AppState *state);
+    void reload();
+
+protected:
+    void showEvent(QShowEvent *event) override;
+
+private:
+    // One fine-tune row: sliders (three for a colour) or a switch.
+    struct KnobRow {
+        QString name;
+        QList<QSlider *> sliders;
+        QList<QLabel *> values;
+        double step = 0.01;
+        Switch *toggle = nullptr;
+        QLabel *shown = nullptr;
+        QPushButton *reset = nullptr;
+    };
+
+    void buildFineTune(QVBoxLayout *rows);
+    // Load settings.conf, apply CHANGE, write it, show the result.
+    void edit(const std::function<bool(SettingsConf &)> &change);
+    void lookChosen(int index);
+    // Write row ROW's override from its controls.
+    void knobMoved(int row);
+    void showSliders(const KnobRow &row, const SsrValue &value);
+
+    AppState *m_state;
+    std::optional<SsrTable> m_table;
+    Switch *m_on;
+    QGroupBox *m_lookBox;
+    QGroupBox *m_tuneBox;
+    QList<QPushButton *> m_lookButtons;
+    QLabel *m_lookDesc;
+    QLabel *m_tableError;
+    QLabel *m_problems;
+    QList<KnobRow> m_rows;
     bool m_filling = false;
 };
 

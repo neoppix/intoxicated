@@ -1,5 +1,5 @@
 //! The command line: the options, the usage text, the parse errors,
-//! `--check-join-url` and `--print-default-flags`.
+//! `--check-join-url`, `--print-default-flags` and `--print-ssr-looks`.
 //!
 //! Arguments are read left to right. A flag that takes a value consumes the
 //! next argument whatever it looks like, a repeated flag replaces the earlier
@@ -229,6 +229,15 @@ pub fn default_flags_json() -> String {
     serde_json::to_string_pretty(&layer).expect("a map of strings always serialises")
 }
 
+/// `--print-ssr-looks`: the reflections' switch, knobs and named looks
+/// ([`intoxicated_runtime::android::ssr::looks_json`]) as one JSON object on
+/// stdout. Nothing else runs. The launcher's `--ssr-looks` runs it for
+/// Intoxicated Settings' Shaders page, so the looks are kept in one place.
+pub fn print_ssr_looks() -> ExitCode {
+    println!("{}", intoxicated_runtime::android::ssr::looks_json());
+    ExitCode::SUCCESS
+}
+
 /// The usage text, written to stderr by `--help` and after a parse error.
 ///
 /// One block per option, the flag and its placeholder padded to column 20
@@ -279,6 +288,10 @@ usage: intoxicated-run --lib-dir <dir> [options]
                     built-in layer, which <profile>/flags.json overrides) as
                     one JSON object, keys sorted, and exit 0. Runs nothing
                     else; the launcher's --default-flags runs it
+  --print-ssr-looks  print the screen-space reflections' knobs (variable,
+                    kind, range, default) and named looks (the value each
+                    starts every knob at) as one JSON object, and exit 0.
+                    Runs nothing else; the launcher's --ssr-looks runs it
   --run <secs>      how long to let Roblox run after handover (default 15).
                     0 means no timer: run until the window is closed or the
                     process is sent SIGTERM/SIGINT. Closing the window ends the
@@ -576,6 +589,7 @@ mod tests {
         assert_eq!(error("--bogus"), "unrecognised argument: --bogus");
         assert_eq!(error("--lib-dir x --check-join-url"), "unrecognised argument: --check-join-url");
         assert_eq!(error("--lib-dir x --print-default-flags"), "unrecognised argument: --print-default-flags");
+        assert_eq!(error("--lib-dir x --print-ssr-looks"), "unrecognised argument: --print-ssr-looks");
         for (flag, message) in [
             ("--lib-dir", "--lib-dir needs a value"),
             ("--library", "--library needs a value"),
@@ -736,6 +750,7 @@ mod tests {
             "--join-url <url>",
             "--check-join-url",
             "--print-default-flags",
+            "--print-ssr-looks",
             "--run <secs>",
             "--dump-classes <f>",
             "-v, --verbose",
