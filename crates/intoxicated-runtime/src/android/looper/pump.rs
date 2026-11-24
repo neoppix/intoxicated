@@ -104,6 +104,8 @@ pub fn stop_reason(signalled: bool, window_closed: bool, quit: bool, honour_clos
 /// Async-signal-safe: one atomic swap and `_exit`.
 extern "C" fn on_signal(sig: c_int) {
     if SIGNALLED.swap(sig, Ordering::SeqCst) != 0 {
+        // One unlink(2), async-signal-safe like `_exit`.
+        crate::profile_lock::withdraw_pid_file();
         // SAFETY: `_exit` is async-signal-safe.
         unsafe { libc::_exit(128 + sig) }
     }
@@ -515,6 +517,7 @@ fn grace(looper: Option<&'static Looper>) {
 /// before the wait, and goes out with one write(2): nothing here takes a lock
 /// or allocates, since the stuck thread may hold anything.
 pub(super) fn overrun_exit(line: &[u8]) {
+    crate::profile_lock::withdraw_pid_file();
     // SAFETY: a live buffer; `_exit` runs no handlers.
     unsafe {
         libc::write(2, line.as_ptr().cast(), line.len());

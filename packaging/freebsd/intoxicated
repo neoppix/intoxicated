@@ -23,8 +23,66 @@
 #                                    # {"available": false} from a client
 #                                    # built without the visual effects
 #   intoxicated --version            # print the client's version line
+#   intoxicated --help               # print this usage
+#   intoxicated --profile <name> [any of the above]
+#                                    # run on profile <name>
 #
-# INTOXICATED_PROFILE=<name> picks the profile (default: default).
+# --profile <name> picks the profile; without it INTOXICATED_PROFILE=<name>
+# does, then settings.conf's INTOXICATED_PROFILE, then default. One client
+# runs per profile, so clients on different profiles can run side by side.
+
+usage() {
+  cat <<'EOF'
+usage: intoxicated [--profile <name>] [<place id> | <link>]
+       intoxicated [--profile <name>] --update-apk | --update | --default-flags
+                   | --ssr-looks | --shader-looks | --version | --help
+
+  (nothing)            start on the Roblox home page
+  <place id>           join a place by id, e.g. intoxicated 189707
+  <link>               a roblox:// link, roblox.com's Play link
+                       (roblox-player:...) or a roblox.com game page link
+  --profile <name>     run on profile <name> (1 to 32 letters, digits, - and _);
+                       also --profile=<name>. Each profile has its own Roblox
+                       account, storage and flags.json; one client runs per
+                       profile, so different profiles can run at the same time
+  --update-apk         download the newest Roblox build, then exit
+  --update             update Intoxicated (install.sh pulls, builds, reinstalls)
+  --default-flags      print the client's built-in flags as JSON
+  --ssr-looks          print the reflections' knobs and looks as JSON
+  --shader-looks       the same for every effect drawn before the HUD
+  --version            print the client's version line
+  --help               print this
+
+Environment: INTOXICATED_PROFILE=<name> picks the profile when --profile is
+not given. Client options are read from ~/.config/intoxicated/settings.conf;
+target/release/intoxicated-run --help lists the client's own switches.
+Exit status 3: the profile is already open in another client.
+EOF
+}
+
+# --profile comes first and wins over INTOXICATED_PROFILE and settings.conf.
+# It is exported, so the launcher's own second run (see join_link) keeps it.
+PROFILE_FROM=INTOXICATED_PROFILE
+case "${1:-}" in
+  --profile)
+    INTOXICATED_PROFILE=${2:-}
+    PROFILE_FROM=--profile
+    [ $# -ge 2 ] && shift
+    shift
+    ;;
+  --profile=*)
+    INTOXICATED_PROFILE=${1#--profile=}
+    PROFILE_FROM=--profile
+    shift
+    ;;
+esac
+if [ "$PROFILE_FROM" = --profile ]; then
+  if [ -z "$INTOXICATED_PROFILE" ]; then
+    echo "intoxicated: --profile needs a name" >&2
+    exit 2
+  fi
+  export INTOXICATED_PROFILE
+fi
 
 # Client options from settings.conf (Intoxicated Settings writes it; it can be
 # edited by hand). Each line KEY=VALUE whose KEY is INTOXICATED_ followed by
@@ -140,11 +198,13 @@ ensure_flag() {
   mkdir -p "$(dirname "$FLAGS_FILE")"
   [ -s "$FLAGS_FILE" ] || printf '{}\n' > "$FLAGS_FILE"
   /usr/local/bin/jq -e --arg k "$1" 'has($k)' "$FLAGS_FILE" >/dev/null 2>&1 && return 0
-  if /usr/local/bin/jq --arg k "$1" --arg v "$2" '. + {($k): $v}' "$FLAGS_FILE" > "$FLAGS_FILE.new" 2>/dev/null; then
-    mv "$FLAGS_FILE.new" "$FLAGS_FILE"
+  # A temporary name of this launch's own: two launches on one profile both
+  # get here before the client's lock refuses the second.
+  if /usr/local/bin/jq --arg k "$1" --arg v "$2" '. + {($k): $v}' "$FLAGS_FILE" > "$FLAGS_FILE.new.$$" 2>/dev/null; then
+    mv "$FLAGS_FILE.new.$$" "$FLAGS_FILE"
     echo "intoxicated: $3 ($1=$2 in $FLAGS_FILE)" >&2
   else
-    rm -f "$FLAGS_FILE.new"
+    rm -f "$FLAGS_FILE.new.$$"
     echo "intoxicated: $FLAGS_FILE is not valid JSON; $1 left at Roblox's default" >&2
   fi
 }
@@ -198,6 +258,7 @@ case "${1:-}" in
   --shader-looks) need_bin; "$BIN" --print-shader-looks; exit $? ;;
   # The first line of --help is the client's banner: name, version, licence.
   --version) need_bin; "$BIN" --help 2>/dev/null | head -n 1; exit 0 ;;
+  --help|-h) usage; exit 0 ;;
 esac
 
 # A profile is one directory under $DATADIR/profiles, so its name is one plain
@@ -207,7 +268,11 @@ case $PROFILE in
   *) [ ${#PROFILE} -le 32 ] && bad_profile= || bad_profile=1 ;;
 esac
 if [ -n "$bad_profile" ]; then
-  echo "intoxicated: INTOXICATED_PROFILE=\"$PROFILE\" is not a profile name; use 1 to 32 letters, digits, - and _" >&2
+  if [ "$PROFILE_FROM" = --profile ]; then
+    echo "intoxicated: --profile \"$PROFILE\" is not a profile name; use 1 to 32 letters, digits, - and _" >&2
+  else
+    echo "intoxicated: INTOXICATED_PROFILE=\"$PROFILE\" is not a profile name; use 1 to 32 letters, digits, - and _" >&2
+  fi
   exit 2
 fi
 
@@ -229,6 +294,17 @@ if [ -n "$1" ]; then
 fi
 unset INTOXICATED_LINK_REWRITTEN
 
+# Several profiles started together on a machine with no build yet: the first
+# launch downloads it, the others wait for that download (at most ten
+# minutes) instead of failing on its lock.
+if [ ! -f "$APK" ] || [ ! -f "$ENGINE" ]; then
+  waited=0
+  while [ -d "$APKDIR.lock" ] && [ $waited -lt 600 ]; do
+    [ $waited -eq 0 ] && echo "intoxicated: another launch is downloading the Roblox build; waiting for it..." >&2
+    sleep 1
+    waited=$((waited+1))
+  done
+fi
 if [ ! -f "$APK" ] || [ ! -f "$ENGINE" ]; then
   echo "intoxicated: no Roblox build in $APKDIR" >&2
   fetch_apk || { echo "intoxicated: could not get a Roblox build" >&2; exit 1; }
@@ -259,7 +335,11 @@ while [ $i -lt 4 ]; do
   # open in another client, which says so itself; trying again cannot help.
   case $rc in
     0) exit 0 ;;
-    3) exit 3 ;;
+    3)
+      echo "intoxicated: profile $PROFILE is already running in another client; close that one first," \
+        "or start another profile with intoxicated --profile <name>" >&2
+      exit 3
+      ;;
     124) echo "intoxicated: shutdown hung and was cut off" >&2; exit 124 ;;
     130|143) exit $rc ;;
   esac

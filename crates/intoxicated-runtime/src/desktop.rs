@@ -13,6 +13,18 @@ pub fn title() -> String {
     }
 }
 
+/// The title of the client's window on profile `profile`: [`title`], then
+/// the profile in brackets when it is not the default one, so clients on
+/// several profiles can be told apart in a task bar. `WM_CLASS` stays the
+/// same for all of them (see `android::x11_window`), so window rules and the
+/// desktop file still match every one.
+pub fn window_title(profile: Option<&str>) -> String {
+    match profile {
+        Some(name) if !name.is_empty() && name != crate::profile::DEFAULT_NAME => format!("{} [{name}]", title()),
+        _ => title(),
+    }
+}
+
 /// Whether to tell the engine the system is in dark mode.
 ///
 /// Decided from `GTK_THEME`, which is the one appearance setting every
@@ -59,6 +71,15 @@ pub fn open_url(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_window_title_names_a_profile_other_than_default() {
+        assert_eq!(window_title(None), title());
+        assert_eq!(window_title(Some("default")), title());
+        assert_eq!(window_title(Some("")), title());
+        assert_eq!(window_title(Some("alt")), format!("{} [alt]", title()));
+        assert_eq!(window_title(Some("alt_2-x")), format!("{} [alt_2-x]", title()));
+    }
 
     #[test]
     fn the_title_names_the_client_and_its_version() {

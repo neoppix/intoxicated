@@ -56,10 +56,16 @@ fn claim_profile(opt: &Options) -> Result<intoxicated_runtime::profile_lock::Cla
 
 /// The claim, before anything reads or writes the profile. Refused: exit 3.
 pub fn claim(opt: &Options) -> Result<intoxicated_runtime::profile_lock::Claim, ExitCode> {
-    claim_profile(opt).map_err(|refusal| {
+    let claim = claim_profile(opt).map_err(|refusal| {
         eprintln!("error: {refusal}");
         ExitCode::from(crate::cli::EXIT_PROFILE)
-    })
+    })?;
+    // For Intoxicated Settings' Stop button. Without it the client still
+    // runs; it just cannot be stopped from there.
+    if let Err(e) = claim.publish_pid() {
+        println!("  could not write {}: {e}", claim.profile_dir().join("client.pid").display());
+    }
+    Ok(claim)
 }
 
 /// The two settings that can refuse a profile before it is used.

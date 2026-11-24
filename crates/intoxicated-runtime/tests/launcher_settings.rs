@@ -27,7 +27,7 @@ esac
 for a in "$@"; do printf '%s\n' "$a"; done > "$RECORD/args"
 env | grep '^INTOXICATED_' > "$RECORD/env"
 ps -ww -o args= -p "$PPID" > "$RECORD/launcher"
-exit 0
+exit "${FAKE_EXIT:-0}"
 "#;
 
 struct Scratch {
@@ -209,6 +209,83 @@ fn a_profile_other_than_default_is_passed_on_and_gets_the_flags() {
     assert_eq!(r.status, 0, "{}", r.stderr);
     assert!(!r.args.unwrap().contains(&"--profile".to_string()));
     assert!(s.flags_of("default").exists());
+}
+
+#[test]
+fn the_profile_switch_wins_over_the_environment_and_settings_conf() {
+    let s = Scratch::new("profile-switch");
+    s.settings("INTOXICATED_PROFILE=fromconf\n");
+    let profile_of = |r: &Run| {
+        let args = r.args.as_ref().expect("the client was started");
+        args.iter().position(|a| a == "--profile").map(|at| args[at + 1].clone())
+    };
+
+    let r = s.run(&["--profile", "alt"], &[("INTOXICATED_PROFILE", "fromenv")]);
+    assert_eq!(r.status, 0, "{}", r.stderr);
+    assert_eq!(profile_of(&r).as_deref(), Some("alt"));
+    assert_eq!(r.env["INTOXICATED_PROFILE"], "alt", "exported for the client and the launcher's second run");
+
+    let r = s.run(&["--profile=second_1", "5938036553"], &[]);
+    assert_eq!(r.status, 0, "{}", r.stderr);
+    assert_eq!(profile_of(&r).as_deref(), Some("second_1"));
+    assert!(r.args.as_ref().unwrap().contains(&"--join-url".to_string()));
+
+    // A link the launcher rewrites runs it a second time; the profile stays.
+    let r = s.run(&["--profile", "alt", "https://www.roblox.com/games/1818/Some-Name"], &[]);
+    assert_eq!(r.status, 0, "{}", r.stderr);
+    assert_eq!(profile_of(&r).as_deref(), Some("alt"));
+    assert!(r.launcher_args.contains("placeId=1818"), "{}", r.launcher_args);
+
+    // --profile default is the default profile: nothing is passed on.
+    let r = s.run(&["--profile", "default"], &[]);
+    assert_eq!(r.status, 0, "{}", r.stderr);
+    assert_eq!(profile_of(&r), None);
+
+    // The information switches still work after it.
+    let r = s.run(&["--profile", "alt", "--version"], &[]);
+    assert_eq!(r.status, 0, "{}", r.stderr);
+    assert!(r.args.is_none());
+    assert!(r.stdout.starts_with("Intoxicated "), "{}", r.stdout);
+
+    for (args, said) in [
+        (&["--profile"][..], "--profile needs a name"),
+        (&["--profile", "../evil"][..], "--profile \"../evil\" is not a profile name"),
+        (&["--profile="][..], "--profile needs a name"),
+        (&["--profile", ""][..], "--profile needs a name"),
+    ] {
+        let r = s.run(args, &[]);
+        assert_eq!(r.status, 2, "{args:?}: {}", r.stderr);
+        assert!(r.args.is_none(), "{args:?} started the client");
+        assert!(r.stderr.contains(said), "{args:?}: {}", r.stderr);
+    }
+}
+
+#[test]
+fn a_profile_already_running_is_named_and_not_retried() {
+    let s = Scratch::new("busy");
+    let r = s.run(&["--profile", "alt"], &[("FAKE_EXIT", "3")]);
+    assert_eq!(r.status, 3, "{}", r.stderr);
+    assert!(
+        r.stderr.contains("intoxicated: profile alt is already running in another client"),
+        "{}",
+        r.stderr
+    );
+    assert!(r.stderr.contains("intoxicated --profile <name>"), "{}", r.stderr);
+    assert!(!r.stderr.contains("retrying"), "exit 3 is not a boot hiccup: {}", r.stderr);
+}
+
+#[test]
+fn help_lists_the_profile_switch_without_starting_the_client() {
+    let s = Scratch::new("help");
+    for flag in ["--help", "-h"] {
+        let r = s.run(&[flag], &[]);
+        assert_eq!(r.status, 0, "{}", r.stderr);
+        assert!(r.args.is_none(), "the client was not started");
+        assert!(r.stdout.starts_with("usage: intoxicated [--profile <name>]"), "{}", r.stdout);
+        assert!(r.stdout.contains("--profile <name>     run on profile <name>"), "{}", r.stdout);
+        assert!(r.stdout.contains("INTOXICATED_PROFILE=<name>"), "{}", r.stdout);
+        assert!(r.stdout.contains("Exit status 3"), "{}", r.stdout);
+    }
 }
 
 #[test]

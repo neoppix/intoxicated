@@ -135,7 +135,7 @@ pub fn run(lib: linker::Library, opt: &Options, asset_root: &str, data_root: &Pa
     // The window, and the display facts the User-Agent embeds.
     let (rw, rh) = switches::requested_resolution();
     let w = match intoxicated_runtime::android::open_window(
-        rw, rh, &intoxicated_runtime::desktop::title(),
+        rw, rh, &intoxicated_runtime::desktop::window_title(opt.profile.as_deref()),
     ) {
         Ok(w) => w,
         Err(e) => {
