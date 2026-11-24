@@ -30,6 +30,9 @@ use std::ffi::{c_char, c_void, CStr};
 use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 
+pub(crate) mod capture;
+pub(crate) mod spirv;
+
 
 /// The switch.
 pub const ENV: &str = "INTOXICATED_RT";
@@ -431,6 +434,8 @@ unsafe fn apply(info: *const c_void, extensions: &[&'static CStr], enabled: Enab
 /// devctl `rt`: what the devices got.
 pub fn control(args: &[&str]) -> Result<String, String> {
     match args {
+        ["draws"] => capture::request_draws(),
+        ["dump", path] => capture::dump(path),
         [] | ["stats"] => {
             if !requested() {
                 return Err(format!("the ray-traced reflections are off ({ENV}=1 at start turns them on)"));
@@ -444,13 +449,14 @@ pub fn control(args: &[&str]) -> Result<String, String> {
                 })
                 .collect();
             Ok(format!(
-                "engine_api={} instance_api={} {}",
+                "engine_api={} instance_api={} {} {}",
                 version_text(ENGINE_API_VERSION.load(Relaxed)),
                 version_text(INSTANCE_API_VERSION.load(Relaxed)),
-                if devices.is_empty() { "no device".to_string() } else { devices.join(" ") }
+                if devices.is_empty() { "no device".to_string() } else { devices.join(" ") },
+                capture::stats_line(),
             ))
         }
-        _ => Err("rt [stats]".into()),
+        _ => Err("rt [stats] | draws | dump <path>".into()),
     }
 }
 

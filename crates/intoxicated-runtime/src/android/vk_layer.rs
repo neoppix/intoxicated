@@ -364,6 +364,7 @@ extern "C" fn vk_get_instance_proc_addr(instance: *mut c_void, name: *const c_ch
         _ => {
             // SAFETY: the host getter, called with the engine's own arguments.
             let p = unsafe { (h.get_instance_proc_addr)(instance, name) };
+            let p = super::rt::capture::hook(bytes, p);
             passes::hook(bytes, super::vulkan_etc::instance_hook(instance, bytes, p).unwrap_or(p))
         }
     }
@@ -423,7 +424,7 @@ extern "C" fn vk_get_device_proc_addr(device: *mut c_void, name: *const c_char) 
             capture_hook(bytes, next)
         }
         bytes => {
-            let p = host(device, name);
+            let p = super::rt::capture::hook(bytes, host(device, name));
             passes::hook(bytes, super::vulkan_etc::device_hook(device, bytes, p).unwrap_or(p))
         }
     }
@@ -482,6 +483,7 @@ extern "C" fn vk_destroy_device(device: *mut c_void, allocator: *const c_void) {
     super::depth_capture::device_destroying(device);
     super::ssr::device_destroying(device);
     super::rt::device_destroying(device);
+    super::rt::capture::device_destroying(device);
     passes::device_destroying(device);
     let f = NEXT_DESTROY_DEVICE.load(std::sync::atomic::Ordering::Relaxed);
     if f != 0 {

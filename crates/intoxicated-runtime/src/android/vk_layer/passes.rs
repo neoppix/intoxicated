@@ -58,6 +58,9 @@ pub(crate) const WATCH_TRACE: u32 = 0x1;
 pub(crate) const WATCH_DEPTH: u32 = 0x2;
 /// The reflections, the depth of field or the bloom (`android::ssr`).
 pub(crate) const WATCH_POST: u32 = 0x4;
+/// The scene's geometry captured for the ray-traced reflections
+/// (`android::rt::capture`), with `INTOXICATED_RT=1` or its research switch.
+pub(crate) const WATCH_RT: u32 = 0x8;
 
 /// The present count at which the next trace starts; `u64::MAX` for none.
 static TRACE_AT: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -86,7 +89,11 @@ pub(crate) fn wanted() -> bool {
         if ssr {
             WATCH.fetch_or(WATCH_POST, Relaxed);
         }
-        at.is_some() || ssr || crate::devctl::enabled()
+        let rt = crate::android::rt::capture::wanted();
+        if rt {
+            WATCH.fetch_or(WATCH_RT, Relaxed);
+        }
+        at.is_some() || ssr || rt || crate::devctl::enabled()
     })
 }
 
@@ -357,6 +364,9 @@ pub(crate) fn on_present(presents: u64) {
     }
     // Also while off: objects it replaced are destroyed some presents later.
     crate::android::ssr::frame_end(presents);
+    if w & WATCH_RT != 0 {
+        crate::android::rt::capture::frame_end(presents);
+    }
     if presents >= TRACE_AT.load(Relaxed) {
         TRACE_AT.store(u64::MAX, Relaxed);
         *recorder() = Some(Recorder::default());
@@ -895,6 +905,9 @@ unsafe fn pass_from_rendering(cmd: usize, info: *const c_void) -> Pass {
 /// Before the begin of a pass is forwarded. The reflections, when this is
 /// the pass they go in front of, record their work here.
 fn pass_begun(watch: u32, pass: Pass) {
+    if watch & WATCH_RT != 0 {
+        crate::android::rt::capture::pass_beginning(&pass);
+    }
     if watch & WATCH_POST != 0 {
         crate::android::ssr::pass_begun(&pass);
     }
@@ -906,8 +919,25 @@ fn pass_begun(watch: u32, pass: Pass) {
     }
 }
 
+/// After the begin of a pass has been forwarded.
+fn pass_started(watch: u32, cmd: *mut c_void) {
+    if watch & WATCH_RT != 0 {
+        crate::android::rt::capture::pass_started(cmd);
+    }
+}
+
+/// Before the end of a pass is forwarded.
+fn pass_ending(watch: u32, cmd: *mut c_void) {
+    if watch & WATCH_RT != 0 {
+        crate::android::rt::capture::pass_ending(cmd);
+    }
+}
+
 /// After the end of a pass has been forwarded.
 fn pass_ended(watch: u32, cmd: *mut c_void) {
+    if watch & WATCH_RT != 0 {
+        crate::android::rt::capture::pass_ended(cmd);
+    }
     if watch & WATCH_TRACE != 0 {
         record(|r| {
             r.end_pass(cmd as usize);
@@ -924,6 +954,9 @@ extern "C" fn cmd_begin_render_pass(cmd: *mut c_void, begin: *const c_void, cont
     if let Some(f) = next::<extern "C" fn(*mut c_void, *const c_void, u32)>(&BEGIN_RENDER_PASS) {
         f(cmd, begin, contents);
     }
+    if w != 0 && !begin.is_null() {
+        pass_started(w, cmd);
+    }
 }
 
 extern "C" fn cmd_begin_render_pass2(cmd: *mut c_void, begin: *const c_void, subpass: *const c_void) {
@@ -937,9 +970,15 @@ extern "C" fn cmd_begin_render_pass2(cmd: *mut c_void, begin: *const c_void, sub
     if let Some(f) = next::<extern "C" fn(*mut c_void, *const c_void, *const c_void)>(&BEGIN_RENDER_PASS2) {
         f(cmd, begin, subpass);
     }
+    if w != 0 && !begin.is_null() {
+        pass_started(w, cmd);
+    }
 }
 
 extern "C" fn cmd_next_subpass(cmd: *mut c_void, contents: u32) {
+    if WATCH.load(Relaxed) & WATCH_RT != 0 {
+        crate::android::rt::capture::interrupted(cmd);
+    }
     if WATCH.load(Relaxed) & WATCH_TRACE != 0 {
         record(|r| r.next_subpass(cmd as usize));
     }
@@ -949,6 +988,9 @@ extern "C" fn cmd_next_subpass(cmd: *mut c_void, contents: u32) {
 }
 
 extern "C" fn cmd_next_subpass2(cmd: *mut c_void, begin: *const c_void, end: *const c_void) {
+    if WATCH.load(Relaxed) & WATCH_RT != 0 {
+        crate::android::rt::capture::interrupted(cmd);
+    }
     if WATCH.load(Relaxed) & WATCH_TRACE != 0 {
         record(|r| r.next_subpass(cmd as usize));
     }
@@ -958,6 +1000,7 @@ extern "C" fn cmd_next_subpass2(cmd: *mut c_void, begin: *const c_void, end: *co
 }
 
 extern "C" fn cmd_end_render_pass(cmd: *mut c_void) {
+    pass_ending(WATCH.load(Relaxed), cmd);
     if let Some(f) = next::<extern "C" fn(*mut c_void)>(&END_RENDER_PASS) {
         f(cmd);
     }
@@ -968,6 +1011,7 @@ extern "C" fn cmd_end_render_pass(cmd: *mut c_void) {
 }
 
 extern "C" fn cmd_end_render_pass2(cmd: *mut c_void, end: *const c_void) {
+    pass_ending(WATCH.load(Relaxed), cmd);
     if let Some(f) = next::<extern "C" fn(*mut c_void, *const c_void)>(&END_RENDER_PASS2) {
         f(cmd, end);
     }
@@ -986,9 +1030,13 @@ extern "C" fn cmd_begin_rendering(cmd: *mut c_void, info: *const c_void) {
     if let Some(f) = next::<extern "C" fn(*mut c_void, *const c_void)>(&BEGIN_RENDERING) {
         f(cmd, info);
     }
+    if w != 0 && !info.is_null() {
+        pass_started(w, cmd);
+    }
 }
 
 extern "C" fn cmd_end_rendering(cmd: *mut c_void) {
+    pass_ending(WATCH.load(Relaxed), cmd);
     if let Some(f) = next::<extern "C" fn(*mut c_void)>(&END_RENDERING) {
         f(cmd);
     }
@@ -999,13 +1047,20 @@ extern "C" fn cmd_end_rendering(cmd: *mut c_void) {
 }
 
 fn drew(cmd: *mut c_void, kind: DrawKind) {
-    if WATCH.load(Relaxed) & WATCH_TRACE != 0 {
+    let w = WATCH.load(Relaxed);
+    if w & WATCH_TRACE != 0 {
         record(|r| r.draw(cmd as usize, kind));
+    }
+    if w & WATCH_RT != 0 && kind == DrawKind::Indirect {
+        crate::android::rt::capture::drew(cmd, "indirect", 0, 0);
     }
 }
 
 extern "C" fn cmd_draw(cmd: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     drew(cmd, DrawKind::Direct);
+    if WATCH.load(Relaxed) & WATCH_RT != 0 {
+        crate::android::rt::capture::drew(cmd, "draw", vertices, instances);
+    }
     if let Some(f) = next::<extern "C" fn(*mut c_void, u32, u32, u32, u32)>(&DRAW) {
         f(cmd, vertices, instances, first_vertex, first_instance);
     }
@@ -1013,6 +1068,9 @@ extern "C" fn cmd_draw(cmd: *mut c_void, vertices: u32, instances: u32, first_ve
 
 extern "C" fn cmd_draw_indexed(cmd: *mut c_void, indices: u32, instances: u32, first_index: u32, vertex_offset: i32, first_instance: u32) {
     drew(cmd, DrawKind::Indexed);
+    if WATCH.load(Relaxed) & WATCH_RT != 0 {
+        crate::android::rt::capture::drew(cmd, "indexed", indices, instances);
+    }
     if let Some(f) = next::<extern "C" fn(*mut c_void, u32, u32, u32, i32, u32)>(&DRAW_INDEXED) {
         f(cmd, indices, instances, first_index, vertex_offset, first_instance);
     }
@@ -1050,6 +1108,9 @@ extern "C" fn cmd_draw_indexed_indirect_count(cmd: *mut c_void, buffer: u64, off
 }
 
 extern "C" fn cmd_execute_commands(cmd: *mut c_void, count: u32, list: *const usize) {
+    if WATCH.load(Relaxed) & WATCH_RT != 0 {
+        crate::android::rt::capture::interrupted(cmd);
+    }
     if WATCH.load(Relaxed) & WATCH_TRACE != 0 && !list.is_null() {
         // SAFETY: the engine's array of `count` command buffers.
         let secondaries = unsafe { std::slice::from_raw_parts(list, count as usize) }.to_vec();
@@ -1360,6 +1421,9 @@ extern "C" fn begin_command_buffer(cmd: *mut c_void, info: *const c_void) -> i32
     if rc == VK_SUCCESS && ssr_watching() {
         crate::android::ssr::cmd_begun(cmd);
     }
+    if rc == VK_SUCCESS && WATCH.load(Relaxed) & WATCH_RT != 0 {
+        crate::android::rt::capture::cmd_begun(cmd);
+    }
     rc
 }
 
@@ -1367,8 +1431,15 @@ extern "C" fn cmd_bind_pipeline(cmd: *mut c_void, bind_point: u32, pipeline: u64
     if bind_point == crate::android::ssr::BIND_POINT_COMPUTE && ssr_watching() {
         crate::android::ssr::compute(cmd, |c| c.bind_pipeline(pipeline));
     }
+    let rt = WATCH.load(Relaxed) & WATCH_RT != 0;
+    if rt {
+        crate::android::rt::capture::binding(cmd, bind_point);
+    }
     if let Some(f) = next::<extern "C" fn(*mut c_void, u32, u64)>(&BIND_PIPELINE) {
         f(cmd, bind_point, pipeline);
+    }
+    if rt {
+        crate::android::rt::capture::bound(cmd, bind_point, pipeline);
     }
 }
 
