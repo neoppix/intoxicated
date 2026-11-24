@@ -16,11 +16,16 @@
 //! Four dispatches of `post.comp`, the last three at half resolution but for
 //! the compose:
 //!
-//! 1. the focus: the nearest depth in a small square around the screen
-//!    centre (the character in third person), as a distance, eased towards
-//!    over `focus_time` seconds in log distance so the focus does not pump;
-//!    or the fixed `focus_distance`. It is kept in a 1x1 image of ours from
-//!    frame to frame.
+//! 1. the focus, by `focus_mode`: 1, the nearest depth in a small square
+//!    around the screen centre (the character in third person); 2, past
+//!    it: the mean log distance of what lies more than 1.5 times as far as
+//!    that nearest depth in a larger square (the play area behind the
+//!    character), or the sky when only the subject and the sky are there;
+//!    0, the fixed `focus_distance`. Eased towards over `focus_time`
+//!    seconds in log distance so the focus does not pump, and kept in a 1x1
+//!    image of ours from frame to frame. Only what is behind the focus by
+//!    more than `far_range` (and, with `near_blur`, in front of it by more
+//!    than `focus_range`) blurs.
 //! 2. the preparation: the colour 2x2 averaged, with the signed circle of
 //!    confusion of the nearest of the four (positive behind the sharp band,
 //!    negative in front of it, which only blurs with `near_blur`). The
@@ -49,9 +54,8 @@
 //! # Units
 //!
 //! Distances are in studs: a depth `d` is `NEAR_STUDS / d` studs away. The
-//! near plane's 0.1 studs is INFERRED from the depth at the screen centre
-//! on Timebomb Duels at the default camera distance (see the commit that
-//! added this module); only `focus_distance` uses it.
+//! near plane's 0.1 studs is assumed, not measured (INFERRED); only
+//! `focus_distance` uses it.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32};
@@ -73,23 +77,29 @@ use super::{
 pub const DOF_ENV: &str = "INTOXICATED_DOF";
 pub const DOF_LOOK_ENV: &str = "INTOXICATED_DOF_LOOK";
 
-/// The default look's numbers, shared with the look of that name.
-const STRENGTH: f32 = 8.0;
+/// The default look's numbers, shared with the look of that name: a light
+/// blur of the far background only, the play area sharp (tuned on Timebomb
+/// Duels after the owner found the subject focus too blurry to play with).
+const STRENGTH: f32 = 5.0;
 const FOCUS_RANGE: f32 = 0.3;
+const FAR_RANGE: f32 = 1.5;
+const FOCUS_MODE: f32 = 2.0;
 
 /// Every knob of the depth of field, in the order `dof get` lists them.
-pub(crate) const DOF_KNOBS: [Knob; 7] = [
+pub(crate) const DOF_KNOBS: [Knob; 8] = [
     // The largest blur, as a radius in pixels at 1080p (scaled with the
     // height of the scene).
     knob("strength", "INTOXICATED_DOF_STRENGTH", Kind::Number { min: 0.0, max: 32.0 }, [STRENGTH; 3], 0),
-    // 1: focus on the nearest thing around the screen centre; 0: at
-    // focus_distance.
-    knob("autofocus", "INTOXICATED_DOF_AUTOFOCUS", Kind::Switch, [1.0; 3], 1),
-    // The focus without autofocus, in studs.
+    // 0: at focus_distance; 1: on the nearest thing at the screen centre
+    // (the character); 2: past it, on what lies behind it.
+    knob("focus_mode", "INTOXICATED_DOF_FOCUS_MODE", Kind::Whole { min: 0, max: 2 }, [FOCUS_MODE; 3], 1),
+    // The focus in focus_mode 0, in studs.
     knob("focus_distance", "INTOXICATED_DOF_FOCUS_DISTANCE", Kind::Number { min: 0.5, max: 500.0 }, [20.0; 3], 2),
-    // How far either side of the focus stays sharp, as a fraction of its
-    // distance.
+    // How far in front of the focus stays sharp (with near_blur), as a
+    // fraction of its distance.
     knob("focus_range", "INTOXICATED_DOF_FOCUS_RANGE", Kind::Number { min: 0.0, max: 4.0 }, [FOCUS_RANGE; 3], 3),
+    // How far behind the focus stays sharp, as a fraction of its distance.
+    knob("far_range", "INTOXICATED_DOF_FAR_RANGE", Kind::Number { min: 0.0, max: 10.0 }, [FAR_RANGE; 3], 7),
     // 1: what is nearer than the focus blurs too.
     knob("near_blur", "INTOXICATED_DOF_NEAR_BLUR", Kind::Switch, [0.0; 3], 4),
     // Seconds the autofocus takes to settle on a new distance (to 63%).
@@ -99,41 +109,47 @@ pub(crate) const DOF_KNOBS: [Knob; 7] = [
 ];
 
 static DOF_ON: AtomicBool = AtomicBool::new(false);
-static DOF_VALUES: [AtomicU32; 7] = [const { AtomicU32::new(0) }; 7];
+static DOF_VALUES: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
 
 /// The looks, the default first; the others are starting points.
 pub(crate) const DOF_LOOKS: [Look; 3] = [
     Look {
-        name: "cinematic",
-        description: "The subject sharp, the background soft like a camera lens. Nearer things stay sharp.",
+        name: "playable",
+        description: "Focus past your character: the play area stays sharp, only the far background and the sky soften.",
         values: &[],
     },
     Look {
-        name: "subtle",
-        description: "A light blur, only far away: depth without hiding anything that matters.",
-        values: &[("strength", [4.0; 3]), ("focus_range", [0.8; 3])],
+        name: "cinematic",
+        description: "For clips: focus on your character, the background soft like a camera lens.",
+        values: &[("strength", [8.0; 3]), ("focus_mode", [1.0; 3]), ("far_range", [0.3; 3])],
     },
     Look {
         name: "portrait",
-        description: "A thin sharp band and a strong blur in front of it and behind it.",
-        values: &[("strength", [14.0; 3]), ("focus_range", [0.15; 3]), ("near_blur", [1.0; 3])],
+        description: "For clips: your character alone sharp, a strong blur in front and behind.",
+        values: &[
+            ("strength", [14.0; 3]),
+            ("focus_mode", [1.0; 3]),
+            ("focus_range", [0.15; 3]),
+            ("far_range", [0.15; 3]),
+            ("near_blur", [1.0; 3]),
+        ],
     },
 ];
 
 pub(crate) const DOF_USAGE: &str = "dof on|off|stats|get|reset|look <name>|set <name> <value>; names: strength \
-     autofocus focus_distance focus_range near_blur focus_time samples; looks: cinematic subtle portrait";
+     focus_mode focus_distance focus_range far_range near_blur focus_time samples; looks: playable cinematic portrait";
 
 pub(crate) static DOF: Effect = Effect {
     name: "dof",
     title: "Depth of field",
-    summary: "Blurs what is far from the focus, the character at the screen centre by default, like a camera \
-              lens. The HUD stays sharp.",
+    summary: "Blurs what is far from the focus like a camera lens: by default only the far background, or \
+              everything but your character for clips. The HUD stays sharp.",
     index: 1,
     env: DOF_ENV,
     look_env: DOF_LOOK_ENV,
     knobs: &DOF_KNOBS,
     looks: &DOF_LOOKS,
-    not_a_look: &["autofocus", "focus_distance", "focus_time", "samples"],
+    not_a_look: &["focus_distance", "focus_time", "samples"],
     values: &DOF_VALUES,
     on: &DOF_ON,
     usage: DOF_USAGE,
@@ -229,6 +245,7 @@ pub(crate) struct PostParams {
     pub intensity: f32,
     pub radius: f32,
     pub samples: u32,
+    pub far_range: f32,
 }
 
 /// `flags` bits.
@@ -236,6 +253,7 @@ pub(crate) const SRC_RESULT: u32 = 0x1;
 pub(crate) const NEAR_BLUR: u32 = 0x2;
 pub(crate) const AUTOFOCUS: u32 = 0x4;
 pub(crate) const FOCUS_RESET: u32 = 0x8;
+pub(crate) const FOCUS_PAST: u32 = 0x10;
 
 fn value(fx: &Effect, values: &[[f32; 3]], name: &str) -> [f32; 3] {
     fx.knobs.iter().position(|k| k.name == name).map_or([0.0; 3], |i| values[i])
@@ -255,7 +273,11 @@ pub(crate) fn post_params(extent: [u32; 2], dof: &[[f32; 3]], bloom: &[[f32; 3]]
         tint: [tint[0], tint[1], tint[2], 1.0],
         flags: (mode << 8)
             | if d("near_blur") != 0.0 { NEAR_BLUR } else { 0 }
-            | if d("autofocus") != 0.0 { AUTOFOCUS } else { 0 },
+            | match d("focus_mode") as u32 {
+                0 => 0,
+                1 => AUTOFOCUS,
+                _ => AUTOFOCUS | FOCUS_PAST,
+            },
         coc_scale: d("strength") * extent[1] as f32 / 1080.0 * 0.5,
         focus_fixed: d("focus_distance") / NEAR_STUDS,
         focus_range: d("focus_range"),
@@ -265,6 +287,7 @@ pub(crate) fn post_params(extent: [u32; 2], dof: &[[f32; 3]], bloom: &[[f32; 3]]
         intensity: b("intensity")[0],
         radius: b("radius")[0],
         samples: d("samples") as u32,
+        far_range: d("far_range"),
     }
 }
 
@@ -673,7 +696,8 @@ mod tests {
     fn the_push_constants_have_the_std430_layout() {
         use std::mem::{offset_of, size_of};
         // As spirv-dis prints post.comp's block.
-        assert_eq!(size_of::<PostParams>(), 72);
+        assert_eq!(size_of::<PostParams>(), 76);
+        assert_eq!(offset_of!(PostParams, far_range), 72);
         assert_eq!(offset_of!(PostParams, dst_size), 8);
         assert_eq!(offset_of!(PostParams, tint), 16);
         assert_eq!(offset_of!(PostParams, flags), 32);
@@ -687,7 +711,8 @@ mod tests {
         let dof: Vec<[f32; 3]> = DOF_KNOBS.iter().map(|k| k.default).collect();
         let bloom: Vec<[f32; 3]> = BLOOM_KNOBS.iter().map(|k| k.default).collect();
         let p = post_params([1920, 1080], &dof, &bloom, 1, 0.0);
-        assert_eq!((p.size, p.dst_size, p.flags), ([1920, 1080], [960, 540], (1 << 8) | AUTOFOCUS));
+        assert_eq!((p.size, p.dst_size, p.flags), ([1920, 1080], [960, 540], (1 << 8) | AUTOFOCUS | FOCUS_PAST));
+        assert_eq!(p.far_range, FAR_RANGE);
         assert!((p.coc_scale - STRENGTH * 0.5).abs() < 1e-6, "strength is a radius at 1080p, in half pixels");
         assert_eq!((p.focus_blend, p.samples, p.focus_range), (0.0, 48, FOCUS_RANGE));
         assert!((p.focus_fixed - 200.0).abs() < 1e-3, "20 studs over a near plane of 0.1");
@@ -699,7 +724,7 @@ mod tests {
 
         let mut dof2 = dof.clone();
         dof2[DOF_KNOBS.iter().position(|k| k.name == "near_blur").unwrap()] = [1.0; 3];
-        dof2[DOF_KNOBS.iter().position(|k| k.name == "autofocus").unwrap()] = [0.0; 3];
+        dof2[DOF_KNOBS.iter().position(|k| k.name == "focus_mode").unwrap()] = [0.0; 3];
         dof2[DOF_KNOBS.iter().position(|k| k.name == "focus_time").unwrap()] = [0.0; 3];
         let p = post_params([8, 8], &dof2, &bloom, 2, 0.0);
         assert_eq!((p.flags, p.focus_blend), ((2 << 8) | NEAR_BLUR, 1.0));

@@ -250,15 +250,18 @@ bright, so fog and darkness stay as they are.
 
 - Depth of field keeps the focus sharp and blurs what is behind it (and, with
   `INTOXICATED_DOF_NEAR_BLUR=1`, what is in front), more the further away,
-  like a camera lens, with a round bokeh; the sky counts as far. The focus is
-  the nearest thing around the screen centre, which in third person is your
-  character, eased over `INTOXICATED_DOF_FOCUS_TIME` seconds so it does not
-  pump, or a fixed `INTOXICATED_DOF_FOCUS_DISTANCE` in studs with
-  `INTOXICATED_DOF_AUTOFOCUS=0`. `_STRENGTH` is the largest blur as a radius
-  in pixels at 1080p, `_FOCUS_RANGE` how much either side of the focus stays
-  sharp, `_SAMPLES` the quality. A blurred background does not bleed over a
-  sharp edge in front of it. Looks: `cinematic` (the default), `subtle`,
-  `portrait` (`INTOXICATED_DOF_LOOK`).
+  like a camera lens, with a round bokeh; the sky counts as far. A blurred
+  background does not bleed over a sharp edge in front of it. The default
+  look, `playable`, focuses past your character on what lies behind it
+  (`INTOXICATED_DOF_FOCUS_MODE=2`) and keeps 1.5 times that distance sharp
+  behind it (`_FAR_RANGE`), with a light blur (`_STRENGTH=5`, a radius in
+  pixels at 1080p), so in third person the play area stays sharp and only
+  the far background and the sky soften. For clips, `cinematic` and
+  `portrait` focus on your character at the screen centre (mode 1) and blur
+  everything behind it strongly, `portrait` in front too
+  (`INTOXICATED_DOF_LOOK`). Mode 0 focuses at `_FOCUS_DISTANCE` studs. The
+  focus eases over `_FOCUS_TIME` seconds so it does not pump; `_SAMPLES` is
+  the quality.
 - Bloom makes bright lights, neon and bright sky glow:
   `INTOXICATED_BLOOM_THRESHOLD` is the brightness it starts at, from 0 to 1
   (the engine's picture is not HDR), with a soft `_KNEE`; `_INTENSITY`,
@@ -266,15 +269,18 @@ bright, so fog and darkness stay as they are.
   default), `neon`, `dreamy` (`INTOXICATED_BLOOM_LOOK`).
 
 devctl takes `dof` and `bloom` with the same words as `ssr` (`on`, `off`,
-`get`, `set <name> <value>`, `look <name>`, `reset`, `stats`), and the
-Shaders page sets all of it. Limits: the depth of field works
-from the scene's depth, which glass, water and other transparent surfaces
-usually do not write, so they are blurred or kept sharp by what is behind them
-(INFERRED); the
-autofocus looks only at the screen centre, so in shift-lock (character off
-centre) it focuses on what the crosshair is on; and studs for the fixed focus
-assume Roblox's near plane of 0.1 studs (INFERRED from the depth of the scene
-at a known distance).
+`get`, `set <name> <value>`, `look <name>`, `reset`, `stats`), and the Shaders
+page sets all of it. On an RTX 4070 Ti at 1667x1349 on Timebomb Duels the depth
+of field took about 0.13 to 0.2 ms of GPU time per frame and the bloom about
+0.1 ms; both together, with the shared depth copy and copy back, about 0.3 ms,
+and the frame times (p50 4.2 ms, about 240 fps) did not change measurably.
+Limits: the depth of field works from the scene's depth, which glass, water and
+other transparent surfaces usually do not write, so they are blurred or kept
+sharp by what is behind them (INFERRED); the autofocus looks only around the
+screen centre, so in shift-lock (character off centre) it focuses on what the
+crosshair is on; mode 2 can settle on the floor just behind the character when
+little else is in view (INFERRED); and the studs of the fixed focus assume a
+near plane of 0.1 studs, which was not measured.
 
 When the disk holding the profile's Roblox data runs short, the client says so:
 below 2 GiB free as it hands Roblox its window, below 512 MiB again when the

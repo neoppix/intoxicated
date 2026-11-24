@@ -4,8 +4,9 @@
 // one variant per dispatch, chosen by a define:
 //
 //   FOCUS            one group: where the camera is focused, from the depth
-//                    of a small region around the screen centre, eased over
-//                    time, kept in a 1x1 image of ours from frame to frame.
+//                    of a region around the screen centre (the subject
+//                    there, or what lies past it), eased over time, kept in
+//                    a 1x1 image of ours from frame to frame.
 //   DOF_PREP         half resolution: the scene colour, 2x2 averaged, and the
 //                    signed circle of confusion of the nearest of the four.
 //   DOF_GATHER       half resolution: the blur, gathered over a golden-angle
@@ -62,14 +63,15 @@ layout(push_constant) uniform Params {
     vec4 tint;
     // Bit 0: the scene colour is in our result image. Bit 1: things nearer
     // than the focus blur too. Bit 2: autofocus. Bit 3: the focus starts
-    // over (no easing). Bits 8 to 11: how the engine's format packs a pixel.
+    // over (no easing). Bit 4: autofocus past the subject. Bits 8 to 11: how
+    // the engine's format packs a pixel.
     uint flags;
     // The largest circle of confusion, as a radius in half-resolution pixels.
     float coc_scale;
     // The fixed focus distance, in near-plane units.
     float focus_fixed;
-    // The band either side of the focus that stays sharp, as a fraction of
-    // the focus distance.
+    // The band in front of the focus that stays sharp, as a fraction of the
+    // focus distance.
     float focus_range;
     // How far the focus moves towards where it should be this frame, 0 to 1.
     float focus_blend;
@@ -83,12 +85,16 @@ layout(push_constant) uniform Params {
     float radius;
     // Taps of the depth of field's gather.
     uint samples;
+    // The band behind the focus that stays sharp, as a fraction of the
+    // focus distance.
+    float far_range;
 } pc;
 
 const uint SRC_RESULT = 1u;
 const uint NEAR_BLUR = 2u;
 const uint AUTOFOCUS = 4u;
 const uint FOCUS_RESET = 8u;
+const uint FOCUS_PAST = 16u;
 
 // The sky, in near-plane units: far enough to count as infinity.
 const float SKY_Z = 1e7;
@@ -98,8 +104,12 @@ const float FAR_GAIN = 1.5;
 // The same for the near blur, towards the camera.
 const float NEAR_GAIN = 1.0;
 // The region the autofocus looks at: a square this fraction of the screen's
-// height either side of its centre.
+// height either side of its centre; larger past the subject, so that it
+// reaches round a character in third person.
 const float FOCUS_AREA = 0.05;
+const float FOCUS_AREA_PAST = 0.15;
+// Past the subject, what counts as behind it: this many times as far.
+const float PAST_FACTOR = 1.5;
 
 vec4 unpack(uint w) {
     uint mode = (pc.flags >> 8) & 0xfu;
@@ -156,7 +166,7 @@ float luma(vec3 c) {
 // Like a lens, it grows with the difference of inverse distances, so the
 // sky is as blurred as anything gets.
 float coc_of(float d, float focus) {
-    float hi = focus * (1.0 + pc.focus_range);
+    float hi = focus * (1.0 + pc.far_range);
     float lo = focus / (1.0 + pc.focus_range);
     float far = clamp((1.0 - hi * d) * FAR_GAIN, 0.0, 1.0);
     float near = 0.0;
@@ -173,12 +183,17 @@ float focus_now() {
 #if defined(FOCUS)
 
 shared float nearest[64];
+shared float logs[64];
+shared float counts[64];
+shared float skies[64];
 
 void main() {
     uint i = gl_LocalInvocationIndex;
+    bool past = (pc.flags & FOCUS_PAST) != 0u;
     vec2 at = vec2(i % 8u, i / 8u) + 0.5;
-    vec2 offset = (at / 8.0 * 2.0 - 1.0) * FOCUS_AREA * float(pc.size.y);
-    nearest[i] = depth_at(ivec2(vec2(pc.size) * 0.5 + offset));
+    vec2 offset = (at / 8.0 * 2.0 - 1.0) * (past ? FOCUS_AREA_PAST : FOCUS_AREA) * float(pc.size.y);
+    float own = depth_at(ivec2(vec2(pc.size) * 0.5 + offset));
+    nearest[i] = own;
     barrier();
     for (uint s = 32u; s > 0u; s >>= 1) {
         if (i < s) {
@@ -186,10 +201,35 @@ void main() {
         }
         barrier();
     }
+    // Past the subject: the mean log distance of what lies well behind the
+    // nearest thing, the sky left out.
+    bool behind = own > 0.0 && own * PAST_FACTOR < nearest[0];
+    logs[i] = behind ? log(1.0 / own) : 0.0;
+    counts[i] = behind ? 1.0 : 0.0;
+    skies[i] = own > 0.0 ? 0.0 : 1.0;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (i < s) {
+            logs[i] += logs[i + s];
+            counts[i] += counts[i + s];
+            skies[i] += skies[i + s];
+        }
+        barrier();
+    }
     if (i == 0u) {
         // The nearest thing in the region: the character in third person,
         // whatever is aimed at in first.
         float target = nearest[0] > 0.0 ? 1.0 / nearest[0] : SKY_Z;
+        // Or what lies past it, so the play area behind a third-person
+        // character stays sharp; the sky when nothing but the subject and
+        // the sky is there; the subject when it fills the region.
+        if (past && nearest[0] > 0.0) {
+            if (counts[0] > 0.0) {
+                target = exp(logs[0] / counts[0]);
+            } else if (skies[0] > 0.0) {
+                target = SKY_Z;
+            }
+        }
         if ((pc.flags & AUTOFOCUS) == 0u) {
             target = pc.focus_fixed;
         }

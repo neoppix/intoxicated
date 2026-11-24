@@ -486,18 +486,23 @@ env:
                                      camera lens, before the HUD is drawn, so
                                      the HUD stays sharp. Off by default.
                                      devctl's dof takes the same words as ssr
-  INTOXICATED_DOF_LOOK=<name>        cinematic (the defaults), subtle or
-                                     portrait; the variables below change it
+  INTOXICATED_DOF_LOOK=<name>        playable (the defaults: only the far
+                                     background softens), cinematic or
+                                     portrait (for clips: focus on the
+                                     character); the variables below change it
   INTOXICATED_DOF_STRENGTH=<0..32>   the largest blur, a radius in pixels at
-                                     1080p (8)
-  INTOXICATED_DOF_AUTOFOCUS=<0|1>    1 focus on the nearest thing around the
-                                     screen centre, eased over time; 0 at
-                                     FOCUS_DISTANCE (1)
+                                     1080p (5)
+  INTOXICATED_DOF_FOCUS_MODE=<0..2>  0 at FOCUS_DISTANCE, 1 on the nearest
+                                     thing at the screen centre (the
+                                     character), 2 past it, on what lies
+                                     behind it (2); eased over time
   INTOXICATED_DOF_FOCUS_DISTANCE=<studs>
-                                     the focus without autofocus (20)
-  INTOXICATED_DOF_FOCUS_RANGE=<0..4> how far either side of the focus stays
-                                     sharp, as a fraction of its distance
-                                     (0.3)
+                                     the focus in mode 0 (20)
+  INTOXICATED_DOF_FOCUS_RANGE=<0..4> how far in front of the focus stays
+                                     sharp with NEAR_BLUR, as a fraction of
+                                     its distance (0.3)
+  INTOXICATED_DOF_FAR_RANGE=<0..10>  how far behind the focus stays sharp,
+                                     as a fraction of its distance (1.5)
   INTOXICATED_DOF_NEAR_BLUR=<0|1>    1 what is nearer than the focus blurs
                                      too (0)
   INTOXICATED_DOF_FOCUS_TIME=<secs>  how long the autofocus takes to settle
