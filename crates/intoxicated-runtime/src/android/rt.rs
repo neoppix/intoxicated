@@ -38,10 +38,23 @@ pub(crate) mod trace;
 /// The switch.
 pub const ENV: &str = "INTOXICATED_RT";
 
-/// Whether the switch was on at start, read once.
+/// What is said once when the switch is on, and in `rt stats`.
+pub const WARNING: &str = "ray-traced reflections are experimental: they replace the screen-space ones, \
+off-screen hits have no textures, in-world interface does not reflect, they can flicker while the camera moves, \
+they cost about 260 MB of video memory and about 1 ms of GPU time (compute on the shader cores; NVIDIA's FreeBSD \
+driver has no hardware ray tracing), and they were only tried on an RTX 4070 Ti with NVIDIA 620.70.06";
+
+/// Whether the switch was on at start, read once; the first time it is on
+/// the warning is printed.
 pub(crate) fn requested() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var(ENV).is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| {
+        let on = std::env::var(ENV).is_ok_and(|v| v.trim() == "1");
+        if on {
+            println!("[android] vulkan: rt: WARNING: {WARNING} ({ENV}=1)");
+        }
+        on
+    })
 }
 
 const VK_SUCCESS: i32 = 0;
@@ -462,7 +475,7 @@ pub fn control(args: &[&str]) -> Result<String, String> {
                 })
                 .collect();
             Ok(format!(
-                "engine_api={} instance_api={} {} {} {}",
+                "experimental=yes engine_api={} instance_api={} {} {} {} warning={WARNING:?}",
                 version_text(ENGINE_API_VERSION.load(Relaxed)),
                 version_text(INSTANCE_API_VERSION.load(Relaxed)),
                 if devices.is_empty() { "no device".to_string() } else { devices.join(" ") },

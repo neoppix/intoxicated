@@ -852,6 +852,52 @@ void testEffectSettings() {
     QFile::remove(path);
 }
 
+// The ray-traced reflections: their own switch only, never a look's.
+void testRayTracing() {
+    const QString path = settingsConfPath();
+    const auto reloaded = [&] {
+        SettingsConf c;
+        c.load(path);
+        return c;
+    };
+    QString error;
+    writeAll(path, "INTOXICATED_SSR=1\n");
+    SettingsConf conf = reloaded();
+    check(!rtOn(conf), "ray tracing starts off");
+    QList<SsrTable> tables;
+    parseShaderTables(kShaderLooks, &tables, nullptr);
+    for (const SsrTable &t : tables) {
+        for (const SsrLook &look : t.looks) {
+            check(applySsrLook(t, conf, look.name), "apply " + look.name);
+            check(!rtOn(conf) && !conf.value(kRtSetting), look.name + " does not turn ray tracing on");
+        }
+    }
+    setRtOn(conf, true);
+    check(conf.save(&error), "save: " + error);
+    check(readAll(path).endsWith("INTOXICATED_RT=1\n"), "on writes INTOXICATED_RT=1");
+    conf = reloaded();
+    check(rtOn(conf), "and reads back as on");
+    for (const SsrTable &t : tables) {
+        for (const SsrLook &look : t.looks)
+            applySsrLook(t, conf, look.name);
+    }
+    check(rtOn(conf), "no look turns it off either");
+    for (const char *off : {"0", "", "yes"}) {
+        SettingsConf c;
+        c.set(kRtSetting, off);
+        check(!rtOn(c), QStringLiteral("INTOXICATED_RT=%1 is off").arg(off));
+    }
+    setRtOn(conf, false);
+    check(conf.save(&error), "save: " + error);
+    check(!readAll(path).contains("INTOXICATED_RT"), "off removes the line");
+    const QStringList warnings = rtWarnings();
+    const QString all = warnings.join(QLatin1Char(' '));
+    for (const char *word : {"replaces", "textures", "leaderboards", "flicker", "never drawn", "260 MB", "1 ms",
+                             "no hardware ray tracing", "RTX 4070 Ti", "620.70.06"})
+        check(all.contains(QLatin1String(word)), QStringLiteral("the warnings say %1").arg(word));
+    QFile::remove(path);
+}
+
 // readShaderTables runs `intoxicated --shader-looks`.
 void testShaderLauncher(const QString &scratch) {
     const QString bin = scratch + "/bin2";
@@ -907,6 +953,7 @@ int runSelfTest() {
     testSsrLauncher(root);
     testShaderTables();
     testEffectSettings();
+    testRayTracing();
     testShaderLauncher(root);
 
     std::printf("self-test: %d checks, %d failed (scratch %s)\n", g_checks, g_failures, qPrintable(root));

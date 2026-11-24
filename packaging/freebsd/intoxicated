@@ -231,6 +231,14 @@ fi
 
 ensure_flags
 
+# Ray-traced reflections are opt-in and experimental; say so where it starts.
+if [ "${INTOXICATED_RT:-}" = 1 ]; then
+  echo "intoxicated: INTOXICATED_RT=1: ray-traced reflections are EXPERIMENTAL. They replace the screen-space" >&2
+  echo "  reflections, show off-screen things without textures, use about 260 MB more video memory and" >&2
+  echo "  about 1 ms more GPU time, and were only tried on an RTX 4070 Ti (NVIDIA 620.70.06); unset it if" >&2
+  echo "  the game misbehaves." >&2
+fi
+
 set -- --lib-dir "$APKDIR/lib/x86_64" --apk "$APK" --host-libc --game-activity --run 0
 [ "$PROFILE" != default ] && set -- "$@" --profile "$PROFILE"
 [ -n "$JOIN" ] && set -- "$@" --join-url "$JOIN"

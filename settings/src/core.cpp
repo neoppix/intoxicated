@@ -1135,6 +1135,26 @@ void setEffectOn(const QString &switchEnv, SettingsConf &conf, bool on) {
         conf.remove(switchEnv);
 }
 
+bool rtOn(const SettingsConf &conf) { return effectOn(kRtSetting, conf); }
+
+void setRtOn(SettingsConf &conf, bool on) { setEffectOn(kRtSetting, conf, on); }
+
+QStringList rtWarnings() {
+    return {
+        QStringLiteral("While on it replaces the screen-space reflections; their look and fine tuning still apply."),
+        QStringLiteral("Off-screen hits have no textures yet: players and textured walls reflect grey or in flat "
+                       "colours."),
+        QStringLiteral("Interface drawn in the world, such as leaderboards and name tags, does not reflect."),
+        QStringLiteral("Reflections can flicker while the camera moves."),
+        QStringLiteral("Objects the game has never drawn cannot appear in a reflection."),
+        QStringLiteral("Uses about 260 MB more video memory and about 1 ms more GPU time a frame."),
+        QStringLiteral("Runs as compute on the shader cores, because NVIDIA's FreeBSD driver has no hardware ray "
+                       "tracing."),
+        QStringLiteral("May crash or misbehave on other GPUs and drivers: only tested on an RTX 4070 Ti with NVIDIA "
+                       "620.70.06."),
+    };
+}
+
 bool ssrOn(const SettingsConf &conf) { return effectOn(kSsrSetting, conf); }
 
 void setSsrOn(SettingsConf &conf, bool on) { setEffectOn(kSsrSetting, conf, on); }

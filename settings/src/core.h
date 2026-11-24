@@ -355,6 +355,19 @@ bool applySsrLook(const SsrTable &table, SettingsConf &conf, const QString &look
 bool setSsrKnob(SettingsConf &conf, const SsrKnob &knob, const SsrValue &value);
 void resetSsrKnob(SettingsConf &conf, const SsrKnob &knob);
 
+// --- Ray-traced reflections (experimental) ---------------------------------
+
+// INTOXICATED_RT=1 replaces the screen-space reflections with ray-traced
+// ones. Experimental and opt-in: no look, preset or mode of this app ever
+// writes it; only its own switch on the Shaders page does.
+inline const QString kRtSetting = QStringLiteral("INTOXICATED_RT");
+
+bool rtOn(const SettingsConf &conf);
+void setRtOn(SettingsConf &conf, bool on);
+// What to know before turning it on, one line each, for the page and its
+// confirmation.
+QStringList rtWarnings();
+
 // --- Self-test -------------------------------------------------------------
 
 int runSelfTest();

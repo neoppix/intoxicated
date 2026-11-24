@@ -1,7 +1,8 @@
 // Intoxicated Settings: the Shaders page. The effects the client draws into
 // the game before the HUD (screen-space reflections, depth of field, bloom),
 // one group each: the switch, the named looks and a fine-tune row per knob,
-// each written to settings.conf as it changes. The effects, their knobs and
+// each written to settings.conf as it changes; and, last, the experimental
+// ray-traced reflections, a switch behind a confirmation. The effects, their knobs and
 // their looks come from `intoxicated --shader-looks`, so nothing here keeps
 // a copy of their values.
 
@@ -165,6 +166,7 @@ ShadersPage::ShadersPage(AppState *state) : m_state(state) {
     }
     for (int i = 0; i < m_effects.size(); ++i)
         buildEffect(b, i);
+    buildRayTracing(b);
     b->addStretch(1);
 
     connect(state, &AppState::settingsChanged, this, &ShadersPage::reload);
@@ -258,6 +260,62 @@ void ShadersPage::buildEffect(QVBoxLayout *page, int index) {
     fx.tuneButton->setChecked(tuned);
     fx.tune->setVisible(tuned);
     fx.tuneButton->setText(tuned ? QStringLiteral("Hide") : QStringLiteral("Show"));
+}
+
+void ShadersPage::buildRayTracing(QVBoxLayout *page) {
+    Section s = section(QStringLiteral("Ray-traced reflections (experimental)"));
+    auto *v = new QVBoxLayout(s.body);
+    v->setContentsMargins(8, 6, 8, 4);
+    v->setSpacing(0);
+    page->addWidget(s.box);
+    page->addSpacing(8);
+
+    auto *top = new QHBoxLayout;
+    top->setContentsMargins(6, 2, 6, 6);
+    top->setSpacing(10);
+    auto *tag = new QLabel(QStringLiteral("EXPERIMENTAL"));
+    tag->setObjectName(QStringLiteral("experimentalTag"));
+    top->addWidget(tag, 0, Qt::AlignVCenter);
+    top->addWidget(note(QStringLiteral("Opt in, at your own risk. Off by default, and no look or preset turns it on.")),
+                   1);
+    v->addLayout(top);
+    v->addWidget(separator());
+
+    m_rtOn = new Switch;
+    m_rtOn->setToolTip(kRtSetting);
+    v->addWidget(settingRow(QStringLiteral("Ray-traced reflections"),
+                            QStringLiteral("Traces each reflection against the scene's own geometry, so it can show "
+                                           "what is off screen or behind the camera."),
+                            m_rtOn));
+    connect(m_rtOn, &QCheckBox::clicked, this, &ShadersPage::rayTracingClicked);
+    v->addWidget(separator());
+    QStringList items;
+    for (const QString &w : rtWarnings())
+        items.append(QStringLiteral("\u2022 ") + w);
+    auto *warnings = note(items.join(QLatin1Char('\n')));
+    warnings->setContentsMargins(6, 8, 6, 8);
+    v->addWidget(warnings);
+}
+
+void ShadersPage::rayTracingClicked(bool on) {
+    if (on) {
+        QStringList items;
+        for (const QString &w : rtWarnings())
+            items.append(QStringLiteral("\u2022 ") + w);
+        QMessageBox box(QMessageBox::Warning, QStringLiteral("Ray-traced reflections"),
+                        QStringLiteral("Ray-traced reflections are experimental. Turn them on?"),
+                        QMessageBox::Yes | QMessageBox::Cancel, this);
+        box.setInformativeText(items.join(QLatin1Char('\n')));
+        box.setDefaultButton(QMessageBox::Cancel);
+        if (box.exec() != QMessageBox::Yes) {
+            reload();
+            return;
+        }
+    }
+    edit([on](SettingsConf &conf) {
+        setRtOn(conf, on);
+        return true;
+    });
 }
 
 void ShadersPage::buildFineTune(QVBoxLayout *rows, int index) {
@@ -367,6 +425,8 @@ void ShadersPage::reload() {
         QMessageBox::warning(this, QStringLiteral("Shaders"), error);
     for (EffectUi &fx : m_effects)
         reloadEffect(conf, fx);
+    if (m_rtOn)
+        m_rtOn->setChecked(rtOn(conf));
     m_filling = false;
 }
 

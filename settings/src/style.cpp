@@ -82,6 +82,14 @@ QLabel#heading { color: #f5f5f7; font-size: 24px; font-weight: 700; }
 QLabel#subtitle { color: #9a9aa4; font-size: 13px; }
 QLabel#note { color: #9a9aa4; font-size: 12px; }
 QLabel#error { color: #ff6b70; font-size: 12px; }
+QLabel#experimentalTag {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #E91F26, stop:1 #A5071A);
+    color: #ffffff;
+    font-size: 11px;
+    font-weight: 700;
+    border-radius: 4px;
+    padding: 2px 7px;
+}
 QLabel#status { color: #9a9aa4; font-size: 12px; }
 QLabel#aboutName { color: #f5f5f7; font-size: 28px; font-weight: 700; }
 QLabel#aboutTag { color: #c8c8cf; font-size: 15px; }

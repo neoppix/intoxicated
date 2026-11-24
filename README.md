@@ -282,43 +282,8 @@ crosshair is on; mode 2 can settle on the floor just behind the character when
 little else is in view (INFERRED); and the studs of the fixed focus assume a
 near plane of 0.1 studs, which was not measured.
 
-Ray-traced reflections are a prototype, off by default: `INTOXICATED_RT=1` (it
-turns the reflections on as well, unless `INTOXICATED_SSR` is set; their look
-knobs apply). With it every reflection is ray traced and the screen-space march
-does not run at all; without it the screen-space reflections are their own
-effect as before. Each frame the client captures the opaque world geometry the
-engine draws in its 3D scene (transform feedback, enabled through Vulkan: the
-engine's lit vertex shaders get their position, colour and camera vector
-outputs marked for capture and compute nothing differently; particles,
-billboards, name tags, the sky and anything that blends, which includes text
-and images on signs, are left out), measures the camera's real projection from
-it, builds a bounding volume hierarchy on the GPU and traces one reflection ray
-per 2 by 2 pixels against it, spread back over the pixels of the same surface
-and steadied over frames while the view holds still. So a reflection can show
-what is off screen or hidden, such as players off screen seen in a wall, or the
-front of your own character in the wall ahead of it. Where the hit is what the
-screen shows, the reflection takes its colour from a copy of the scene made
-after the opaque world is drawn and before anything transparent, the interface
-drawn in the world or a billboard; elsewhere the colour the engine's vertex
-shader passed on, without textures, at the brightness the screen shows such
-colours at on average. The engine culls what is outside the view (of 165000
-captured triangles, 8 touched the space behind the camera), so the static parts
-it drew are kept in a cache in world space and still reflected once they leave
-the view, until the view shows their place again without them, they go unseen
-for about two minutes, the cache needs their room, or the camera jumps (a
-teleport); moving players come only from the frame itself. In Timebomb Duels
-(30000 to 60000 triangles drawn a frame and 7000 to 19000 more from the cache,
-1667x1349, RTX 4070 Ti) it costs 0.2 to 0.3 ms of GPU time for the hierarchy
-and 0.5 to 0.7 ms for the rays with the default and mirror looks (all of the
-reflections' work 0.9 to 1.3 ms, against 0.6 ms for the march); frame times did
-not change at the engine's 240 fps. NVIDIA's FreeBSD driver offers no hardware
-ray tracing: on the RTX 4070 Ti, drivers 580.142 and 620.70.06 list neither
-`VK_KHR_acceleration_structure` nor `VK_KHR_ray_query` nor
-`VK_KHR_ray_tracing_pipeline` (vulkaninfo lists them for llvmpipe only) and the
-package ships no `libnvidia-rtcore`, so the hierarchy and the rays are compute
-shaders of the client's own running on the shader cores. devctl `rt on`, `rt
-off` and `rt stats` switch them and report the triangles, the measured camera
-and the GPU time.
+Ray-traced reflections are an experimental, opt-in alternative to the
+screen-space ones; see [Experimental: ray-traced reflections](#experimental-ray-traced-reflections).
 
 When the disk holding the profile's Roblox data runs short, the client says so:
 below 2 GiB free as it hands Roblox its window, below 512 MiB again when the
@@ -327,6 +292,55 @@ run ends. The engine itself never reports a full disk.
 A new Roblox build can import symbols Intoxicated does not answer yet; if
 `intoxicated` reports `cannot locate symbol`, that is what happened. The raw
 syscall sites the anticheat fix needs are found automatically for every build.
+
+## Experimental: ray-traced reflections
+
+**Experimental. Off by default, opt in at your own risk.** `INTOXICATED_RT=1`
+(in the environment or settings.conf, or the switch under "Ray-traced
+reflections (experimental)" on the Shaders page of Intoxicated Settings, which
+asks for confirmation) replaces the screen-space reflections with ray-traced
+ones; remove the line, or turn the switch off, to go back. No look or preset
+turns it on. The launcher and the client both print a warning when it is on,
+and devctl `rt stats` repeats it.
+
+What it does: each frame the client captures the opaque world geometry the
+engine draws in its 3D scene (transform feedback, enabled through Vulkan: the
+engine's lit vertex shaders get their position, colour, camera vector and
+world position marked for capture and compute nothing differently), measures
+the camera's real projection from it, keeps the static parts in a cache in
+world space so they stay reflectable after they leave the view, builds a
+bounding volume hierarchy on the GPU and traces one ray per 2 by 2 pixels
+against it. A reflection can so show what is off screen or behind the camera,
+such as the ceiling in a floor or players off screen in a wall. The screen-space reflections' look and fine tuning still apply.
+
+What to know before turning it on:
+
+- While on it replaces the screen-space reflections entirely.
+- Off-screen hits have no textures yet: players and textured walls reflect
+  grey or in flat colours (the engine's base colour of each part, at the
+  brightness the screen shows such colours at on average).
+- Interface drawn in the world, such as leaderboards, name tags and trophy
+  icons, does not reflect, nor do particles or transparent parts.
+- Reflections can flicker while the camera moves.
+- Objects the game has never drawn cannot appear; a static part that moved
+  while out of view stays in the reflections at its old place until the view
+  shows that place again, and players only come from the current frame.
+- It costs about 260 MB more video memory and about 1 ms more GPU time a
+  frame. Measured in Timebomb Duels at 1667x1349 on an RTX 4070 Ti: 0.2 to
+  0.3 ms for the hierarchy and 0.5 to 0.7 ms for the rays (all of the
+  reflections' work 0.9 to 1.3 ms, against 0.6 ms for the screen-space
+  ones); frame times did not change at the engine's 240 fps.
+- It runs as compute on the shader cores because NVIDIA's FreeBSD driver
+  has no hardware ray tracing: on the RTX 4070 Ti, drivers 580.142 and
+  620.70.06 list neither `VK_KHR_acceleration_structure` nor
+  `VK_KHR_ray_query` nor `VK_KHR_ray_tracing_pipeline` (vulkaninfo lists them
+  for llvmpipe only), and the package ships no `libnvidia-rtcore`.
+- It may crash or misbehave on other GPUs and drivers: it was only tested on
+  an RTX 4070 Ti with NVIDIA 620.70.06, in Timebomb Duels.
+
+devctl `rt on` and `rt off` switch it while the game runs (with
+`INTOXICATED_RT=1` at start), and `rt stats` reports the triangles, the
+measured camera, the cache and the GPU time.
 
 ## Intoxicated Settings
 
@@ -337,10 +351,11 @@ a JSON file (a Bloxstrap export or a `ClientAppSettings.json`) with a preview,
 export and reset. Client options: window, input, graphics, audio and session.
 Shaders: the screen-space reflections, the depth of field and the bloom, one
 group each with a switch, the named looks (Competitive, Wet road, Clean
-mirror, Puddles and Glossy for the reflections; Cinematic, Subtle and Portrait
+mirror, Puddles and Glossy for the reflections; Playable, Cinematic and Portrait
 for the depth of field; Soft, Neon and Dreamy for the bloom) and a fine-tune
 row for each of their settings; picking a look clears the fine tuning, after
-asking, and each row has its own reset. Like the client options they apply from the
+asking, and each row has its own reset. Below them, marked experimental, the
+switch for the ray-traced reflections, with their warnings and a confirmation. Like the client options they apply from the
 next launch. Profiles: create, delete and pick the default one. And Play, a place id or
 link field, and the two update commands. It is a Qt 6 Widgets program in
 `settings/` that needs `qt6-base` and nothing else.

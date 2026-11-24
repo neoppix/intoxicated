@@ -213,6 +213,10 @@ private:
     };
 
     void buildEffect(QVBoxLayout *page, int index);
+    // The experimental ray-traced reflections: a switch, the warnings and a
+    // confirmation before it turns on.
+    void buildRayTracing(QVBoxLayout *page);
+    void rayTracingClicked(bool on);
     void buildFineTune(QVBoxLayout *rows, int index);
     void reloadEffect(const SettingsConf &conf, EffectUi &fx);
     // Load settings.conf, apply CHANGE, write it, show the result.
@@ -224,6 +228,7 @@ private:
 
     AppState *m_state;
     QList<EffectUi> m_effects;
+    Switch *m_rtOn = nullptr;
     QLabel *m_tableError;
     bool m_filling = false;
 };

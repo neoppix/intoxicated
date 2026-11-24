@@ -521,7 +521,7 @@ env:
                                      threshold (0.5)
   INTOXICATED_BLOOM_RADIUS=<0..1>    0 a tight glow, 1 a wide one (0.7)
   INTOXICATED_BLOOM_TINT=<r,g,b>     colour of the glow, each 0 to 2 (1,1,1)
-  INTOXICATED_RT=1                   ray-traced reflections (prototype): the
+  INTOXICATED_RT=1                   EXPERIMENTAL ray-traced reflections: the
                                      scene's triangles are captured as the
                                      engine draws them and the reflections'
                                      rays are traced against them, so they
