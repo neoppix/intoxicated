@@ -60,7 +60,7 @@ layout(binding = 3, r32ui) uniform uimage2D result_img;
 #ifdef COMPOSE
 layout(binding = 3, r32ui) uniform writeonly uimage2D out_img;
 layout(binding = 5) uniform sampler2D trace_tex;
-#else
+#elif !defined(RTEMPORAL)
 layout(binding = 4, rgba16f) uniform writeonly image2D trace_img;
 #endif
 
@@ -563,6 +563,11 @@ layout(std430, set = 1, binding = 14) buffer GiB { uvec4 gi_b[]; };
 // passes: red and green, blue and variance, as halves.
 layout(std430, set = 1, binding = 15) buffer GiFa { uvec2 gi_fa[]; };
 layout(std430, set = 1, binding = 16) buffer GiFb { uvec2 gi_fb[]; };
+// The reflections' history per pixel, this frame's and the last one's in
+// turn (by the frame's parity): the colour and strength as halves, the
+// surface's depth (studs), the hit distance and the frames kept as halves.
+layout(std430, set = 1, binding = 18) buffer ReflA { uvec4 refl_a[]; };
+layout(std430, set = 1, binding = 19) buffer ReflB { uvec4 refl_b[]; };
 // The environment: what the screen showed in each direction where it showed
 // sky, kept over frames, octahedral around world up, `ENV_SIZE` squared:
 // (red and green, blue and weight as halves, the cache's generation it
@@ -944,7 +949,16 @@ bool emits(uint tri) {
 // four of them picked at random, one of those by what it would give
 // (resampled importance sampling), and a ray towards a random point on it
 // for whether it is in view. 0 where there are none.
-const float NEON_LIGHT = 0.08;
+// Neon as a light: a quarter of its drawn brightness, falling off faster
+// than the square of the distance beyond NEON_NEAR studs, so a panel lights
+// the wall and floor beside it strongly while a street of lit windows does
+// not wash everything out.
+const float NEON_LIGHT = 0.25;
+const float NEON_NEAR = 12.0;
+// The indirect light is held to GI_MOST times the engine's ambient plus
+// GI_MOST_ADD (a stray sample cannot wash a wall out; a Neon glow stays).
+const float GI_MOST = 8.0;
+const float GI_MOST_ADD = 1.5;
 
 vec3 emitter_light(vec3 X, vec3 n, uint seed) {
     uint count = min(emitters_n, MAX_EMITTERS);
@@ -986,7 +1000,8 @@ vec3 emitter_light(vec3 X, vec3 n, uint seed) {
         // engine draws Neon far brighter than the screen can show (13 times
         // white for a white part), and lights nothing with it; taken at
         // full strength as a light it would flood a street of lit windows.
-        vec3 f = NEON_LIGHT * emission_of(tri, col) * cos_x * cos_y * (0.5 * area2) * float(count) / (3.14159265 * max(d2, 4.0));
+        vec3 f = NEON_LIGHT * emission_of(tri, col) * cos_x * cos_y * (0.5 * area2) * float(count) / (3.14159265 * max(d2, 1.0))
+            / (1.0 + d2 / (NEON_NEAR * NEON_NEAR));
         float p_hat = dot(f, vec3(0.2126, 0.7152, 0.0722));
         if (!(p_hat > 0.0) || isinf(p_hat)) {
             continue;
@@ -1080,7 +1095,11 @@ void learn_colour(uint slot, vec3 screen, vec3 n, vec3 Hw) {
     slots[at + 2u] = v;
 }
 
+// The last reflection ray's hit distance (studs; far for none).
+float g_hit_t = 60000.0;
+
 vec4 reflection_rt(ivec2 p, vec3 P, vec3 N, float wet) {
+    g_hit_t = 60000.0;
     vec3 V = normalize(P);
     float cos_v = clamp(dot(-V, N), 0.0, 1.0);
     float schlick = 0.04 + 0.96 * pow(1.0 - cos_v, 5.0);
@@ -1104,6 +1123,7 @@ vec4 reflection_rt(ivec2 p, vec3 P, vec3 N, float wet) {
     uint tri;
     vec2 uv;
     float t = trace_ray(O, Rw, 0.002 * P.z * scale, t_max, tri, uv);
+    g_hit_t = t > 0.0 ? t : 60000.0;
     int k = cell(p);
     if (category) {
         // Flags bits 6 and 7 at 3: what the ray hit, by kind: yellow a Neon
@@ -1189,11 +1209,14 @@ vec4 reflection_rt(ivec2 p, vec3 P, vec3 N, float wet) {
         vec3 n = hit_normal(tri, uv, Rw);
         vec3 lin = lit_linear(own, n, Hw);
         vec3 albedo = own * own;
+        // Only with the indirect light on (flags bit 14): without it the
+        // reflections show what the engine's light alone makes, as the
+        // screen does.
+        vec3 amb = engine_ambient(n);
         if (gi.x >= 0.0) {
-            vec3 amb = engine_ambient(n);
-            lin = max(lin + albedo * (min(gi, 3.0 * amb + vec3(0.3)) - amb), 0.5 * lin);
-        } else {
-            lin += albedo * emitter_light(Hw + n * 0.02, n, hash(uint(p.x) * 7919u + uint(p.y) * 104729u + frame * 31u));
+            lin = max(lin + albedo * (min(gi, GI_MOST * amb + vec3(GI_MOST_ADD)) - amb), 0.5 * lin);
+        } else if ((pc.flags & 16384u) != 0u) {
+            lin += albedo * min(emitter_light(Hw + n * 0.02, n, hash(uint(p.x) * 7919u + uint(p.y) * 104729u + frame * 31u)), GI_MOST * amb + vec3(GI_MOST_ADD));
         }
         own = sqrt(clamp(lin * frame_block[20].y, 0.0, 1.0));
     } else {
@@ -1211,7 +1234,7 @@ vec4 reflection_rt(ivec2 p, vec3 P, vec3 N, float wet) {
         vec3 ambient = engine_ambient(n);
         vec3 to_sun = -frame_block[16].xyz;
         vec3 light = ambient + frame_block[15].xyz * max(dot(n, to_sun), 0.0) + frame_block[17].xyz * max(-dot(n, to_sun), 0.0);
-        lin = max(lin + lin / max(light, vec3(0.02)) * (min(gi, 3.0 * ambient + vec3(0.3)) - ambient), 0.5 * lin);
+        lin = max(lin + lin / max(light, vec3(0.02)) * (min(gi, GI_MOST * ambient + vec3(GI_MOST_ADD)) - ambient), 0.5 * lin);
         screen = sqrt(clamp(lin * exposure_, 0.0, 1.0));
     }
     vec3 c = mix(own, screen, screen_share * on_screen);
@@ -1254,6 +1277,24 @@ vec4 debug_view(vec3 n) {
 uint leader(ivec2 b) {
     int s = int(grid_scale());
     int m = s / 2, e = s - 1;
+#if !defined(GI) && !defined(GIFILTER) && !defined(GIAPPLY)
+    // The reflections' rays leave from a different pixel of the block each
+    // frame (a Halton walk over it), so their history (RTEMPORAL) covers
+    // the whole block and edges come out smooth.
+    if ((pc.flags & 65536u) != 0u) {
+        uint k = frame % uint(s * s);
+        uint hx = 0u, hy = 0u;
+        // Bit-reversed order over the block's cells.
+        uint r = bitfieldReverse(k) >> (32u - uint(max(findMSB(uint(s * s - 1)) + 1, 1)));
+        r = r < uint(s * s) ? r : k;
+        hx = r % uint(s);
+        hy = r / uint(s);
+        ivec2 q = s * b + ivec2(hx, hy);
+        if (all(lessThan(uvec2(q), pc.size)) && depth_at(q) > 0.0) {
+            return uint(q.x) | (uint(q.y) << 16);
+        }
+    }
+#endif
     ivec2 order[5] = ivec2[5](ivec2(m, m), ivec2(0, 0), ivec2(e, e), ivec2(e, 0), ivec2(0, e));
     for (int i = 0; i < 5; ++i) {
         ivec2 q = s * b + order[i];
@@ -1434,7 +1475,9 @@ void main() {
         L = env.a > 0.0 ? env.rgb * env.rgb / exposure_ : engine_ambient(dir);
     }
     // The Neon parts' light, wherever they are, in view or not.
-    L += emitter_light(X + n * (0.002 * dist + 0.02), n, h ^ 0x68e31da4u);
+    // Two samples of it (each resampled from four), averaged.
+    vec3 Xo = X + n * (0.002 * dist + 0.02);
+    L += 0.5 * (emitter_light(Xo, n, h ^ 0x68e31da4u) + emitter_light(Xo, n, h ^ 0x1b873593u));
     L = min(L, vec3(16.0));
     // Accumulated over up to 32 frames, with the first two moments of its
     // brightness for the filter's variance. A sample far outside what the
@@ -1567,6 +1610,134 @@ void main() {
     }
 }
 
+#elif defined(RT) && defined(RTEMPORAL)
+
+// The reflections' history (`-DRT -DRTEMPORAL`), per pixel, after the
+// upsample: the pixel's last result found where the reflected thing was a
+// frame ago (its mirror image, the surface point moved back along the view
+// ray by the hit distance, for a mirror; the surface point itself as the
+// surface gets rough), kept where the surface there is the same (depth) and
+// the reflected thing is as far away (hit distance), held inside the
+// colours the pixels around it show now (YCoCg box) and blended with this
+// frame's: up to 12 frames while the camera is still, 3 while it turns.
+// The block a ray leaves from moves around its block from frame to frame,
+// so the edges of what is reflected come out smooth over a few frames
+// instead of in block steps. Into this frame's history buffer; the resolve
+// pass copies it into the trace image the compose reads.
+layout(binding = 4, rgba16f) uniform readonly image2D trace_cur;
+
+vec3 ycocg(vec3 c) {
+    return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b);
+}
+
+void main() {
+    camera_from_fit();
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(p), pc.size))) {
+        return;
+    }
+    uint at = uint(p.y) * pc.size.x + uint(p.x);
+    bool odd = (frame & 1u) != 0u;
+    vec4 cur = imageLoad(trace_cur, p);
+    float d = depth_at(p);
+    if (any(isnan(cur)) || any(isinf(cur))) {
+        cur = vec4(0.0);
+    }
+    if (d <= 0.0 || !g_fit || (pc.flags & 65536u) == 0u) {
+        uvec4 o = uvec4(packHalf2x16(cur.rg), packHalf2x16(cur.ba), 0u, 0u);
+        if (odd) { refl_b[at] = o; } else { refl_a[at] = o; }
+        return;
+    }
+    // The box of what the pixels around show now.
+    vec3 lo = vec3(1e9), hi = vec3(-1e9);
+    float alo = 1e9, ahi = -1e9;
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            vec4 c = imageLoad(trace_cur, clamp(p + ivec2(i, j), ivec2(0), ivec2(pc.size) - 1));
+            if (any(isnan(c)) || any(isinf(c))) {
+                continue;
+            }
+            vec3 y = ycocg(c.rgb);
+            lo = min(lo, y);
+            hi = max(hi, y);
+            alo = min(alo, c.a);
+            ahi = max(ahi, c.a);
+        }
+    }
+    vec3 P = view_pos(vec2(p) + 0.5, d);
+    vec3 X = to_world(P);
+    vec3 V = normalize(X - cam_pos.xyz);
+    float z = P.z * g_near;
+    uint s = grid_scale();
+    uvec2 hs = half_size();
+    uvec2 hb = min(uvec2(p) / s, hs - 1u);
+    float t = unpackHalf2x16(blocks[hb.y * hs.x + hb.x].w).x;
+    float far_ = 4096.0;
+    float th = clamp(t, 0.0, far_);
+    // Mirror image for a mirror, the surface itself as it gets rough.
+    vec3 Y = mix(X + V * th, X, clamp(pc.roughness * 2.0, 0.0, 1.0));
+    float frames = 0.0;
+    vec4 hist = vec4(0.0);
+    float camera_turn = 1.0 - dot(forward.xyz, prev_forward.xyz);
+    float moved = distance(cam_pos.xyz, prev_pos.xyz);
+    float most = mix(12.0, 3.0, max(smoothstep(0.0002, 0.004, camera_turn), smoothstep(0.05, 1.0, moved)));
+    if (prev_camera.w > 0.0) {
+        // Where the surface point was on the screen, and its depth then.
+        vec3 r = X - prev_pos.xyz;
+        vec3 vs = vec3(dot(r, prev_right.xyz), dot(r, prev_up.xyz), dot(r, prev_forward.xyz));
+        vec3 ry = Y - prev_pos.xyz;
+        vec3 vy = vec3(dot(ry, prev_right.xyz), dot(ry, prev_up.xyz), dot(ry, prev_forward.xyz));
+        if (vs.z > 0.0 && vy.z > 0.0) {
+            vec2 ps = (vec2(vs.x / (vs.z * prev_camera.x), -vs.y / (vs.z * prev_camera.y)) * 0.5 + 0.5) * vec2(pc.size);
+            vec2 py = (vec2(vy.x / (vy.z * prev_camera.x), -vy.y / (vy.z * prev_camera.y)) * 0.5 + 0.5) * vec2(pc.size);
+            if (all(greaterThanEqual(ps, vec2(0.0))) && all(lessThan(ps, vec2(pc.size))) && all(greaterThanEqual(py, vec2(0.0))) && all(lessThan(py, vec2(pc.size)))) {
+                uvec4 es = odd ? refl_a[uint(ps.y) * pc.size.x + uint(ps.x)] : refl_b[uint(ps.y) * pc.size.x + uint(ps.x)];
+                uvec4 ey = odd ? refl_a[uint(py.y) * pc.size.x + uint(py.x)] : refl_b[uint(py.y) * pc.size.x + uint(py.x)];
+                float zs = uintBitsToFloat(es.z);
+                vec2 ty = unpackHalf2x16(ey.w);
+                float ty_ = ty.x;
+                bool same_surface = abs(zs - vs.z) < 0.02 * vs.z + 0.05;
+                bool same_hit = abs(min(ty_, far_) - th) < 0.15 * th + 1.0;
+                if (same_surface && same_hit && ty.y > 0.0) {
+                    hist = vec4(unpackHalf2x16(ey.x), unpackHalf2x16(ey.y));
+                    frames = ty.y;
+                    if (any(isnan(hist)) || any(isinf(hist))) {
+                        frames = 0.0;
+                    }
+                }
+            }
+        }
+    }
+    vec4 o = cur;
+    if (frames > 0.0) {
+        // Held inside what the neighbourhood shows now, a little widened.
+        vec3 pad = 0.1 * (hi - lo) + vec3(0.002);
+        vec3 y = clamp(ycocg(hist.rgb), lo - pad, hi + pad);
+        vec3 rgb = vec3(y.x + y.y - y.z, y.x + y.z, y.x - y.y - y.z);
+        hist = vec4(rgb, clamp(hist.a, alo - 0.02, ahi + 0.02));
+        frames = min(frames + 1.0, most);
+        o = mix(hist, cur, 1.0 / frames);
+    } else {
+        frames = 1.0;
+    }
+    uvec4 w = uvec4(packHalf2x16(o.rg), packHalf2x16(o.ba), floatBitsToUint(z), packHalf2x16(vec2(min(t, 60000.0), frames)));
+    if (odd) { refl_b[at] = w; } else { refl_a[at] = w; }
+}
+
+#elif defined(RT) && defined(RRESOLVE)
+
+// The reflections' history pass's result into the trace image the compose
+// reads (`-DRT -DRRESOLVE`).
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(p), pc.size))) {
+        return;
+    }
+    uint at = uint(p.y) * pc.size.x + uint(p.x);
+    uvec4 e = (frame & 1u) != 0u ? refl_b[at] : refl_a[at];
+    imageStore(trace_img, p, vec4(unpackHalf2x16(e.x), unpackHalf2x16(e.y)));
+}
+
 #elif defined(RT) && defined(GIAPPLY)
 
 // The engine's colour format, read back (the inverse of `pack` in the
@@ -1658,9 +1829,8 @@ void main() {
     if (weights < 1e-3) {
         return;
     }
-    // Brightening held to a few times the engine's own ambient, so a
-    // stray bright sample cannot wash a wall out.
-    vec3 indirect = min(sum / weights, 3.0 * engine_ambient(n) + vec3(0.3));
+    // Brightening held (GI_MOST).
+    vec3 indirect = min(sum / weights, GI_MOST * engine_ambient(n) + vec3(GI_MOST_ADD));
     uint packed = imageLoad(result_img, p).r;
     vec4 c = unpack(packed);
     float exposure_ = max(frame_block[20].y, 1e-3);
@@ -1676,8 +1846,6 @@ void main() {
 
 #elif defined(RT) && !defined(UPSAMPLE)
 
-// How much of a block's last result is kept when its pixel is where it was.
-const float HISTORY = 0.6;
 
 void main() {
     camera_from_fit();
@@ -1717,20 +1885,9 @@ void main() {
         }
     }
     uint i = uint(b.y) * hs.x + uint(b.x);
-    uvec4 last = blocks[i];
-    float last_d = abs(uintBitsToFloat(last.w));
-    // The last frame's result is kept only to steady noise: where the pixel
-    // is where it was, not on a curved mesh, and what it reflects has not
-    // changed (a moving head reflected in a still shoulder, or anything
-    // that moved, would lag behind and jump).
-    if (from != NO_PIXEL && !curved && last.z == from && abs(last_d - d) <= 0.001 * d) {
-        vec4 h = vec4(unpackHalf2x16(last.x), unpackHalf2x16(last.y));
-        vec4 diff = abs(h - r);
-        if (!any(isnan(h)) && !any(isinf(h)) && max(max(diff.r, diff.g), max(diff.b, diff.a)) < 0.08) {
-            r = mix(r, h, HISTORY);
-        }
-    }
-    blocks[i] = uvec4(packHalf2x16(r.rg), packHalf2x16(r.ba), from, floatBitsToUint(curved ? -d : d));
+    // The history is kept per pixel (RTEMPORAL); here the hit distance
+    // for its reprojection, and whether the block is on a curved mesh.
+    blocks[i] = uvec4(packHalf2x16(r.rg), packHalf2x16(r.ba), from, packHalf2x16(vec2(min(g_hit_t, 60000.0), curved ? 1.0 : 0.0)));
 }
 
 #else
@@ -1794,7 +1951,7 @@ void main() {
             // FULL_RATE_MAX pixels a frame.
             if (P.z * g_near < 24.0 && g_fit && (pc.flags & 32768u) != 0u) {
                 uvec4 own = blocks[uint(b0.y) * hs.x + uint(b0.x)];
-                bool curved = uintBitsToFloat(own.w) < 0.0 || dot(smoothed(p, P, N), N) < 0.996;
+                bool curved = unpackHalf2x16(own.w).y > 0.5 || dot(smoothed(p, P, N), N) < 0.996;
                 if (curved && atomicAdd(full_rate, 1u) < FULL_RATE_MAX) {
                     vec3 n = surface_normal(p, P, N);
                     uint view_ = (pc.flags >> 6) & 3u;

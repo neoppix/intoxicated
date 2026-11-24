@@ -344,7 +344,7 @@ What to know before turning it on:
   ones); frame times did not change at the engine's 240 fps. In Jailbreak
   (the city, its menu's camera flight) with terrain and Neon parts and the
   indirect light on, at 1667x1349: 120,000 to 260,000 triangles, 1.1 to 2.0
-  ms for the hierarchy and 1.2 to 2.4 ms for the trace at 4 by 4 blocks; the
+  ms for the hierarchy and 1.2 to 2.4 ms for the trace at 4 by 4 blocks (before the blocks were held at 2 by 2); the
   capture hooks cost the render thread about 0.5 ms a frame (0.6 us a draw).
 - It runs as compute on the shader cores because NVIDIA's FreeBSD driver
   has no hardware ray tracing: on the RTX 4070 Ti, drivers 580.142 and
@@ -375,7 +375,8 @@ Neon parts give off light: the client recognises the engine's Neon shader
 (its colour `4 * pow(colour * 1.35, 4)`, unlit) and captures those parts even
 where the engine draws them blending, so they show in reflections at their
 own brightness, in view or not, and light their surroundings in the indirect
-light below (taken at a twelfth of their drawn brightness). Terrain (grass,
+light below (taken at a quarter of their drawn brightness, falling off
+faster beyond 12 studs). Terrain (grass,
 rock, sand; not water) is captured too: its shaders pass on no colour, so it
 is grey until the screen has shown it, then in the colour the screen showed
 it in. devctl `rt view category` colours what each reflection ray hit (yellow
@@ -397,12 +398,17 @@ and put in place of the engine's own ambient light, so corners darken and
 coloured walls tint what faces them. It is computed before the reflections,
 so they show it. It takes about 160 MB more video memory when on.
 
-The reflections trace one ray per block of 2 by 2 pixels up to an output 1920
-wide (3 by 3 up to 2880, 4 by 4 above), the indirect light one per block twice
-as wide; both get coarser, by up to two steps, while the trace takes more than
-the 3 ms budget leaves after the hierarchy's build, and finer again well under
-it (`rt stats`: `blocks`, `gi_blocks`). Only at 2 by 2 do near curved pixels
-trace their own rays. `rt stats` also reports the render thread's time in the
+The reflections trace one ray per block of 2 by 2 pixels at any size
+(`INTOXICATED_RT_BLOCK=1` for one per pixel), from a different pixel of the
+block each frame; each pixel keeps a history, found where the reflected thing
+was a frame ago (its mirror image, by the hit distance), held to what the
+pixels around it show now and kept over up to 12 frames while the camera is
+still and 3 while it turns, so reflected edges come out smooth rather than in
+block steps. The indirect light traces one ray per block twice as wide, and
+coarser by up to two steps while the trace takes more than the 4.5 ms budget
+leaves after the hierarchy's build (`rt stats`: `blocks`, `gi_blocks`). Only
+at 2 by 2 with the indirect light at its finest do near curved pixels trace
+their own rays. `rt stats` also reports the render thread's time in the
 client's capture hooks (`cpu_us_frame`, `cpu_ns_draw`).
 
 devctl `rt on` and `rt off` switch it while the game runs (with

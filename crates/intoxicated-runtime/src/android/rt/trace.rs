@@ -96,6 +96,9 @@ const SPIRV_ENV: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_env.spv.rs"
 const SPIRV_GI: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_gi.spv.rs"));
 const SPIRV_GI_APPLY: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_gi_apply.spv.rs"));
 const SPIRV_GI_FILTER: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_gi_filter.spv.rs"));
+/// `ssr/ssr.comp` with `RT` and `RTEMPORAL`, and with `RT` and `RRESOLVE`.
+const SPIRV_TEMPORAL: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_temporal.spv.rs"));
+const SPIRV_RESOLVE: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_resolve.spv.rs"));
 
 const PREP: usize = 0;
 const SORT_LOCAL: usize = 1;
@@ -111,13 +114,18 @@ const ENV: usize = 10;
 const GI: usize = 11;
 const GI_APPLY: usize = 12;
 const GI_FILTER: usize = 13;
-const PIPELINES: usize = 14;
+const TEMPORAL: usize = 14;
+const RESOLVE: usize = 15;
+const PIPELINES: usize = 16;
 /// The bindings of our set: 0 the capture, 2 the sorted keys, 3 the nodes,
 /// 4 the parents, 5 the flags, 6 the globals, 7 the traced blocks, 8 the
 /// triangles to trace, 9 the cache, 10 this frame's draws, 11 its textures
 /// by serial, 12 the environment, 13 and 14 the indirect light, 15 and 16
-/// the filtered indirect light, 17 the triangles that give off light.
-const BINDINGS: [u32; 17] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+/// the filtered indirect light, 17 the triangles that give off light, 18
+/// and 19 the reflections' history.
+const BINDINGS: [u32; 19] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19];
+/// Bytes of the reflections' history a pixel (`ssr.comp` `refl_a`).
+const REFL_BYTES: u64 = 16;
 /// Bytes of the indirect light a 2 by 2 block.
 const GI_BYTES: u64 = 32;
 /// The environment: 256 by 256 directions, 16 bytes each.
@@ -252,12 +260,20 @@ const GLOBALS_SCALES: u64 = 308;
 /// Pixels may trace their own reflection ray (`ssr.comp`'s upsample) only
 /// while the blocks are their finest, 2 by 2.
 const FLAG_FULL_RATE: u32 = 1 << 15;
-/// The reflections trace on a grid at most this wide over two; wider
-/// outputs get bigger blocks.
-const TARGET_WIDTH: u32 = 1920;
+/// The reflections keep a history per pixel (`ssr.comp` RTEMPORAL), and
+/// their rays move around their blocks from frame to frame.
+const FLAG_TEMPORAL: u32 = 1 << 16;
+/// The reflections' blocks, pixels a side: `INTOXICATED_RT_BLOCK` 1 or 2
+/// (2 unless set).
+pub const BLOCK_ENV: &str = "INTOXICATED_RT_BLOCK";
+
+fn block_size() -> u32 {
+    static B: OnceLock<u32> = OnceLock::new();
+    *B.get_or_init(|| if std::env::var(BLOCK_ENV).is_ok_and(|v| v.trim() == "1") { 1 } else { 2 })
+}
 /// The GPU time the build and the trace together should stay under (ms),
 /// looked at every `BUDGET_FRAMES` frames; `MAX_COARSER` steps at most.
-const BUDGET_MS: f64 = 3.0;
+const BUDGET_MS: f64 = 4.5;
 const BUDGET_FRAMES: u32 = 120;
 const MAX_COARSER: u32 = 2;
 
@@ -480,6 +496,10 @@ struct Gpu {
     gi_filtered: [Owned; 2],
     /// This frame's triangles that give off light, by index.
     emitters: Owned,
+    /// The reflections' history, this frame's and the last one's, and the
+    /// pixels it has room for.
+    refl: [Owned; 2],
+    pixel_room: u64,
     /// The ring slot of the last trace, whose set 2 the apply pass binds.
     last_slot: usize,
     /// A zeroed stand-in for the engine's per-frame uniform block.
@@ -588,6 +608,8 @@ impl Gpu {
             self.gi_filtered[0],
             self.gi_filtered[1],
             self.emitters,
+            self.refl[0],
+            self.refl[1],
             self.no_frame_block,
             self.readback,
             self.cache_copy,
@@ -681,6 +703,8 @@ fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool, extent: [u32; 2]) -
         gi_room: 0,
         gi_filtered: [Owned::default(); 2],
         emitters: Owned::default(),
+        refl: [Owned::default(); 2],
+        pixel_room: extent[0].max(2560) as u64 * extent[1].max(1440) as u64,
         last_slot: 0,
         no_frame_block: Owned::default(),
         cache_copy: Owned::default(),
@@ -860,6 +884,10 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         make_buffer(&g.buffers, d, &types, g.gi_room / 4, usage, false)?,
     ];
     g.emitters = make_buffer(&g.buffers, d, &types, EMITTERS_BYTES, usage, false)?;
+    g.refl = [
+        make_buffer(&g.buffers, d, &types, REFL_BYTES * g.pixel_room, usage, false)?,
+        make_buffer(&g.buffers, d, &types, REFL_BYTES * g.pixel_room, usage, false)?,
+    ];
     g.no_frame_block = make_buffer(&g.buffers, d, &types, FRAME_BLOCK_BYTES, USAGE_UNIFORM | USAGE_TRANSFER_DST, false)?;
     make_textures(g, &types)?;
     g.readback = make_buffer(&g.buffers, d, &types, READBACK_BYTES, USAGE_TRANSFER_DST, true)?;
@@ -929,6 +957,8 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         SPIRV_GI,
         SPIRV_GI_APPLY,
         SPIRV_GI_FILTER,
+        SPIRV_TEMPORAL,
+        SPIRV_RESOLVE,
     ];
     for (i, code) in codes.into_iter().enumerate() {
         g.shaders[i] = shader(f, d, code)?;
@@ -945,7 +975,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
                 name: c"main".as_ptr(),
                 specialization: none,
             },
-            layout: if matches!(i, TRACE | UPSAMPLE | GATHER | ENV | GI | GI_APPLY | GI_FILTER) { g.trace_layout } else { g.build_layout },
+            layout: if matches!(i, TRACE | UPSAMPLE | GATHER | ENV | GI | GI_APPLY | GI_FILTER | TEMPORAL | RESOLVE) { g.trace_layout } else { g.build_layout },
             base_pipeline: 0,
             base_pipeline_index: -1,
         };
@@ -980,6 +1010,8 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         DescriptorBufferInfo { buffer: g.gi_filtered[0].buffer, offset: 0, range: g.gi_room / 4 },
         DescriptorBufferInfo { buffer: g.gi_filtered[1].buffer, offset: 0, range: g.gi_room / 4 },
         DescriptorBufferInfo { buffer: g.emitters.buffer, offset: 0, range: EMITTERS_BYTES },
+        DescriptorBufferInfo { buffer: g.refl[0].buffer, offset: 0, range: REFL_BYTES * g.pixel_room },
+        DescriptorBufferInfo { buffer: g.refl[1].buffer, offset: 0, range: REFL_BYTES * g.pixel_room },
     ];
     let writes: Vec<WriteDescriptorSet> = infos
         .iter()
@@ -1088,10 +1120,10 @@ pub(crate) fn record(
         check((g.buffers.map_memory)(g.device as Dev, g.cache_copy.memory, 0, SLOT_BYTES * slots() as u64, 0, &mut mapped), "vkMapMemory")?;
         g.cache_copy_ptr = mapped as usize;
     }
-    // The blocks' size: the reflections' a side by the output's width (one
-    // ray a block on a grid at most `TARGET_WIDTH` / 2 wide), the indirect
-    // light's twice that; both coarser while the GPU time stays over the
-    // budget, finer again well under it.
+    // The blocks' size: the reflections' `INTOXICATED_RT_BLOCK` pixels a
+    // side (2 unless set to 1), never coarser; the indirect light's twice
+    // that, coarser while the GPU time stays over the budget, finer again
+    // well under it.
     g.budget_frames += 1;
     if g.budget_frames >= BUDGET_FRAMES {
         g.budget_frames = 0;
@@ -1106,8 +1138,8 @@ pub(crate) fn record(
             g.coarser -= 1;
         }
     }
-    let rscale = extent[0].div_ceil(TARGET_WIDTH / 2).max(2) + g.coarser;
-    let scales = (rscale, 2 * rscale);
+    let rscale = block_size();
+    let scales = (rscale, rscale * (2 + 2 * g.coarser));
     let rescaled = g.scales != scales;
     g.scales = scales;
     st.stats.scales = scales;
@@ -1159,6 +1191,8 @@ pub(crate) fn record(
         (f.cmd_fill_buffer)(cmd, g.gi[1].buffer, 0, g.gi_room, 0);
         (f.cmd_fill_buffer)(cmd, g.gi_filtered[0].buffer, 0, g.gi_room / 4, 0);
         (f.cmd_fill_buffer)(cmd, g.gi_filtered[1].buffer, 0, g.gi_room / 4, 0);
+        (f.cmd_fill_buffer)(cmd, g.refl[0].buffer, 0, REFL_BYTES * g.pixel_room, 0);
+        (f.cmd_fill_buffer)(cmd, g.refl[1].buffer, 0, REFL_BYTES * g.pixel_room, 0);
     }
     (f.cmd_fill_buffer)(cmd, g.globals.buffer, GLOBALS_SCALES, 4, scales.0);
     (f.cmd_fill_buffer)(cmd, g.globals.buffer, GLOBALS_SCALES + 4, 4, scales.1);
@@ -1312,8 +1346,12 @@ pub(crate) fn record(
     if gi_run {
         tp.flags |= FLAG_GI;
     }
-    if scales.0 == 2 {
+    if scales.0 == 2 && g.coarser == 0 {
         tp.flags |= FLAG_FULL_RATE;
+    }
+    let temporal = extent[0] as u64 * extent[1] as u64 <= g.pixel_room;
+    if temporal {
+        tp.flags |= FLAG_TEMPORAL;
     }
     let push = |q: &super::super::ssr::Params| {
         (f.cmd_push_constants)(
@@ -1360,6 +1398,15 @@ pub(crate) fn record(
     g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
     (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[UPSAMPLE]);
     (f.cmd_dispatch)(cmd, extent[0].div_ceil(8), extent[1].div_ceil(8), 1);
+    if temporal {
+        // Each pixel's history (by the frame's parity), then that into the
+        // trace image the compose reads.
+        for pipeline in [TEMPORAL, RESOLVE] {
+            g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
+            (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[pipeline]);
+            (f.cmd_dispatch)(cmd, extent[0].div_ceil(8), extent[1].div_ceil(8), 1);
+        }
+    }
     stamp(2);
     if timed {
         g.pending[slot] = true;
