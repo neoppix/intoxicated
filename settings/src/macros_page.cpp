@@ -224,7 +224,7 @@ MacrosPage::MacrosPage(AppState *state) : m_state(state) {
     mv->setSpacing(0);
     m_master = new Switch;
     mv->addWidget(settingRow(QStringLiteral("Run macros"),
-                             QStringLiteral("Off turns every macro off at once (INTOXICATED_MACROS=0)"), m_master));
+                             QStringLiteral("Off by default; on writes INTOXICATED_MACROS=1"), m_master));
     b->addWidget(masterBox.box);
     b->addSpacing(8);
     connect(m_master, &QCheckBox::clicked, this, &MacrosPage::setMaster);
@@ -348,8 +348,8 @@ void MacrosPage::reload() {
     SettingsConf conf;
     conf.load(settingsConfPath());
     const auto macrosValue = conf.value(kMacrosSetting);
-    // On unless the line says 0: the client's own rule.
-    m_master->setChecked(!(macrosValue && (macrosValue->isEmpty() || *macrosValue == QLatin1String("0"))));
+    // Off unless the line says 1: the client's own rule.
+    m_master->setChecked(macrosValue && *macrosValue == QLatin1String("1"));
 
     const MacrosFile file = loadMacros(macrosPath(m_state->profile()));
     m_broken = !file.error.isEmpty();
@@ -588,7 +588,7 @@ void MacrosPage::setMaster(bool on) {
         return;
     QString error;
     // On is the default, so it removes the line; off writes 0.
-    if (!editSetting(kMacrosSetting, on ? std::nullopt : std::optional<QString>(QStringLiteral("0")), &error))
+    if (!editSetting(kMacrosSetting, on ? std::optional<QString>(QStringLiteral("1")) : std::nullopt, &error))
         QMessageBox::warning(this, QStringLiteral("Macros"), error);
 }
 

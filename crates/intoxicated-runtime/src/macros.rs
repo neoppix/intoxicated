@@ -4,8 +4,8 @@
 //! The macros live in `<profile>/macros.json`, written by Intoxicated Settings
 //! and readable by hand. [`load`] reads them once at startup, next to where
 //! `devctl::start` binds the dev socket, so the profile has latched by then.
-//! `INTOXICATED_MACROS=0` turns the whole feature off; any other value, or
-//! none, leaves it on.
+//! The feature is off unless `INTOXICATED_MACROS=1`: no macro fires until the
+//! user turns it on.
 //!
 //! A macro has a trigger (a physical key and the Ctrl/Shift/Alt that must be
 //! held with it) and a list of steps. The trigger is matched in [`intercept`],
@@ -255,20 +255,17 @@ fn parse_step(value: &serde_json::Value) -> Result<Step, String> {
 static MACROS: Mutex<Vec<Macro>> = Mutex::new(Vec::new());
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Whether the switch leaves the feature on: unset, or set to anything but
-/// empty or `0`.
+/// Whether the switch turns the feature on: only `1`. Unset, empty or any
+/// other value leaves it off.
 fn switch_on() -> bool {
-    match std::env::var(ENV) {
-        Ok(v) => !v.is_empty() && v != "0",
-        Err(_) => true,
-    }
+    std::env::var(ENV).is_ok_and(|v| v == "1")
 }
 
 /// Read `<profile>/macros.json` once, after the profile has latched. A read or
 /// parse problem is one line on stdout and never stops the launch.
 pub fn load() {
     if !switch_on() {
-        println!("  macros: off (INTOXICATED_MACROS={})", std::env::var(ENV).unwrap_or_default());
+        println!("  macros: off (INTOXICATED_MACROS=1 turns them on)");
         return;
     }
     let path = crate::profile::active().join("macros.json");

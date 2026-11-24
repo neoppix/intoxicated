@@ -401,8 +401,7 @@ void resetSsrKnob(SettingsConf &conf, const SsrKnob &knob);
 // In-game macros: a key press, seen on the client's own input path while the
 // Roblox window is focused, plays a recorded sequence of input back through
 // that same path. They live in <profile>/macros.json, which the client reads
-// once at launch (crate::macros). INTOXICATED_MACROS=0 turns the feature off;
-// anything else, or no line, leaves it on.
+// once at launch (crate::macros). The feature is off unless INTOXICATED_MACROS=1.
 inline const QString kMacrosSetting = QStringLiteral("INTOXICATED_MACROS");
 
 // <profile>/macros.json.

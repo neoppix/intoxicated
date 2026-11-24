@@ -18,6 +18,7 @@
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QPushButton>
+#include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -150,6 +151,14 @@ MainWindow::MainWindow(AppState *state, int startPage) : m_state(state) {
     h->addWidget(main, 1);
 
     connect(m_nav, &QListWidget::currentRowChanged, this, [this](int row) {
+        if (row < 0)
+            return;
+        if (isVisible() && row == int(pageNames().indexOf(QStringLiteral("Macros"))) && !acceptMacrosWarning()) {
+            const QSignalBlocker block(m_nav);
+            m_nav->setCurrentRow(m_lastPage);
+            return;
+        }
+        m_lastPage = row;
         m_stack->setCurrentIndex(row);
         for (int i = 0; i < m_nav->count(); ++i) {
             QFont f = m_nav->font();
@@ -171,6 +180,24 @@ MainWindow::MainWindow(AppState *state, int startPage) : m_state(state) {
 // The opening size, as a hint rather than a resize so that Qt's own
 // -geometry option still applies.
 QSize MainWindow::sizeHint() const { return {980, 680}; }
+
+bool MainWindow::acceptMacrosWarning() {
+    if (m_macrosWarned)
+        return true;
+    QMessageBox box(QMessageBox::Warning, QStringLiteral("Macros"),
+                    QStringLiteral("Macros play back recorded input in the game."),
+                    QMessageBox::NoButton, this);
+    box.setInformativeText(
+        QStringLiteral("Many games ban macros in their own rules, and Roblox's Community Standards forbid gaining "
+                       "an unfair advantage. A macro that breaks a game's rules can get you kicked or banned from "
+                       "that game. Check the rules of the game first; using macros is at your own risk."));
+    QPushButton *go = box.addButton(QStringLiteral("I understand"), QMessageBox::AcceptRole);
+    box.addButton(QStringLiteral("Go back"), QMessageBox::RejectRole);
+    box.setDefaultButton(go);
+    box.exec();
+    m_macrosWarned = box.clickedButton() == go;
+    return m_macrosWarned;
+}
 
 QWidget *MainWindow::sidebar() {
     auto *side = new QFrame;

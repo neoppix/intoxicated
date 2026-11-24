@@ -345,8 +345,8 @@ it can also be edited by hand, as a `{"intoxicated-macros": 1, "macros": [...]}`
 object whose macros carry a `name`, a `trigger` (a `key` evdev code and
 optional `ctrl`/`shift`/`alt`), optional `enabled`, `swallow` and `repeat`, and
 a `steps` array. A macro that cannot be read is skipped and the rest kept.
-`INTOXICATED_MACROS=0` turns the whole feature off; anything else, or no line,
-leaves it on. The in-game trigger and playback are not covered by the automated
+Macros are off by default: only `INTOXICATED_MACROS=1` (the page's "Run
+macros" switch) turns them on. The in-game trigger and playback are not covered by the automated
 tests (they need a running client); the file's parsing, the step model and the
 settings app's editor are.
 

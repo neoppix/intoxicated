@@ -459,6 +459,9 @@ private:
     QWidget *sidebar();
     QWidget *bottomBar();
     void fillProfiles();
+    // Asked once per run the first time the Macros page is opened from the
+    // sidebar; false sends the user back to the page they came from.
+    bool acceptMacrosWarning();
 
     AppState *m_state;
     QListWidget *m_nav;
@@ -466,6 +469,8 @@ private:
     Combo *m_profiles;
     QLabel *m_status;
     QTimer *m_statusTimer;
+    int m_lastPage = 0;
+    bool m_macrosWarned = false;
 };
 
 // `intoxicated-settings --askpass PROMPT`, for sudo -A.
