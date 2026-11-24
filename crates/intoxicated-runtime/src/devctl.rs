@@ -25,8 +25,9 @@
 //!   same words for the depth of field, the bloom, the lens effects and the
 //!   sharpening; `shaders mode <name>` sets every effect's switch and look
 //!   from a mode (off, competitive, cinematic) and `shaders` reports them.
-//!   A client built without the `shaders` feature answers all six with
-//!   `err not built: ...`.
+//!   `effects toggle|on|off|get` does what the effects hotkey does: every
+//!   effect off, or back as configured. A client built without the
+//!   `shaders` feature answers all seven with `err not built: ...`.
 //! - `bussub`, `buslast` and `deeplink` reach the engine's message bus through
 //!   `deeplink::dev_request`, which blocks this thread for at most 5 s.
 //!
@@ -389,9 +390,10 @@ fn reply(line: &str) -> String {
             None => "err depthshot <path>".into(),
         },
         // Screen-space reflections, depth of field, bloom, lens effects and
-        // sharpening: on, off, their settings and GPU cost; and the modes
-        // that set them all. See `android::ssr`.
-        verb @ ("ssr" | "dof" | "bloom" | "lens" | "sharpen" | "shaders") => {
+        // sharpening: on, off, their settings and GPU cost; the modes that
+        // set them all; and all of them off and back, as the effects hotkey
+        // does. See `android::ssr`.
+        verb @ ("ssr" | "dof" | "bloom" | "lens" | "sharpen" | "shaders" | "effects") => {
             let args: Vec<&str> = it.collect();
             match crate::android::ssr::control_verb(verb, &args) {
                 Some(Ok(state)) => format!("ok {state}"),

@@ -1017,6 +1017,49 @@ void testLensAndSharpen() {
 }
 
 // readShaderTables runs `intoxicated --shader-looks`.
+void testEffectsHotkey() {
+    const QString path = settingsConfPath();
+    const auto reloaded = [&] {
+        SettingsConf c;
+        c.load(path);
+        return c;
+    };
+    QString error;
+    writeAll(path, "INTOXICATED_SHADERS_MODE=competitive\n");
+    SettingsConf conf = reloaded();
+    check(!effectsHotkeyOn(conf), "the effects hotkey starts off");
+    setEffectsHotkeyOn(conf, true);
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path), QByteArray("INTOXICATED_SHADERS_MODE=competitive\nINTOXICATED_EFFECTS_HOTKEY=1\n"),
+         "on writes INTOXICATED_EFFECTS_HOTKEY=1 and leaves the mode line alone");
+    conf = reloaded();
+    check(effectsHotkeyOn(conf), "and reads back on");
+    setEffectsHotkeyOn(conf, false);
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path), QByteArray("INTOXICATED_SHADERS_MODE=competitive\n"), "off removes the line");
+    // Hand-written values, as the client reads them.
+    for (const char *on : {"1", "F9", "f10", "F12", " F1 "}) {
+        writeAll(path, QByteArray("INTOXICATED_EFFECTS_HOTKEY=") + on + "\n");
+        check(effectsHotkeyOn(reloaded()), QString("%1 is on").arg(on));
+    }
+    for (const char *off : {"", "0", "F11", "F13", "F0", "2", "yes", "F"}) {
+        writeAll(path, QByteArray("INTOXICATED_EFFECTS_HOTKEY=") + off + "\n");
+        check(!effectsHotkeyOn(reloaded()), QString("%1 is off").arg(off));
+    }
+    // On keeps a key name the client takes, and replaces one it does not.
+    writeAll(path, "INTOXICATED_EFFECTS_HOTKEY=F10\n");
+    conf = reloaded();
+    setEffectsHotkeyOn(conf, true);
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path), QByteArray("INTOXICATED_EFFECTS_HOTKEY=F10\n"), "on keeps F10");
+    writeAll(path, "INTOXICATED_EFFECTS_HOTKEY=F11\n");
+    conf = reloaded();
+    setEffectsHotkeyOn(conf, true);
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path), QByteArray("INTOXICATED_EFFECTS_HOTKEY=1\n"), "on replaces F11 with 1");
+    QFile::remove(path);
+}
+
 void testShaderLauncher(const QString &scratch) {
     const QString bin = scratch + "/bin2";
     QDir().mkpath(bin);
@@ -1285,6 +1328,7 @@ int runSelfTest() {
     testEffectSettings();
     testShaderModes();
     testLensAndSharpen();
+    testEffectsHotkey();
     testShaderLauncher(root);
     testMacros();
     testSeveralClients(root);

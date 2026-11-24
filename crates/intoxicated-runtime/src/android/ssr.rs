@@ -109,6 +109,19 @@
 //! the surface it hit, on an edge of it, at the end of a finite ray, near the
 //! screen edge, or on a surface seen nearly edge on.
 //!
+//! # All off and back
+//!
+//! The effects hotkey (`crate::effects_hotkey`, F9 with
+//! `INTOXICATED_EFFECTS_HOTKEY=1`) and devctl `effects toggle|on|off|get`
+//! turn every effect off at once and back as configured ([`AllOff`]): off
+//! saves each switch and clears it, so the hooks stop watching the frame and
+//! nothing of ours is recorded into it; back on puts the saved switches back,
+//! the knobs and looks never having been touched. Our objects stay made
+//! meanwhile, costing memory but no GPU time. That in game the hooks then
+//! record nothing and the effects come back as they were is INFERRED from
+//! this code and the unit tests: it was not run in a game when it was
+//! added.
+//!
 //! # Our objects
 //!
 //! Made on the render thread at the first matched frame of a device and kept
@@ -853,14 +866,189 @@ pub(crate) fn requested_at_start() -> bool {
 }
 
 /// Turn an effect on or off for the frames recorded from now on; the
-/// recording hooks watch while any is on.
+/// recording hooks watch while any is on. While everything is off by the
+/// hotkey ([`AllOff`]), this is a choice of the user's that the saved
+/// switches follow.
 fn set_on(fx: &Effect, on: bool) {
+    all_off().switch_changed(fx.index, on);
     fx.on.store(on, Relaxed);
+    watch_follows();
+}
+
+/// Watch the frame for the effects while any is on, and not at all while
+/// none is: then the hooks record nothing and call nothing of ours.
+fn watch_follows() {
     if EFFECTS.iter().any(|e| e.is_on()) {
         WATCH.fetch_or(WATCH_POST, Relaxed);
     } else {
         WATCH.fetch_and(!WATCH_POST, Relaxed);
     }
+}
+
+// ------------------------------------------------------------- all off
+
+/// A switch that goes off with the rest when everything is turned off, and
+/// comes back as it was.
+#[derive(Clone, Copy)]
+pub(crate) struct Switched {
+    pub name: &'static str,
+    pub on: &'static AtomicBool,
+}
+
+/// Switches outside [`EFFECTS`] that go off and come back with them; none
+/// yet. This is where ray tracing joins the hotkey: an RT effect that is one
+/// of [`EFFECTS`] joins it by itself, with nothing to add here; one kept
+/// apart, with a switch and a point in the frame of its own, is listed here
+/// (`Switched { name: "rt", on: &rt::ON }`) and has [`watch_follows`] watch
+/// the frame for it while its switch is on, as it does for the effects.
+pub(crate) static ALSO_SWITCHED: [Switched; 0] = [];
+
+/// Every switch the hotkey turns off: the effects' in the order of
+/// [`EFFECTS`], then [`ALSO_SWITCHED`].
+fn switched() -> Vec<Switched> {
+    EFFECTS.iter().map(|fx| Switched { name: fx.name, on: fx.on }).chain(ALSO_SWITCHED).collect()
+}
+
+/// Everything off at once, by the effects hotkey (`crate::effects_hotkey`)
+/// or devctl `effects off`, and back as it was. Off saves every switch and
+/// clears it; nothing else is touched, so every look and knob stays as it
+/// is, and back on puts the saved switches back. The environment is never
+/// read again.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct AllOff {
+    /// The switches as they were, by [`switched`]'s order; `None` while the
+    /// effects are as configured.
+    saved: Option<Vec<bool>>,
+}
+
+impl AllOff {
+    const fn new() -> Self {
+        AllOff { saved: None }
+    }
+
+    pub(crate) fn is_off(&self) -> bool {
+        self.saved.is_some()
+    }
+
+    /// Save the switches and clear them; false when they are off already.
+    pub(crate) fn turn_off(&mut self, switches: &[Switched]) -> bool {
+        if self.saved.is_some() {
+            return false;
+        }
+        self.saved = Some(switches.iter().map(|s| s.on.load(Relaxed)).collect());
+        for s in switches {
+            s.on.store(false, Relaxed);
+        }
+        true
+    }
+
+    /// Put the saved switches back; false when nothing was turned off.
+    pub(crate) fn turn_on(&mut self, switches: &[Switched]) -> bool {
+        let Some(saved) = self.saved.take() else { return false };
+        for (s, on) in switches.iter().zip(saved) {
+            s.on.store(on, Relaxed);
+        }
+        true
+    }
+
+    /// devctl switched switch `index` while everything was off. On ends the
+    /// all off with the switches as they are now, as the user has chosen
+    /// again; off is kept, so that one stays off when the rest come back.
+    pub(crate) fn switch_changed(&mut self, index: usize, on: bool) {
+        match &mut self.saved {
+            Some(_) if on => self.saved = None,
+            Some(saved) => {
+                if let Some(s) = saved.get_mut(index) {
+                    *s = false;
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// The names of the saved switches that were on.
+    fn saved_on(&self, switches: &[Switched]) -> Vec<&'static str> {
+        let saved = self.saved.as_deref().unwrap_or(&[]);
+        switches.iter().zip(saved).filter(|(_, &on)| on).map(|(s, _)| s.name).collect()
+    }
+}
+
+static ALL_OFF: Mutex<AllOff> = Mutex::new(AllOff::new());
+
+fn all_off() -> MutexGuard<'static, AllOff> {
+    ALL_OFF.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn names_or_none(names: &[&str]) -> String {
+    if names.is_empty() {
+        "none was on".into()
+    } else {
+        names.join(" ")
+    }
+}
+
+/// Everything off (`to` false), back as configured (true) or the other way
+/// from now (`None`), for the frames recorded from now on; the log line
+/// that says what happened, `by` naming the key or `devctl`.
+fn switch_all(to: Option<bool>, by: &str) -> String {
+    requested_at_start();
+    let switches = switched();
+    let mut all = all_off();
+    let off = to.map_or(!all.is_off(), |on| !on);
+    let line = if off {
+        if all.turn_off(&switches) {
+            format!("all off ({by}); back on with it: {}", names_or_none(&all.saved_on(&switches)))
+        } else {
+            format!("all off already ({by})")
+        }
+    } else {
+        let was_on = all.saved_on(&switches);
+        if all.turn_on(&switches) {
+            format!("back as configured ({by}): {}", names_or_none(&was_on))
+        } else {
+            format!("as configured already ({by})")
+        }
+    };
+    drop(all);
+    watch_follows();
+    format!("[android] vulkan: effects: {line}")
+}
+
+/// The effects hotkey was pressed (`crate::effects_hotkey`): everything off,
+/// or back as configured. One line in the log.
+pub(crate) fn toggle_all(by: &str) {
+    println!("{}", switch_all(None, by));
+}
+
+pub(crate) const EFFECTS_USAGE: &str = "effects [get]|toggle|on|off; off turns every effect off, on puts them back";
+
+/// devctl `effects toggle|on|off|get`: what the hotkey does, without a key.
+/// The answer is the state after the command.
+fn effects_control(args: &[&str]) -> Result<String, String> {
+    let to = match args {
+        [] | ["get"] => None,
+        ["toggle"] => Some(None),
+        ["on"] => Some(Some(true)),
+        ["off"] => Some(Some(false)),
+        _ => return Err(EFFECTS_USAGE.into()),
+    };
+    if let Some(to) = to {
+        println!("{}", switch_all(to, "devctl"));
+    }
+    requested_at_start();
+    let switches = switched();
+    let all = all_off();
+    let now: Vec<String> = switches.iter().map(|s| format!("{}={}", s.name, u8::from(s.on.load(Relaxed)))).collect();
+    let mut answer = format!(
+        "effects={} hotkey={} {}",
+        if all.is_off() { "off" } else { "configured" },
+        crate::effects_hotkey::active_key().unwrap_or_else(|| "off".into()),
+        now.join(" ")
+    );
+    if all.is_off() {
+        answer += &format!("; back on: {}", names_or_none(&all.saved_on(&switches)));
+    }
+    Ok(answer)
 }
 
 // ------------------------------------------------------------- devctl
@@ -875,11 +1063,14 @@ pub fn control(args: &[&str]) -> Result<String, String> {
     SSR.control(args)
 }
 
-/// devctl `ssr ...`, `dof ...`, `bloom ...`, `lens ...`, `sharpen ...` or
-/// `shaders ...`; `None` for another verb.
+/// devctl `ssr ...`, `dof ...`, `bloom ...`, `lens ...`, `sharpen ...`,
+/// `shaders ...` or `effects ...`; `None` for another verb.
 pub fn control_verb(verb: &str, args: &[&str]) -> Option<Result<String, String>> {
     if verb == "shaders" {
         return Some(shaders_control(args));
+    }
+    if verb == "effects" {
+        return Some(effects_control(args));
     }
     effect(verb).map(|fx| fx.control(args))
 }
@@ -3647,5 +3838,115 @@ mod tests {
             assert!(shaders.iter().any(|(_, s, d)| *s == stem && d == &[format!("-D{variant}").as_str()]), "{stem} is listed");
             assert_eq!(*built, &words(&std::fs::read_to_string(android.join(format!("{stem}.spv.rs"))).unwrap())[..]);
         }
+    }
+
+    // The all off of the effects hotkey, on switches and an effect of the
+    // test's own, so the client's are never touched.
+
+    static T_ON: [AtomicBool; 3] = [const { AtomicBool::new(false) }; 3];
+
+    fn test_switches() -> Vec<Switched> {
+        ["a", "b", "c"].iter().zip(&T_ON).map(|(&name, on)| Switched { name, on }).collect()
+    }
+
+    fn now(switches: &[Switched]) -> Vec<bool> {
+        switches.iter().map(|s| s.on.load(Relaxed)).collect()
+    }
+
+    #[test]
+    fn all_off_clears_every_switch_and_puts_back_exactly_the_saved_ones() {
+        let sw = test_switches();
+        for (s, on) in sw.iter().zip([true, false, true]) {
+            s.on.store(on, Relaxed);
+        }
+        let mut all = AllOff::new();
+        assert!(!all.is_off());
+        assert!(!all.turn_on(&sw), "nothing to put back yet");
+        assert!(all.turn_off(&sw));
+        assert!(all.is_off());
+        assert_eq!(now(&sw), [false, false, false]);
+        assert_eq!(all.saved_on(&sw), ["a", "c"]);
+        // A second off keeps what was saved the first time.
+        assert!(!all.turn_off(&sw));
+        assert_eq!(all.saved_on(&sw), ["a", "c"]);
+        assert!(all.turn_on(&sw));
+        assert!(!all.is_off());
+        assert_eq!(now(&sw), [true, false, true]);
+        // And again, the same.
+        assert!(all.turn_off(&sw) && all.turn_on(&sw));
+        assert_eq!(now(&sw), [true, false, true]);
+    }
+
+    #[test]
+    fn a_switch_changed_while_all_off_is_followed() {
+        let sw = test_switches();
+        let mut all = AllOff::new();
+        for s in &sw {
+            s.on.store(true, Relaxed);
+        }
+        all.turn_off(&sw);
+        // devctl turns b off: it stays off when the rest come back.
+        all.switch_changed(1, false);
+        assert_eq!(all.saved_on(&sw), ["a", "c"]);
+        all.turn_on(&sw);
+        assert_eq!(now(&sw), [true, false, true]);
+        // devctl turns one on while all are off: that ends the all off, with
+        // the switches as they are.
+        all.turn_off(&sw);
+        all.switch_changed(2, true);
+        assert!(!all.is_off());
+        assert!(!all.turn_on(&sw));
+        assert_eq!(now(&sw), [false, false, false]);
+        // Out of range or with nothing off, nothing happens.
+        all.switch_changed(9, false);
+        assert_eq!(all, AllOff::new());
+    }
+
+    static T_FX_ON: AtomicBool = AtomicBool::new(false);
+    static T_FX_VALUES: [AtomicU32; SLOTS] = [const { AtomicU32::new(0) }; SLOTS];
+    /// The reflections' knobs and looks, with values and a switch of its own.
+    static T_FX: Effect = Effect {
+        name: "test",
+        title: "Test",
+        summary: "",
+        index: 0,
+        env: "INTOXICATED_TEST_EFFECT",
+        look_env: "INTOXICATED_TEST_EFFECT_LOOK",
+        knobs: &KNOBS,
+        looks: &LOOKS,
+        not_a_look: &NOT_A_LOOK,
+        values: &T_FX_VALUES,
+        on: &T_FX_ON,
+        usage: USAGE,
+    };
+
+    #[test]
+    fn back_on_an_effect_has_the_look_it_had() {
+        let fx = &T_FX;
+        let look = fx.start_values("clean_mirror").expect("a look");
+        for (k, v) in fx.knobs.iter().zip(&look) {
+            fx.set(k, *v);
+        }
+        let intensity = fx.find("intensity").unwrap();
+        fx.set(intensity, [0.77; 3]);
+        fx.on.store(true, Relaxed);
+        let before = fx.current();
+        let sw = [Switched { name: fx.name, on: fx.on }];
+        let mut all = AllOff::new();
+        all.turn_off(&sw);
+        assert!(!fx.is_on());
+        assert_eq!(fx.current(), before, "off leaves the knobs alone");
+        all.turn_on(&sw);
+        assert!(fx.is_on());
+        assert_eq!(fx.current(), before);
+        assert_eq!(fx.get(intensity)[0], 0.77);
+    }
+
+    #[test]
+    fn every_effect_is_switched_and_the_verb_is_known() {
+        let names: Vec<&str> = switched().iter().map(|s| s.name).collect();
+        assert_eq!(names, ["ssr", "dof", "bloom", "lens", "sharpen"]);
+        assert_eq!(control_verb("effects", &["sideways"]), Some(Err(EFFECTS_USAGE.to_string())));
+        assert_eq!(names_or_none(&[]), "none was on");
     }
 }

@@ -6,7 +6,8 @@
 //! the sharpening is built, nor their SPIR-V. Their switches
 //! (`INTOXICATED_SSR`, `_DOF`, `_BLOOM`, `_LENS`, `_SHARPEN` and
 //! `_SHADERS_MODE`) are ignored, said once in the log when one asks for
-//! something; their devctl verbs answer "not built"; `--print-shader-looks`
+//! something, and so is the effects hotkey (`INTOXICATED_EFFECTS_HOTKEY`),
+//! whose key then goes to Roblox; their devctl verbs answer "not built"; `--print-shader-looks`
 //! and `--print-ssr-looks` print [`UNAVAILABLE_JSON`], which Intoxicated
 //! Settings reads to leave the Shaders page out. The pass hooks never watch
 //! for the effects (`WATCH_POST` is never set), so the calls the layer makes
@@ -75,13 +76,18 @@ pub fn shader_looks_json() -> String {
     UNAVAILABLE_JSON.into()
 }
 
-/// devctl `ssr`, `dof`, `bloom`, `lens`, `sharpen` and `shaders`: not built.
+/// devctl `ssr`, `dof`, `bloom`, `lens`, `sharpen`, `shaders` and `effects`:
+/// not built.
 pub fn control_verb(verb: &str, _args: &[&str]) -> Option<Result<String, String>> {
-    matches!(verb, "ssr" | "dof" | "bloom" | "lens" | "sharpen" | "shaders")
+    matches!(verb, "ssr" | "dof" | "bloom" | "lens" | "sharpen" | "shaders" | "effects")
         .then(|| Err(format!("not built: this client was built without visual effects; {HOW_TO_ADD}")))
 }
 
 // The layer's calls, never reached (see the module comment).
+
+/// The effects hotkey's toggle: never reached, as `effects_hotkey::load`
+/// leaves the hotkey off when [`AVAILABLE`] is false.
+pub(crate) fn toggle_all(_by: &str) {}
 
 pub(crate) fn pass_begun(_pass: &Pass) {}
 pub(crate) fn resolved(_cmd: *mut c_void, _src: u64, _dst: u64, _dst_layout: u32) {}
@@ -120,7 +126,7 @@ mod tests {
 
     #[test]
     fn the_verbs_answer_not_built_and_others_are_not_theirs() {
-        for verb in ["ssr", "dof", "bloom", "lens", "sharpen", "shaders"] {
+        for verb in ["ssr", "dof", "bloom", "lens", "sharpen", "shaders", "effects"] {
             let answer = control_verb(verb, &["on"]).expect("an effect verb");
             assert!(answer.unwrap_err().starts_with("not built: "), "{verb}");
         }

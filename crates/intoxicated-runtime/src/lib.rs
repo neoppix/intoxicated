@@ -24,6 +24,7 @@ pub mod cookie_jar;
 pub mod deeplink;
 pub mod desktop;
 pub mod devctl;
+pub mod effects_hotkey;
 pub mod engine;
 pub mod engine_log;
 pub mod flag_file;

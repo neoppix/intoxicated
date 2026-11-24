@@ -1143,6 +1143,8 @@ impl HostWindow {
         // An F11 whose release went to another window must not swallow the
         // next press.
         self.f11_held.store(false, Ordering::Release);
+        // The same for the effects hotkey.
+        crate::effects_hotkey::focus_changed();
         if focus_in {
             self.focused.store(1, Ordering::Release);
         } else {

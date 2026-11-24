@@ -1698,6 +1698,12 @@ pub fn host_key(handle: i64, key: &HostKey) {
     if crate::macros::intercept(key.down, key.x_keycode, key.state, focused) {
         return;
     }
+    // The effects hotkey (`INTOXICATED_EFFECTS_HOTKEY`), after the macros so
+    // theirs is unchanged: its press toggles the visual effects, and it is
+    // kept from the engine, repeats and release included.
+    if crate::effects_hotkey::intercept(key.down, key.x_keycode, key.state, focused) {
+        return;
+    }
     with_core(Some(handle), |c| c.host_key(key, focused));
 }
 

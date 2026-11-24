@@ -1399,6 +1399,28 @@ void setEffectOn(const QString &switchEnv, SettingsConf &conf, bool on) {
         conf.remove(switchEnv);
 }
 
+bool effectsHotkeyOn(const SettingsConf &conf) {
+    const auto v = conf.value(kEffectsHotkeySetting);
+    if (!v)
+        return false;
+    const QString value = v->trimmed();
+    if (value == QLatin1String("1"))
+        return true;
+    // F1 to F12 as the client reads them, but F11, the window's fullscreen key.
+    if (value.size() < 2 || value[0].toUpper() != QLatin1Char('F'))
+        return false;
+    bool number = false;
+    const int n = value.mid(1).toInt(&number);
+    return number && n >= 1 && n <= 12 && n != 11;
+}
+
+void setEffectsHotkeyOn(SettingsConf &conf, bool on) {
+    if (!on)
+        conf.remove(kEffectsHotkeySetting);
+    else if (!effectsHotkeyOn(conf))
+        conf.set(kEffectsHotkeySetting, QStringLiteral("1"));
+}
+
 bool ssrOn(const SettingsConf &conf) { return effectOn(kSsrSetting, conf); }
 
 void setSsrOn(SettingsConf &conf, bool on) { setEffectOn(kSsrSetting, conf, on); }

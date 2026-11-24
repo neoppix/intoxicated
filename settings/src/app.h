@@ -213,9 +213,10 @@ private:
 // reflections, depth of field, bloom, lens and sharpen. At the top the
 // whole-page modes (Off, Competitive, Cinematic, and Custom when the effects
 // were changed by hand), then one group per effect with its switch, its
-// looks and a fine-tune row per knob. Each control writes settings.conf as it
-// changes. A client built without the visual effects gets a short page
-// saying how to add them instead.
+// looks and a fine-tune row per knob, and between them the switch for the
+// in-game F9 hotkey that turns them all off and back on. Each control writes
+// settings.conf as it changes. A client built without the visual effects
+// gets a short page saying how to add them instead.
 class ShadersPage : public QWidget {
     Q_OBJECT
 public:
@@ -274,6 +275,8 @@ private:
     // One per mode, then Custom.
     QList<QPushButton *> m_modeButtons;
     QLabel *m_modeDesc = nullptr;
+    // The effects hotkey (INTOXICATED_EFFECTS_HOTKEY).
+    Switch *m_hotkey = nullptr;
     QLabel *m_tableError;
     bool m_filling = false;
     // The client was built without the effects: the page only says how to

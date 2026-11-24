@@ -1,7 +1,8 @@
 // Intoxicated Settings: the Shaders page. The effects the client draws into
 // the game before the HUD (screen-space reflections, depth of field, bloom,
-// lens, sharpen): at the top the whole-page modes, then one group each: the
-// switch, the named looks and a fine-tune row per knob, each written to
+// lens, sharpen): at the top the whole-page modes and the switch for the F9
+// hotkey that turns them all off and back on in game, then one group each:
+// the switch, the named looks and a fine-tune row per knob, each written to
 // settings.conf as it changes. The effects, their knobs, their looks and the
 // modes come from `intoxicated --shader-looks`, so nothing here keeps a copy
 // of their values.
@@ -224,6 +225,37 @@ ShadersPage::ShadersPage(AppState *state) : m_state(state) {
         v->addWidget(m_modeDesc);
         b->addWidget(s.box);
         b->addSpacing(8);
+    }
+    {
+        // The effects hotkey: its own line, not an effect's, so a mode line
+        // is left as it is when it is written.
+        Section s = section(QStringLiteral("In game"));
+        auto *v = new QVBoxLayout(s.body);
+        v->setContentsMargins(0, 0, 0, 0);
+        v->setSpacing(0);
+        m_hotkey = new Switch;
+        m_hotkey->setToolTip(kEffectsHotkeySetting);
+        v->addWidget(settingRow(QStringLiteral("F9 turns all effects on and off in game"),
+                                QStringLiteral("While this is on, F9 no longer opens Roblox's developer console. "
+                                               "Typing in chat is not affected. Off by default; on writes "
+                                               "INTOXICATED_EFFECTS_HOTKEY=1."),
+                                m_hotkey));
+        b->addWidget(s.box);
+        b->addSpacing(8);
+        connect(m_hotkey, &QCheckBox::clicked, this, [this](bool on) {
+            if (m_filling)
+                return;
+            SettingsConf conf;
+            QString error;
+            bool ok = conf.load(settingsConfPath(), &error);
+            if (ok) {
+                setEffectsHotkeyOn(conf, on);
+                ok = conf.save(&error);
+            }
+            if (!ok)
+                QMessageBox::warning(this, QStringLiteral("Shaders"), error);
+            reload();
+        });
     }
     for (int i = 0; i < m_effects.size(); ++i)
         buildEffect(b, i);
@@ -457,6 +489,8 @@ void ShadersPage::reload() {
     expandShaderMode(tables, m_modes, conf);
     for (EffectUi &fx : m_effects)
         reloadEffect(conf, fx);
+    if (m_hotkey)
+        m_hotkey->setChecked(effectsHotkeyOn(conf));
     if (!m_modeButtons.isEmpty()) {
         const QString current = currentShaderMode(tables, m_modes, conf);
         for (int i = 0; i < m_modeButtons.size(); ++i)
