@@ -58,6 +58,8 @@ PlayPage::PlayPage(AppState *state) : m_state(state) {
     jv->addWidget(hint);
     b->addWidget(joinBox.box);
     b->addSpacing(8);
+    b->addWidget(new SeveralClients(state));
+    b->addSpacing(8);
     connect(join, &QPushButton::clicked, this, &PlayPage::join);
     connect(m_link, &QLineEdit::returnPressed, this, &PlayPage::join);
 

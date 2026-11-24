@@ -146,7 +146,10 @@ intoxicated --ssr-looks  # print the reflections' settings and looks (JSON)
 intoxicated --shader-looks  # the same for every effect, and the modes
                             # ({"available": false} when built without them)
 intoxicated --version    # print the client's version line
-INTOXICATED_PROFILE=alt intoxicated   # run another profile (see below)
+intoxicated --help       # print the launcher's usage
+intoxicated --profile alt [<placeId> | '<link>']
+                         # run another profile (see below)
+INTOXICATED_PROFILE=alt intoxicated   # the same, from the environment
 ```
 
 To update Intoxicated itself, run `intoxicated --update` (the installer, from
@@ -198,10 +201,14 @@ certificate**, so a tampered download is caught rather than trusted. It keeps it
 in `~/.cache/intoxicated/apk` and fetches it again if that is ever cleared.
 
 Your sign-in, settings and Roblox's own storage live in the profile,
-`~/.local/share/intoxicated/profiles/default`. `INTOXICATED_PROFILE=<name>`
-(1 to 32 letters, digits, `-` and `_`) runs another one, in
-`profiles/<name>`, with its own account, storage and `flags.json`; one client
-runs per profile, so two profiles can play at the same time.
+`~/.local/share/intoxicated/profiles/default`. `intoxicated --profile <name>`
+or `INTOXICATED_PROFILE=<name>` (1 to 32 letters, digits, `-` and `_`; the
+switch wins over the variable, which wins over settings.conf) runs another
+one, in `profiles/<name>`, with its own account, storage and `flags.json`;
+one client runs per profile, so two profiles can play at the same time (see
+[Several clients at once](#several-clients-at-once)). A second client on a
+profile that is already open is refused with exit status 3, and the launcher
+says which profile it was.
 
 The launcher also reads `~/.config/intoxicated/settings.conf`
 (`$XDG_CONFIG_HOME`): one `INTOXICATED_*=value` line per switch, exported
@@ -432,7 +439,9 @@ add them (`intoxicated --update --effects`). Macros:
 the profile's in-game macros, a list on the left and the selected one's trigger
 key, Ctrl/Shift/Alt, and steps on the right, with a master switch for the lot;
 see [Macros](#macros) below. Profiles: create, delete and pick the default one. And Play, a place id or
-link field, and the two update commands. It is a Qt 6 Widgets program in
+link field, Run several and Running (see
+[Several clients at once](#several-clients-at-once)), and the two update
+commands. It is a Qt 6 Widgets program in
 `settings/` that needs `qt6-base` and nothing else.
 
 The installer asks whether to install it (the answer defaults to yes) while it
@@ -476,6 +485,68 @@ and moderate them themselves. Whether a macro is allowed depends on the game
 you use it in; check its rules first. A macro that breaks a game's rules can
 get you kicked or banned from that game, and that is on you, not on
 Intoxicated.
+
+## Several clients at once
+
+**Roblox does not officially support running several clients at once, and a
+Byfron developer has said that running multiple clients may be treated as
+malicious. Use alt accounts, and do it at your own risk.** Intoxicated does
+nothing to get around anything of Roblox's: it has no single-instance check
+to defeat. Each client is simply its own process on its own profile.
+
+Every profile is its own Roblox account and storage, and one client runs per
+profile, so starting several means one launch per profile:
+
+```sh
+intoxicated &                         # default
+intoxicated --profile alt &           # a second account, in its own window
+intoxicated --profile farm_2 189707 & # a third, straight into a game
+```
+
+A profile that is not signed in opens at the Roblox login screen in its own
+window. The window title names the profile when it is not `default`
+(`Intoxicated <version> (<commit>) [alt]`); `WM_CLASS` is `intoxicated`,
+`Intoxicated` for all of them, so window rules still match every one.
+
+In Intoxicated Settings, the Play page has **Run several**: a switch per
+profile, with whether it is signed in and whether it is running now, and
+**Play selected**, which starts one launcher per checked profile (with
+`INTOXICATED_PROFILE` set), a second and a half apart. The first time in a
+run of the app that this would leave more than one client running, it shows
+the warning above with Continue and Cancel. **Running** lists the clients
+running now, read from the profiles' locks every two seconds, each with a
+**Stop** button. While a client holds its profile it writes its process id to
+`<profile>/client.pid` and removes it when it exits; Stop sends that process
+SIGTERM, which closes it the way Ctrl-C does, and only while that process
+holds the profile's lock open, so a file left by a crash or a process id
+used again since is never signalled. Nothing is ever stopped by name.
+
+What clients on different profiles share, and how it is kept safe:
+
+- The Roblox build in `~/.cache/intoxicated/apk` is only read. When there is
+  none yet, the first launch downloads it and the others wait for that
+  download instead of failing.
+- `~/.cache/intoxicated/clientsettings.json` and
+  `~/.cache/intoxicated/syscall-sites/` are written through a temporary file
+  of each writer's own and a rename, so two clients refreshing them together
+  leave one whole file. The asset folder (`~/.cache/intoxicated/assets`) is
+  written the same way, and the font links in `~/.cache/intoxicated/system`
+  are replaced by a rename, so a running client never finds one missing
+  while the next client starts.
+- settings.conf is only read by the launcher, and every client reads the
+  same options from it. The devctl socket, macros, logs, the run directory
+  and Roblox's own storage are all in the profile. A devctl socket path
+  shared through `INTOXICATED_DEV_CONTROL_SOCKET` is not taken from a client
+  still listening on it; the second client goes without devctl and says so.
+- Each client owns the X11 `CLIPBOARD` only while its last copy is the
+  newest, as any X program does.
+- Sound: every client opens `/dev/dsp` itself, and sound(4)'s virtual
+  channels mix them. With `dev.pcm.N.play.vchans=1`, the default, three
+  opens of the same device at once all succeed; a device with vchans off
+  needs them turned on for a second client to play.
+- Intoxicated Settings sees whether a profile is in use by taking its lock
+  for an instant; a client starting just then waits up to 0.3 s for it
+  rather than refusing.
 
 ## Status: playable
 

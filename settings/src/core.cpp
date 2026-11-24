@@ -19,12 +19,19 @@
 #include <QStandardPaths>
 
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/file.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/user.h>
+#include <libutil.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <climits>
+#include <cstdlib>
+#include <cstring>
 
 namespace intox {
 
@@ -610,7 +617,120 @@ bool profileInUse(const QString &dir) {
 }
 
 bool profileSignedIn(const QString &dir) {
-    return QFileInfo::exists(dir + QStringLiteral("/cookies"));
+    // The client keeps the engine's cookies before anyone signs in, so the
+    // jar alone is not a session; identity is written on sign-in and erased
+    // on sign-out.
+    return QFileInfo::exists(dir + QStringLiteral("/cookies")) && QFileInfo::exists(dir + QStringLiteral("/identity"));
+}
+
+bool processHasOpen(qint64 pid, const QString &file) {
+    if (pid <= 0 || pid > INT_MAX)
+        return false;
+    struct stat st;
+    if (::stat(QFile::encodeName(file).constData(), &st) != 0)
+        return false;
+    int count = 0;
+    // Another user's process, or one that is gone, gives nothing.
+    struct kinfo_file *files = ::kinfo_getfile(pid_t(pid), &count);
+    if (!files)
+        return false;
+    bool found = false;
+    for (int i = 0; i < count && !found; ++i) {
+        const struct kinfo_file &f = files[i];
+        found = f.kf_type == KF_TYPE_VNODE && f.kf_un.kf_file.kf_file_fsid == uint64_t(st.st_dev) &&
+                f.kf_un.kf_file.kf_file_fileid == uint64_t(st.st_ino);
+    }
+    std::free(files);
+    return found;
+}
+
+std::optional<qint64> clientPid(const QString &dir) {
+    QFile file(dir + QLatin1Char('/') + kClientPidFile);
+    if (!file.open(QIODevice::ReadOnly))
+        return std::nullopt;
+    const QByteArray text = file.read(32).trimmed();
+    bool ok = false;
+    const qint64 pid = text.toLongLong(&ok);
+    if (!ok || pid <= 1)
+        return std::nullopt;
+    // Only while that very process holds the profile's lock file open: a file
+    // a crashed client left, or a pid used again since, names nothing.
+    if (!processHasOpen(pid, dir + QStringLiteral("/.lock")))
+        return std::nullopt;
+    return pid;
+}
+
+QList<RunningClient> runningClients() {
+    SettingsConf conf;
+    conf.load(settingsConfPath());
+    QList<RunningClient> out;
+    for (const ProfileInfo &p : listProfiles(defaultProfileName(conf))) {
+        if (!p.inUse)
+            continue;
+        RunningClient c;
+        c.profile = p.name;
+        c.pid = clientPid(profileDir(p.name)).value_or(-1);
+        out.append(c);
+    }
+    return out;
+}
+
+LaunchCommand launchCommand(const QString &profile, const QString &link) {
+    LaunchCommand c;
+    c.program = launcherPath();
+    if (!link.isEmpty())
+        c.arguments.append(link);
+    c.environment = QProcessEnvironment::systemEnvironment();
+    c.environment.insert(QStringLiteral("INTOXICATED_PROFILE"), profile);
+    return c;
+}
+
+bool startClient(const QString &profile, const QString &link, QString *error) {
+    if (!isValidProfileName(profile)) {
+        *error = QStringLiteral("%1 is not a profile name.").arg(profile);
+        return false;
+    }
+    if (profileInUse(profileDir(profile))) {
+        *error = QStringLiteral("Profile %1 is already open in a client.").arg(profile);
+        return false;
+    }
+    const LaunchCommand c = launchCommand(profile, link);
+    if (!QFileInfo(c.program).isExecutable()) {
+        *error = QStringLiteral("intoxicated was not found on PATH or in /usr/local/bin.");
+        return false;
+    }
+    QProcess process;
+    process.setProgram(c.program);
+    process.setArguments(c.arguments);
+    process.setProcessEnvironment(c.environment);
+    process.setWorkingDirectory(QDir::homePath());
+    process.setStandardInputFile(QProcess::nullDevice());
+    if (!process.startDetached()) {
+        *error = QStringLiteral("%1 could not be started: %2").arg(c.program, process.errorString());
+        return false;
+    }
+    return true;
+}
+
+bool stopClient(const QString &profile, QString *error) {
+    if (!isValidProfileName(profile)) {
+        *error = QStringLiteral("%1 is not a profile name.").arg(profile);
+        return false;
+    }
+    const std::optional<qint64> pid = clientPid(profileDir(profile));
+    if (!pid) {
+        *error = profileInUse(profileDir(profile))
+                     ? QStringLiteral("The client on %1 has not said which process it is; close its window instead.")
+                           .arg(profile)
+                     : QStringLiteral("No client runs on profile %1.").arg(profile);
+        return false;
+    }
+    // SIGTERM: the client leaves through its normal teardown, as on Ctrl-C.
+    if (::kill(pid_t(*pid), SIGTERM) != 0) {
+        *error = QStringLiteral("Process %1 could not be stopped: %2").arg(*pid).arg(QString::fromLocal8Bit(std::strerror(errno)));
+        return false;
+    }
+    return true;
 }
 
 QList<ProfileInfo> listProfiles(const QString &extra) {

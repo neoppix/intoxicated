@@ -5,8 +5,12 @@
 
 #include "core.h"
 
+#include <QCoreApplication>
 #include <QDebug>
 #include <QDir>
+#include <QElapsedTimer>
+#include <QProcess>
+#include <QThread>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -442,7 +446,9 @@ void testProfiles() {
 
     check(!profileSignedIn(alt), "not signed in without cookies");
     writeAll(alt + "/cookies", "secret");
-    check(profileSignedIn(alt), "signed in with a cookies file");
+    check(!profileSignedIn(alt), "not signed in with cookies alone (a fresh profile has them too)");
+    writeAll(alt + "/identity", "someone");
+    check(profileSignedIn(alt), "signed in with cookies and an identity");
 
     // A client's lock, held by another open file description.
     const QByteArray lockPath = QFile::encodeName(alt + "/.lock");
@@ -1136,7 +1142,115 @@ void testMacros() {
     QDir(profileDir("default")).removeRecursively();
 }
 
+// Wait up to MS for CONDITION, checking every 50 ms.
+bool waitFor(const std::function<bool()> &condition, int ms) {
+    QElapsedTimer t;
+    t.start();
+    while (!condition()) {
+        if (t.elapsed() > ms)
+            return false;
+        QThread::msleep(50);
+    }
+    return true;
+}
+
+void testSeveralClients(const QString &scratch) {
+    QString error;
+    QDir(profilesRoot()).removeRecursively();
+    check(createProfile("one", &error) && createProfile("two", &error), "two profiles: " + error);
+    const QString one = profileDir("one");
+    const QString two = profileDir("two");
+    const qint64 me = QCoreApplication::applicationPid();
+
+    // client.pid alone names nothing: not without the lock held by that process.
+    check(!clientPid(one), "no pid file, no client");
+    check(runningClients().isEmpty(), "nothing runs");
+    writeAll(one + "/client.pid", QByteArray::number(me) + "\n");
+    check(!clientPid(one), "a pid file whose process does not hold the lock names nothing");
+    writeAll(one + "/client.pid", "not a pid\n");
+    check(!clientPid(one), "a pid file that is not a number names nothing");
+
+    // This process as the client: the lock held, and the pid published.
+    writeAll(one + "/client.pid", QByteArray::number(me) + "\n");
+    const QByteArray lockPath = QFile::encodeName(one + "/.lock");
+    const int fd = ::open(lockPath.constData(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    check(fd >= 0 && ::flock(fd, LOCK_EX | LOCK_NB) == 0, "the test holds one's lock");
+    check(processHasOpen(me, one + "/.lock"), "this process has the lock file open");
+    check(!processHasOpen(me, two + "/flags.json"), "and not a file it never opened");
+    same(clientPid(one).value_or(-1), me, "the pid file names the lock's holder");
+    QList<RunningClient> running = runningClients();
+    check(running.size() == 1 && running[0].profile == "one" && running[0].pid == me,
+          "one is listed as running, with its process");
+    QString why;
+    check(!startClient("one", QString(), &why) && why.contains("already open"),
+          "a profile in use is not started again: " + why);
+    ::close(fd);
+    check(!clientPid(one) && runningClients().isEmpty(), "a released lock is no longer running");
+    QFile::remove(one + "/client.pid");
+
+    // Another process as the client: this program run as a stand-in that
+    // holds two's lock and publishes its pid as the client does. Stop must
+    // end exactly that process.
+    QProcess holder;
+    holder.setProgram(QCoreApplication::applicationFilePath());
+    holder.setArguments({"--self-test-client", two});
+    holder.start();
+    check(holder.waitForStarted(5000), "the stand-in client starts");
+    check(waitFor([&] { return clientPid(two).has_value(); }, 5000), "the other process is found as two's client");
+    const qint64 child = clientPid(two).value_or(-1);
+    same(child, holder.processId(), "by the pid it wrote");
+    running = runningClients();
+    check(running.size() == 1 && running[0].profile == "two" && running[0].pid == child, "two is listed as running");
+    check(stopClient("two", &why), "stop two: " + why);
+    check(holder.waitForFinished(5000), "stopping the client ends it");
+    check(holder.exitStatus() == QProcess::CrashExit, "by SIGTERM");
+    check(!profileInUse(two), "two's lock is free again");
+    check(QFileInfo::exists(two + "/client.pid") && !clientPid(two),
+          "the pid file the fake left behind names nothing");
+    check(!stopClient("two", &why) && why.startsWith("No client runs"), "stopping it again is refused: " + why);
+    check(!stopClient("../x", &why), "a path is not a profile to stop");
+
+    // The launch command, per profile, through a fake launcher.
+    const QString bin = scratch + "/bin";
+    QDir().mkpath(bin);
+    const QString launcher = bin + "/intoxicated";
+    const QString record = scratch + "/launched";
+    QDir().mkpath(record);
+    writeAll(launcher, "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$INTOXICATED_PROFILE\" \"$#\" \"$*\" > '" +
+                           QFile::encodeName(record) + "/'\"$INTOXICATED_PROFILE\"\n");
+    QFile::setPermissions(launcher, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+    const QByteArray savedPath = qgetenv("PATH");
+    qputenv("PATH", QFile::encodeName(bin) + ":" + savedPath);
+    const LaunchCommand c = launchCommand("two", "189707");
+    same(c.program, launcher, "the launcher on PATH is run");
+    same(c.arguments, QStringList({"189707"}), "with the link as its one argument");
+    same(c.environment.value("INTOXICATED_PROFILE"), QString("two"), "and INTOXICATED_PROFILE set");
+    same(launchCommand("one", QString()).arguments, QStringList(), "no link, no argument");
+    check(startClient("one", QString(), &why), "start one: " + why);
+    check(startClient("two", "189707", &why), "start two: " + why);
+    check(waitFor([&] { return QFileInfo::exists(record + "/one") && QFileInfo::exists(record + "/two"); }, 5000),
+          "both launchers ran");
+    same(readAll(record + "/one"), QByteArray("one|0|\n"), "one's launcher got its profile and no argument");
+    same(readAll(record + "/two"), QByteArray("two|1|189707\n"), "two's launcher got its profile and the link");
+    check(!startClient("../x", QString(), &why), "a path is not a profile to start");
+    qputenv("PATH", savedPath);
+    QDir(profilesRoot()).removeRecursively();
+}
+
 } // namespace
+
+int runSelfTestClient(const QString &dir) {
+    // What the client does with a profile, and nothing else: hold its lock
+    // and publish this process's id, until a signal ends the process.
+    const QByteArray lock = QFile::encodeName(dir + "/.lock");
+    const int fd = ::open(lock.constData(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0 || ::flock(fd, LOCK_EX | LOCK_NB) != 0)
+        return 3;
+    writeAll(dir + "/client.pid", QByteArray::number(QCoreApplication::applicationPid()) + "\n");
+    for (int i = 0; i < 600; ++i)
+        QThread::msleep(100);
+    return 0;
+}
 
 int runSelfTest() {
     QTemporaryDir scratch;
@@ -1173,6 +1287,7 @@ int runSelfTest() {
     testLensAndSharpen();
     testShaderLauncher(root);
     testMacros();
+    testSeveralClients(root);
 
     std::printf("self-test: %d checks, %d failed (scratch %s)\n", g_checks, g_failures, qPrintable(root));
     return g_failures == 0 ? 0 : 1;

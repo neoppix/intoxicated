@@ -35,9 +35,11 @@ qt_add_executable(intoxicated-settings
   src/macros_page.cpp
   src/profiles_page.cpp
   src/other_pages.cpp
+  src/several_clients.cpp
   src/selftest.cpp
 )
-target_link_libraries(intoxicated-settings PRIVATE Qt6::Widgets)
+# libutil: kinfo_getfile(3), to see which process holds a profile's lock.
+target_link_libraries(intoxicated-settings PRIVATE Qt6::Widgets util)
 target_compile_options(intoxicated-settings PRIVATE -Wall -Wextra)
 
 # The logo, compiled in, so the app finds it wherever it is installed.

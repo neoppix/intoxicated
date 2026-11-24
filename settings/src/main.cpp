@@ -42,6 +42,11 @@ int main(int argc, char **argv) {
             QCoreApplication app(argc, argv);
             return intox::runSelfTest();
         }
+        // The stand-in client the self-test starts and stops; not for use.
+        if (std::strcmp(argv[i], "--self-test-client") == 0 && i + 1 < argc) {
+            QCoreApplication app(argc, argv);
+            return intox::runSelfTestClient(QString::fromLocal8Bit(argv[i + 1]));
+        }
         if (std::strcmp(argv[i], "--askpass") == 0)
             return intox::runAskpass(argc, argv);
     }

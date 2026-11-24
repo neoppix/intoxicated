@@ -16,6 +16,7 @@
 
 #include <QList>
 #include <QMap>
+#include <QProcessEnvironment>
 #include <QSet>
 #include <QString>
 #include <QStringList>
@@ -198,7 +199,8 @@ struct ProfileInfo {
 // Whether a client holds the profile's lock right now. Taken and released
 // at once with flock(LOCK_EX | LOCK_NB) on a read-only open.
 bool profileInUse(const QString &dir);
-// Signed in means a cookies file exists; its content is never read.
+// Signed in means both the cookies and the identity file exist (the client
+// writes identity on sign-in and erases it on sign-out); neither is read.
 bool profileSignedIn(const QString &dir);
 // `default` first, then every directory with a usable name, sorted, plus
 // EXTRA (the default profile named in settings.conf) when it is missing.
@@ -208,6 +210,45 @@ bool deleteProfile(const QString &name, QString *error);
 // The profile the launcher uses when nothing else is said:
 // settings.conf's INTOXICATED_PROFILE when usable, else `default`.
 QString defaultProfileName(const SettingsConf &conf);
+
+// --- Several clients ---------------------------------------------------------
+
+// <profile>/client.pid: the client writes its process id there while it
+// holds the profile's lock, and removes it when it exits.
+inline const QString kClientPidFile = QStringLiteral("client.pid");
+
+// Whether process PID has FILE open right now (the same device and inode),
+// from the kernel's file table for it. False for a process that is gone or
+// is another user's.
+bool processHasOpen(qint64 pid, const QString &file);
+// The process running profile DIR: client.pid's, but only while that process
+// holds DIR/.lock open, so a file left by a crash or a pid since used again
+// names nothing. Never found by process name.
+std::optional<qint64> clientPid(const QString &dir);
+
+struct RunningClient {
+    QString profile;
+    // -1 when the client has not said (an older client, or just starting).
+    qint64 pid = -1;
+};
+
+// Every profile a client holds right now, in listProfiles() order.
+QList<RunningClient> runningClients();
+
+// What starting a client on PROFILE runs: the launcher, the link (if any)
+// as its one argument, and this app's environment with INTOXICATED_PROFILE.
+struct LaunchCommand {
+    QString program;
+    QStringList arguments;
+    QProcessEnvironment environment;
+};
+LaunchCommand launchCommand(const QString &profile, const QString &link);
+// Start that command detached, from the home directory. Refused for a
+// profile already in use.
+bool startClient(const QString &profile, const QString &link, QString *error);
+// Send SIGTERM to the client on PROFILE (clientPid), which then leaves
+// through its normal teardown.
+bool stopClient(const QString &profile, QString *error);
 
 // --- Profile files ----------------------------------------------------------
 
@@ -498,5 +539,8 @@ QString describeStep(const MacroStep &step);
 // --- Self-test -------------------------------------------------------------
 
 int runSelfTest();
+// `--self-test-client DIR`, started by the self-test: hold DIR/.lock and
+// write DIR/client.pid as a client would, for at most a minute.
+int runSelfTestClient(const QString &dir);
 
 } // namespace intox

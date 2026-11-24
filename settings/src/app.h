@@ -49,6 +49,9 @@ public:
     bool launch(const QString &link);
     // Whether an update runs (the window asks before closing then).
     bool busy = false;
+    // Whether the warning before starting several clients was accepted in
+    // this run of the app.
+    bool severalWarned = false;
 
 signals:
     void profileChanged(const QString &name);
@@ -66,6 +69,40 @@ private:
 };
 
 // --- Pages -----------------------------------------------------------------
+
+// The Play page's "Run several" group (a switch per profile and Play
+// selected, which starts one launcher per checked profile a moment apart)
+// and its "Running" group (the clients running now, refreshed every two
+// seconds from the profiles' locks, each with a Stop button).
+class SeveralClients : public QWidget {
+    Q_OBJECT
+public:
+    explicit SeveralClients(AppState *state);
+    void refresh();
+
+protected:
+    void showEvent(QShowEvent *event) override;
+    void hideEvent(QHideEvent *event) override;
+
+private:
+    void playSelected();
+    void stopOne(const QString &profile);
+    // Asked once per run before more than one client would run; false stops.
+    bool acceptWarning();
+
+    AppState *m_state;
+    QVBoxLayout *m_profileRows;
+    QVBoxLayout *m_runningRows;
+    QLabel *m_noneRunning;
+    QPushButton *m_playSelected;
+    QTimer *m_timer;
+    QStringList m_names;
+    QMap<QString, Switch *> m_checks;
+    QMap<QString, QLabel *> m_descs;
+    // Checked and waiting for their turn to start.
+    QSet<QString> m_pending;
+    QStringList m_shownRunning;
+};
 
 class PlayPage : public QWidget {
     Q_OBJECT

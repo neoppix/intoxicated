@@ -54,21 +54,9 @@ bool AppState::launch(const QString &link) {
                         .arg(m_profile));
         return false;
     }
-    const QString program = launcherPath();
-    if (!QFileInfo(program).isExecutable()) {
-        emit status(QStringLiteral("intoxicated was not found on PATH or in /usr/local/bin."));
-        return false;
-    }
-    QProcess process;
-    process.setProgram(program);
-    process.setArguments(link.isEmpty() ? QStringList() : QStringList{link});
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-    env.insert(QStringLiteral("INTOXICATED_PROFILE"), m_profile);
-    process.setProcessEnvironment(env);
-    process.setWorkingDirectory(QDir::homePath());
-    process.setStandardInputFile(QProcess::nullDevice());
-    if (!process.startDetached()) {
-        emit status(QStringLiteral("%1 could not be started: %2").arg(program, process.errorString()));
+    QString error;
+    if (!startClient(m_profile, link, &error)) {
+        emit status(error);
         return false;
     }
     emit status(link.isEmpty() ? QStringLiteral("Starting Intoxicated on profile %1.").arg(m_profile)
