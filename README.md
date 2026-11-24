@@ -369,12 +369,18 @@ cache, so what a moving player wears leaves no trail.
 
 Diffuse indirect light, more experimental still and off unless
 `INTOXICATED_RT_GI=1` at start (devctl `rt gi on|off` then): one ray per 2
-by 2 pixels in a cosine-weighted direction, its hit lit as the engine lights
-it (one bounce; a miss takes the sky), gathered over frames at the same
-point in the world and over the neighbouring blocks on the same surface, and
-put in place of the engine's own ambient light, so corners darken and
-coloured walls tint what faces them. It takes about 130 MB more video memory
-when on.
+by 2 pixels every other frame (in a checkerboard) in a cosine-weighted
+direction. A hit the screen shows takes its light from the screen, with the
+engine's own lamps and glowing (neon) parts in it; what a cached part shows
+beyond the engine's sun and ambient is remembered as light it gives off, so
+it still lights its surroundings out of view; any other hit is lit as the
+engine lights it (one bounce; a miss takes the sky). The rays are gathered
+over up to 32 frames at the same point in the world (sooner forgotten when
+the light there changes), then smoothed by three a-trous filter passes that
+stop at edges in depth and normal and between light and dark (guided by the
+noise measured at each point, as SVGF does), and put in place of the
+engine's own ambient light, so corners darken and coloured walls tint what
+faces them. It takes about 160 MB more video memory when on.
 
 devctl `rt on` and `rt off` switch it while the game runs (with
 `INTOXICATED_RT=1` at start), `rt stats` reports the triangles, the textures,

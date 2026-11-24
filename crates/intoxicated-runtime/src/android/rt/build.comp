@@ -193,6 +193,8 @@ const uint S_NRM = 26u;
 const uint S_STREAK = 7u;
 const uint S_PROMOTED = 29u;
 const uint S_HIDDEN = 30u;
+// The light it was seen to give off (`ssr.comp`'s GI pass).
+const uint S_EMIT = 31u;
 const uint STABLE = 60u;
 const uint HIDDEN_FRAMES = 240u;
 // Cached triangles further than `pc.reach_bits` from the camera are not
@@ -427,6 +429,8 @@ void main() {
             slots[base + S_MISSES] = 0u;
             slots[base + S_HIDDEN] = 0u;
             slots[base + S_CODE] = d.y;
+            // Its slot, beside the normals flag, for the light it gives off.
+            tris[TRI_VEC4 * i + 5u].w = uintBitsToFloat((normals ? 1u : 0u) | ((base / SLOT_WORDS + 1u) << 1));
             for (uint k = 0u; k < 3u; ++k) {
                 slots[base + S_COL + k] = col[k];
                 slots[base + S_NRM + k] = nrm[k];
@@ -474,6 +478,8 @@ void main() {
     slots[best + S_STREAK] = 1u;
     slots[best + S_PROMOTED] = 0u;
     slots[best + S_HIDDEN] = 0u;
+    slots[best + S_EMIT] = 0u;
+    tris[TRI_VEC4 * i + 5u].w = uintBitsToFloat((normals ? 1u : 0u) | ((best / SLOT_WORDS + 1u) << 1));
     for (uint k = 0u; k < 3u; ++k) {
         uvec3 b = floatBitsToUint(W[k].xyz);
         slots[best + S_POS + 3u * k] = b.x;
@@ -577,7 +583,7 @@ void main() {
     tris[TRI_VEC4 * at + 3u] = vec4(u0, u1);
     tris[TRI_VEC4 * at + 4u] = vec4(u2, uintBitsToFloat(slots[base + S_CODE]), uintBitsToFloat(slots[base + S_SOURCE]));
     uint nA = slots[base + S_NRM], nB = slots[base + S_NRM + 1u], nC = slots[base + S_NRM + 2u];
-    tris[TRI_VEC4 * at + 5u] = uintBitsToFloat(uvec4(nA, nB, nC, (nA | nB | nC) != 0u ? 1u : 0u));
+    tris[TRI_VEC4 * at + 5u] = uintBitsToFloat(uvec4(nA, nB, nC, ((nA | nB | nC) != 0u ? 1u : 0u) | ((base / SLOT_WORDS + 1u) << 1)));
 }
 
 #endif

@@ -551,6 +551,10 @@ layout(std430, set = 1, binding = 6) buffer Globals {
 // the leader's world position (x, y); its z, its normal packed, 0, 0.
 layout(std430, set = 1, binding = 13) buffer GiA { uvec4 gi_a[]; };
 layout(std430, set = 1, binding = 14) buffer GiB { uvec4 gi_b[]; };
+// The filtered indirect light per block, in turn between the filter's
+// passes: red and green, blue and variance, as halves.
+layout(std430, set = 1, binding = 15) buffer GiFa { uvec2 gi_fa[]; };
+layout(std430, set = 1, binding = 16) buffer GiFb { uvec2 gi_fb[]; };
 // The environment: what the screen showed in each direction where it showed
 // sky, kept over frames, octahedral around world up, `ENV_SIZE` squared:
 // (red and green, blue and weight as halves, the cache's generation it
@@ -847,7 +851,7 @@ vec3 rt_normal(vec3 P, vec3 N) {
         return N;
     }
     uvec4 packed = floatBitsToUint(tris[TRI_VEC4 * tri + 5u]);
-    if (packed.w == 0u) {
+    if ((packed.w & 1u) == 0u) {
         return N;
     }
     vec3 n = unpackSnorm4x8(packed.x).xyz * (1.0 - uv.x - uv.y) + unpackSnorm4x8(packed.y).xyz * uv.x
@@ -865,7 +869,7 @@ vec3 rt_normal(vec3 P, vec3 N) {
 vec3 hit_normal(uint tri, vec2 uv, vec3 dir) {
     uvec4 packed = floatBitsToUint(tris[TRI_VEC4 * tri + 5u]);
     vec3 n;
-    if (packed.w != 0u) {
+    if ((packed.w & 1u) != 0u) {
         n = unpackSnorm4x8(packed.x).xyz * (1.0 - uv.x - uv.y) + unpackSnorm4x8(packed.y).xyz * uv.x
             + unpackSnorm4x8(packed.z).xyz * uv.y;
     } else {
@@ -1069,6 +1073,15 @@ void main() {
 
 #elif defined(RT) && defined(GI)
 
+// The cache of static triangles (`rt/build.comp`), for the light each one
+// was seen to give off (`S_EMIT`).
+layout(std430, set = 1, binding = 9) buffer Slots { uint slots[]; };
+const uint SLOT_WORDS = 32u;
+const uint S_EMIT = 31u;
+// Light a cached triangle gives off beyond what the engine's sun and
+// ambient light on it explain, kept as a quarter in 8 bits a channel.
+const float EMIT_SCALE = 4.0;
+
 uint hash(uint x) {
     x ^= x >> 16;
     x *= 0x7feb352du;
@@ -1078,7 +1091,8 @@ uint hash(uint x) {
     return x;
 }
 
-// The GI pass (`-DRT -DGI`): one ray a 2 by 2 block from its leader pixel,
+// The GI pass (`-DRT -DGI`): one ray a 2 by 2 block from its leader pixel
+// (every other frame, see below),
 // cosine-weighted around the surface's normal, its hit lit as the engine
 // lights it (one bounce; a miss takes the sky), accumulated over frames at
 // the same place in the world (the block's point found in the last frame's
@@ -1109,6 +1123,37 @@ void main() {
     vec3 n = normalize(world_dir(nv));
     vec3 X = to_world(P);
     float dist = length(P) * g_near;
+    // The last frame's light at this point, found first: a block traces a
+    // new ray every other frame (in a checkerboard) and otherwise keeps
+    // what it had, which halves the cost.
+    vec3 r = X - prev_pos.xyz;
+    vec3 v = vec3(dot(r, prev_right.xyz), dot(r, prev_up.xyz), dot(r, prev_forward.xyz));
+    float frames = 0.0;
+    vec3 old = vec3(0.0);
+    vec2 moments_old = vec2(0.0);
+    if (prev_camera.w > 0.0 && v.z > 0.0) {
+        vec2 ndc = vec2(v.x / (v.z * prev_camera.x), -v.y / (v.z * prev_camera.y));
+        ivec2 q = ivec2((ndc * 0.5 + 0.5) * vec2(pc.size)) / 2;
+        if (all(greaterThanEqual(q, ivec2(0))) && all(lessThan(uvec2(q), hs))) {
+            uint j = uint(q.y) * hs.x + uint(q.x);
+            uvec4 e0 = odd ? gi_a[2u * j] : gi_b[2u * j];
+            uvec4 e1 = odd ? gi_a[2u * j + 1u] : gi_b[2u * j + 1u];
+            vec3 Y = uintBitsToFloat(uvec3(e0.zw, e1.x));
+            vec3 m = unpackSnorm4x8(e1.y).xyz;
+            vec2 bn = unpackHalf2x16(e0.y);
+            vec3 o = vec3(unpackHalf2x16(e0.x), bn.x);
+            vec2 mo = unpackHalf2x16(e1.z);
+            if (bn.y > 0.0 && distance(X, Y) < 0.02 * dist + 0.05 && dot(m, n) > 0.9
+                && !any(isnan(o)) && !any(isinf(o)) && !any(isnan(mo)) && !any(isinf(mo))) {
+                frames = bn.y;
+                old = o;
+                moments_old = mo;
+            }
+        }
+    }
+    vec3 acc = old;
+    vec2 moments = moments_old;
+    if (frames < 1.0 || ((uint(b.x + b.y) + frame) & 1u) == 0u) {
     // A cosine-weighted direction around n.
     uint h = hash(i * 9781u + frame * 6271u);
     float r1 = float(h & 0xffffu) / 65536.0, r2 = float(h >> 16) / 65536.0;
@@ -1121,46 +1166,177 @@ void main() {
     vec2 uv;
     float t = trace_ray(X + n * (0.002 * dist + 0.02), dir, 0.01, 4096.0, tri, uv);
     vec3 L;
+    float exposure_ = max(frame_block[20].y, 1e-3);
     if (t > 0.0) {
         vec3 Hw = X + n * (0.002 * dist + 0.02) + dir * t;
-        L = lit_linear(hit_colour(tri, uv, t), hit_normal(tri, uv, dir), Hw);
-    } else {
-        vec4 env = environment(dir);
-        L = env.a > 0.0 ? env.rgb * env.rgb / max(frame_block[20].y, 1e-3) : engine_ambient(dir);
-    }
-    // The last frame's light at this point.
-    vec3 r = X - prev_pos.xyz;
-    vec3 v = vec3(dot(r, prev_right.xyz), dot(r, prev_up.xyz), dot(r, prev_forward.xyz));
-    float frames = 1.0;
-    vec3 acc = L;
-    if (prev_camera.w > 0.0 && v.z > 0.0) {
-        vec2 ndc = vec2(v.x / (v.z * prev_camera.x), -v.y / (v.z * prev_camera.y));
-        ivec2 q = ivec2((ndc * 0.5 + 0.5) * vec2(pc.size)) / 2;
-        if (all(greaterThanEqual(q, ivec2(0))) && all(lessThan(uvec2(q), hs))) {
-            uint j = uint(q.y) * hs.x + uint(q.x);
-            uvec4 e0 = odd ? gi_a[2u * j] : gi_b[2u * j];
-            uvec4 e1 = odd ? gi_a[2u * j + 1u] : gi_b[2u * j + 1u];
-            vec3 Y = uintBitsToFloat(uvec3(e0.zw, e1.x));
-            vec3 m = unpackSnorm4x8(e1.y).xyz;
-            vec2 bn = unpackHalf2x16(e0.y);
-            if (bn.y > 0.0 && distance(X, Y) < 0.02 * dist + 0.05 && dot(m, n) > 0.9) {
-                frames = min(bn.y + 1.0, 32.0);
-                vec3 old = vec3(unpackHalf2x16(e0.x), bn.x);
-                if (!any(isnan(old)) && !any(isinf(old))) {
-                    acc = mix(old, L, 1.0 / frames);
+        // A cached triangle's slot (`rt/build.comp` keeps it in the normal
+        // word's upper bits), for the light it gives off.
+        uint slot = floatBitsToUint(tris[TRI_VEC4 * tri + 5u].w) >> 1;
+        // Where the screen shows the hit, its light there, with everything
+        // the engine lit it with (its lamps, a neon part's glow); what that
+        // has beyond the engine's sun and ambient is learnt into the
+        // triangle's slot, so it still gives off light out of view.
+        bool shown = false;
+        vec3 H = to_view_space(Hw);
+        if ((pc.flags & 4u) != 0u && H.z > 1e-3) {
+            vec2 at = to_pixel(H);
+            if (all(greaterThanEqual(at, vec2(0.5))) && all(lessThan(at, vec2(pc.size) - 0.5))) {
+                float ds = depth_at(ivec2(at));
+                if (ds > 0.0 && abs(H.z - 1.0 / ds) < 0.02 * H.z) {
+                    vec3 c = textureLod(opaque_tex, at / vec2(pc.size), 0.0).rgb;
+                    L = c * c / exposure_;
+                    shown = true;
+                    if (slot != 0u) {
+                        vec3 lit = lit_linear(hit_colour(tri, uv, t), hit_normal(tri, uv, dir), Hw);
+                        uint at_ = (slot - 1u) * SLOT_WORDS + S_EMIT;
+                        vec3 e = unpackUnorm4x8(slots[at_]).rgb * EMIT_SCALE;
+                        vec3 extra = max(L - lit, vec3(0.0));
+                        // Only a clear excess counts, else nothing.
+                        vec3 target = dot(extra, vec3(1.0)) > 0.5 * dot(lit, vec3(1.0)) + 0.05 ? extra : vec3(0.0);
+                        slots[at_] = packUnorm4x8(vec4(mix(e, target, 0.25) / EMIT_SCALE, 0.0));
+                    }
                 }
             }
         }
+        if (!shown) {
+            L = lit_linear(hit_colour(tri, uv, t), hit_normal(tri, uv, dir), Hw);
+            if (slot != 0u) {
+                L += unpackUnorm4x8(slots[(slot - 1u) * SLOT_WORDS + S_EMIT]).rgb * EMIT_SCALE;
+            }
+        }
+    } else {
+        vec4 env = environment(dir);
+        L = env.a > 0.0 ? env.rgb * env.rgb / exposure_ : engine_ambient(dir);
+    }
+    L = min(L, vec3(16.0));
+    // Accumulated over up to 32 frames, with the first two moments of its
+    // brightness for the filter's variance. A sample far outside what the
+    // history's moments allow (the light changed) halves the history, so it
+    // follows sooner (history clamping, by its weight).
+    float l = dot(L, vec3(0.2126, 0.7152, 0.0722));
+    if (frames >= 4.0) {
+        float sd = sqrt(max(moments_old.y - moments_old.x * moments_old.x, 0.0));
+        if (abs(l - moments_old.x) > 4.0 * sd + 0.1 * moments_old.x + 0.02) {
+            frames = max(0.5 * frames, 1.0);
+        }
+    }
+    frames = min(frames + 1.0, 32.0);
+    acc = mix(old, L, 1.0 / frames);
+    moments = mix(moments_old, vec2(l, l * l), 1.0 / frames);
     }
     acc = min(acc, vec3(64.0));
     uvec4 o0 = uvec4(packHalf2x16(acc.rg), packHalf2x16(vec2(acc.b, frames)), floatBitsToUint(X.xy));
-    uvec4 o1 = uvec4(floatBitsToUint(X.z), packSnorm4x8(vec4(n, 0.0)), 0u, 0u);
+    uvec4 o1 = uvec4(floatBitsToUint(X.z), packSnorm4x8(vec4(n, 0.0)), packHalf2x16(moments), 0u);
     if (odd) {
         gi_b[2u * i] = o0;
         gi_b[2u * i + 1u] = o1;
     } else {
         gi_a[2u * i] = o0;
         gi_a[2u * i + 1u] = o1;
+    }
+}
+
+#elif defined(RT) && defined(GIFILTER)
+
+// The GI filter (`-DRT -DGIFILTER`), run three times after the GI pass,
+// `pc.steps` 1, 2 and 4 blocks apart (an a-trous wavelet filter, as in
+// SVGF): each block the 5 by 5 blocks that far apart around it, weighted by
+// a B-spline, by how near they lie to its surface's plane, by how alike
+// their normals are and by how alike their light is, measured against the
+// noise its variance (from the moments the GI pass keeps, or the last
+// pass's) leaves; the variance filtered along with the light. Step 1 reads
+// the GI pass's result into `gi_fa`, 2 that into `gi_fb`, 4 that into
+// `gi_fa` again, which the apply takes.
+const float KERNEL[3] = float[](0.375, 0.25, 0.0625);
+
+void light_of(uint k, bool odd, out vec3 L, out float variance) {
+    if (pc.steps <= 1u) {
+        uvec4 e0 = odd ? gi_b[2u * k] : gi_a[2u * k];
+        uvec4 e1 = odd ? gi_b[2u * k + 1u] : gi_a[2u * k + 1u];
+        vec2 bn = unpackHalf2x16(e0.y);
+        L = vec3(unpackHalf2x16(e0.x), bn.x);
+        vec2 m = unpackHalf2x16(e1.z);
+        variance = max(m.y - m.x * m.x, 0.0);
+        // Few frames of history say little about the noise: taken as
+        // large as the light itself until there are four.
+        if (bn.y < 4.0) {
+            variance = max(variance, m.x * m.x);
+        }
+    } else {
+        uvec2 f = pc.steps == 2u ? gi_fa[k] : gi_fb[k];
+        vec2 bv = unpackHalf2x16(f.y);
+        L = vec3(unpackHalf2x16(f.x), bv.x);
+        variance = bv.y;
+    }
+    if (any(isnan(L)) || any(isinf(L)) || isnan(variance) || isinf(variance)) {
+        L = vec3(0.0);
+        variance = 0.0;
+    }
+}
+
+void main() {
+    camera_from_fit();
+    ivec2 b = ivec2(gl_GlobalInvocationID.xy);
+    uvec2 hs = half_size();
+    if (any(greaterThanEqual(uvec2(b), hs))) {
+        return;
+    }
+    uint i = uint(b.y) * hs.x + uint(b.x);
+    bool odd = (frame & 1u) != 0u;
+    uvec4 c0 = odd ? gi_b[2u * i] : gi_a[2u * i];
+    uvec4 c1 = odd ? gi_b[2u * i + 1u] : gi_a[2u * i + 1u];
+    uvec2 result = uvec2(0u);
+    if (unpackHalf2x16(c0.y).y > 0.0 && g_fit) {
+        vec3 X = uintBitsToFloat(uvec3(c0.zw, c1.x));
+        vec3 n = unpackSnorm4x8(c1.y).xyz;
+        float dist = max(distance(X, cam_pos.xyz), 1e-3);
+        const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+        vec3 cL;
+        float cv;
+        light_of(i, odd, cL, cv);
+        float lc = dot(cL, LUMA);
+        float sigma = 4.0 * sqrt(cv) + 1e-3;
+        vec3 sum = vec3(0.0);
+        float sv = 0.0, ws = 0.0;
+        int step_ = int(max(pc.steps, 1u));
+        for (int y = -2; y <= 2; ++y) {
+            for (int x = -2; x <= 2; ++x) {
+                ivec2 q = b + ivec2(x, y) * step_;
+                if (any(greaterThanEqual(uvec2(q), hs))) {
+                    continue;
+                }
+                uint k = uint(q.y) * hs.x + uint(q.x);
+                uvec4 e0 = odd ? gi_b[2u * k] : gi_a[2u * k];
+                uvec4 e1 = odd ? gi_b[2u * k + 1u] : gi_a[2u * k + 1u];
+                if (!(unpackHalf2x16(e0.y).y > 0.0)) {
+                    continue;
+                }
+                vec3 Y = uintBitsToFloat(uvec3(e0.zw, e1.x));
+                vec3 m = unpackSnorm4x8(e1.y).xyz;
+                vec3 L;
+                float v;
+                light_of(k, odd, L, v);
+                float off_plane = abs(dot(n, Y - X)) / dist;
+                float w = KERNEL[abs(x)] * KERNEL[abs(y)]
+                    * (1.0 - smoothstep(0.004, 0.03, off_plane))
+                    * pow(max(dot(m, n), 0.0), 32.0)
+                    * exp(-abs(dot(L, LUMA) - lc) / sigma);
+                if (w > 0.0) {
+                    sum += w * L;
+                    sv += w * w * v;
+                    ws += w;
+                }
+            }
+        }
+        if (ws > 1e-6) {
+            vec3 o = min(sum / ws, vec3(64.0));
+            result = uvec2(packHalf2x16(o.rg), packHalf2x16(vec2(o.b, min(sv / (ws * ws), 1000.0))));
+        }
+    }
+    if (pc.steps == 2u) {
+        gi_fb[i] = result;
+    } else {
+        gi_fa[i] = result;
     }
 }
 
@@ -1197,7 +1373,7 @@ uint pack_result(vec4 c) {
 }
 
 // The GI apply pass (`-DRT -DGIAPPLY`), on the finished reflections'
-// result: the indirect light around each pixel (the blocks within two of
+// result: the filtered indirect light around each pixel (the blocks next to
 // its own that lie on its surface and face its way, by distance), in place
 // of the engine's ambient: the pixel's base colour estimated as its colour
 // over the engine's light without shadow, times the indirect light less the
@@ -1226,8 +1402,8 @@ void main() {
     ivec2 b0 = p / 2;
     vec3 sum = vec3(0.0);
     float weights = 0.0;
-    for (int j = -2; j <= 2; ++j) {
-        for (int i = -2; i <= 2; ++i) {
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
             ivec2 b = b0 + ivec2(i, j);
             if (any(greaterThanEqual(uvec2(b), hs))) {
                 continue;
@@ -1242,8 +1418,10 @@ void main() {
             vec3 Y = uintBitsToFloat(uvec3(e0.zw, e1.x));
             vec3 m = unpackSnorm4x8(e1.y).xyz;
             float off_plane = abs(dot(n, Y - X)) / max(dist, 1e-3);
-            float w = (1.0 - smoothstep(0.004, 0.03, off_plane)) * max(dot(m, n), 0.0) * exp(-0.25 * float(i * i + j * j));
-            vec3 L = vec3(unpackHalf2x16(e0.x), bn.x);
+            float w = (1.0 - smoothstep(0.004, 0.03, off_plane)) * max(dot(m, n), 0.0) * exp(-1.0 * float(i * i + j * j));
+            // The filter's result (see GIFILTER).
+            uvec2 f = gi_fa[k];
+            vec3 L = vec3(unpackHalf2x16(f.x), unpackHalf2x16(f.y).x);
             if (w > 0.0 && !any(isnan(L)) && !any(isinf(L))) {
                 sum += w * L;
                 weights += w;
@@ -1292,10 +1470,13 @@ void main() {
         vec3 P = view_pos(vec2(p) + 0.5, d);
         vec3 N = surface_at(p, P).n;
         float wet = N == vec3(0.0) ? 0.0 : wetness(N);
-        if (N != vec3(0.0)) {
+        // The smooth normal (a ray from the camera) only where it is used:
+        // a wet pixel, or the debug view.
+        bool debug_ = ((pc.flags >> 6) & 3u) != 0u;
+        if (N != vec3(0.0) && (wet > 0.0 || debug_)) {
             vec3 n = surface_normal(p, P, N);
             curved = g_source > 1.5 && dot(n, N) < 0.9995;
-            if (((pc.flags >> 6) & 3u) != 0u) {
+            if (debug_) {
                 r = debug_view(n);
             } else if (wet > 0.0) {
                 r = reflection_rt(p, P, n, wet);

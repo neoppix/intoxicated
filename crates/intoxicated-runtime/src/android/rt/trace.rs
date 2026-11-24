@@ -91,9 +91,11 @@ const SPIRV_TRACE: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_trace.spv
 const SPIRV_UPSAMPLE: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_upsample.spv.rs"));
 /// `ssr/ssr.comp` with `RT` and `ENVMAP`.
 const SPIRV_ENV: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_env.spv.rs"));
-/// `ssr/ssr.comp` with `RT` and `GI`, and with `RT` and `GIAPPLY`.
+/// `ssr/ssr.comp` with `RT` and `GI`, with `RT` and `GIAPPLY`, and with
+/// `RT` and `GIFILTER`.
 const SPIRV_GI: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_gi.spv.rs"));
 const SPIRV_GI_APPLY: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_gi_apply.spv.rs"));
+const SPIRV_GI_FILTER: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_gi_filter.spv.rs"));
 
 const PREP: usize = 0;
 const SORT_LOCAL: usize = 1;
@@ -108,12 +110,14 @@ const GATHER: usize = 9;
 const ENV: usize = 10;
 const GI: usize = 11;
 const GI_APPLY: usize = 12;
-const PIPELINES: usize = 13;
+const GI_FILTER: usize = 13;
+const PIPELINES: usize = 14;
 /// The bindings of our set: 0 the capture, 2 the sorted keys, 3 the nodes,
 /// 4 the parents, 5 the flags, 6 the globals, 7 the traced blocks, 8 the
 /// triangles to trace, 9 the cache, 10 this frame's draws, 11 its textures
-/// by serial, 12 the environment, 13 and 14 the indirect light.
-const BINDINGS: [u32; 14] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+/// by serial, 12 the environment, 13 and 14 the indirect light, 15 and 16
+/// the filtered indirect light.
+const BINDINGS: [u32; 16] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
 /// Bytes of the indirect light a 2 by 2 block.
 const GI_BYTES: u64 = 32;
 /// The environment: 256 by 256 directions, 16 bytes each.
@@ -446,6 +450,8 @@ struct Gpu {
     /// for every block when `INTOXICATED_RT_GI=1` at start, else a token).
     gi: [Owned; 2],
     gi_room: u64,
+    /// The GI filter's buffers, 8 bytes a block.
+    gi_filtered: [Owned; 2],
     /// The ring slot of the last trace, whose set 2 the apply pass binds.
     last_slot: usize,
     /// A zeroed stand-in for the engine's per-frame uniform block.
@@ -545,6 +551,8 @@ impl Gpu {
             self.env,
             self.gi[0],
             self.gi[1],
+            self.gi_filtered[0],
+            self.gi_filtered[1],
             self.no_frame_block,
             self.readback,
             self.cache_copy,
@@ -636,6 +644,7 @@ fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool, extent: [u32; 2]) -
         env: Owned::default(),
         gi: [Owned::default(); 2],
         gi_room: 0,
+        gi_filtered: [Owned::default(); 2],
         last_slot: 0,
         no_frame_block: Owned::default(),
         cache_copy: Owned::default(),
@@ -807,6 +816,10 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         make_buffer(&g.buffers, d, &types, g.gi_room, usage, false)?,
         make_buffer(&g.buffers, d, &types, g.gi_room, usage, false)?,
     ];
+    g.gi_filtered = [
+        make_buffer(&g.buffers, d, &types, g.gi_room / 4, usage, false)?,
+        make_buffer(&g.buffers, d, &types, g.gi_room / 4, usage, false)?,
+    ];
     g.no_frame_block = make_buffer(&g.buffers, d, &types, FRAME_BLOCK_BYTES, USAGE_UNIFORM | USAGE_TRANSFER_DST, false)?;
     make_textures(g, &types)?;
     g.readback = make_buffer(&g.buffers, d, &types, 256, USAGE_TRANSFER_DST, true)?;
@@ -875,6 +888,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         SPIRV_ENV,
         SPIRV_GI,
         SPIRV_GI_APPLY,
+        SPIRV_GI_FILTER,
     ];
     for (i, code) in codes.into_iter().enumerate() {
         g.shaders[i] = shader(f, d, code)?;
@@ -891,7 +905,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
                 name: c"main".as_ptr(),
                 specialization: none,
             },
-            layout: if matches!(i, TRACE | UPSAMPLE | GATHER | ENV | GI | GI_APPLY) { g.trace_layout } else { g.build_layout },
+            layout: if matches!(i, TRACE | UPSAMPLE | GATHER | ENV | GI | GI_APPLY | GI_FILTER) { g.trace_layout } else { g.build_layout },
             base_pipeline: 0,
             base_pipeline_index: -1,
         };
@@ -923,6 +937,8 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         DescriptorBufferInfo { buffer: g.env.buffer, offset: 0, range: ENV_BYTES },
         DescriptorBufferInfo { buffer: g.gi[0].buffer, offset: 0, range: g.gi_room },
         DescriptorBufferInfo { buffer: g.gi[1].buffer, offset: 0, range: g.gi_room },
+        DescriptorBufferInfo { buffer: g.gi_filtered[0].buffer, offset: 0, range: g.gi_room / 4 },
+        DescriptorBufferInfo { buffer: g.gi_filtered[1].buffer, offset: 0, range: g.gi_room / 4 },
     ];
     let writes: Vec<WriteDescriptorSet> = infos
         .iter()
@@ -1069,6 +1085,8 @@ pub(crate) fn record(
         (f.cmd_fill_buffer)(cmd, g.env.buffer, 0, ENV_BYTES, 0);
         (f.cmd_fill_buffer)(cmd, g.gi[0].buffer, 0, g.gi_room, 0);
         (f.cmd_fill_buffer)(cmd, g.gi[1].buffer, 0, g.gi_room, 0);
+        (f.cmd_fill_buffer)(cmd, g.gi_filtered[0].buffer, 0, g.gi_room / 4, 0);
+        (f.cmd_fill_buffer)(cmd, g.gi_filtered[1].buffer, 0, g.gi_room / 4, 0);
         (f.cmd_fill_buffer)(cmd, g.no_frame_block.buffer, 0, FRAME_BLOCK_BYTES, 0);
     }
     g.barrier(cmd, STAGE_TRANSFER | STAGE_COMPUTE, ACCESS_TRANSFER_WRITE | ACCESS_SHADER_WRITE);
@@ -1241,6 +1259,23 @@ pub(crate) fn record(
         g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
         (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[GI]);
         (f.cmd_dispatch)(cmd, extent[0].div_ceil(2).div_ceil(8), extent[1].div_ceil(2).div_ceil(8), 1);
+        // Filtered: three a-trous passes, 1, 2 and 4 blocks apart (the
+        // step in `steps`).
+        (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[GI_FILTER]);
+        for step in [1u32, 2, 4] {
+            g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
+            let mut fp = tp;
+            fp.steps = step;
+            (f.cmd_push_constants)(
+                cmd,
+                g.trace_layout,
+                SHADER_STAGE_COMPUTE,
+                0,
+                std::mem::size_of::<super::super::ssr::Params>() as u32,
+                (&fp as *const super::super::ssr::Params).cast(),
+            );
+            (f.cmd_dispatch)(cmd, extent[0].div_ceil(2).div_ceil(8), extent[1].div_ceil(2).div_ceil(8), 1);
+        }
     }
     stamp(2);
     if timed {
