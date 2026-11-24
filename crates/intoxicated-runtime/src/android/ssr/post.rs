@@ -1,15 +1,20 @@
-//! Depth of field (`INTOXICATED_DOF=1`, devctl `dof`) and bloom
-//! (`INTOXICATED_BLOOM=1`, devctl `bloom`), recorded by the parent module
-//! at the same point of the frame as the reflections and after them: before
-//! the swapchain pass that draws the scene and then the HUD, so the HUD is
-//! drawn over both and is never blurred and never glows. The frame is
-//! matched exactly as for the reflections, and a frame that does not match
-//! gets none of the three.
+//! Depth of field (`INTOXICATED_DOF=1`, devctl `dof`), bloom
+//! (`INTOXICATED_BLOOM=1`, devctl `bloom`), lens effects
+//! (`INTOXICATED_LENS=1`, devctl `lens`) and sharpening
+//! (`INTOXICATED_SHARPEN=1`, devctl `sharpen`), recorded by the parent
+//! module at the same point of the frame as the reflections and after them,
+//! in that order: before the swapchain pass that draws the scene and then
+//! the HUD, so the HUD is drawn over all of them and is never blurred,
+//! glowing, split into colours or sharpened. The frame is matched exactly as
+//! for the reflections, and a frame that does not match gets none of them.
 //!
-//! Neither reveals anything that is not drawn: the depth of field only
-//! blurs the engine's own picture, and the bloom only adds light around
-//! what is already bright in it, screened so it can only brighten. Fog,
-//! darkness and whatever hides something stay as the engine drew them.
+//! None of them reveals anything that is not drawn: the depth of field only
+//! blurs the engine's own picture, the bloom and the lens's fringe only add
+//! light around what is already bright in it, screened so they can only
+//! brighten, the aberration moves drawn colours by a few pixels, the
+//! vignette only darkens, and the sharpen only raises the contrast of
+//! detail that is there, by at most `limit`. Fog, darkness and whatever
+//! hides something stay as the engine drew them.
 //!
 //! # Depth of field
 //!
@@ -50,6 +55,35 @@
 //! `radius`, and a compose that screens the glow, times `intensity` and
 //! `tint`, over the scene. The scene's colour is the engine's 10-bit UNORM
 //! image, not HDR, so the threshold is a brightness from 0 to 1.
+//!
+//! # Lens
+//!
+//! One full-resolution dispatch into a staging image of ours: red sampled
+//! further out from the centre and blue further in, by `aberration` pixels
+//! at the corners (at 1080p, scaled with the height) and by the square of
+//! the distance from the centre in between, so the middle of the screen,
+//! where one aims, stays clean; a rainbow fringe (`halo`) where the bloom
+//! chain's wide glow is stronger than its tight one, that is just outside
+//! the brightest areas, red at the inner edge to violet at the outer,
+//! screened over the scene; and a `vignette` that darkens the corners. The
+//! fringe reads the bloom chain, which the lens runs itself (with the
+//! bloom's threshold, knee and radius) when the bloom is off.
+//!
+//! # Sharpen
+//!
+//! Contrast adaptive sharpening, written here from the idea (AMD's
+//! FidelityFX CAS is the best known form of it): the pixel's difference
+//! from the average of its four sides is added back, times `strength` and
+//! times how much room the 3x3 neighbourhood leaves before black or white
+//! against how bright it gets, so flat mid-tone texture is sharpened most
+//! and an edge already at full contrast barely at all; the change is
+//! clamped to `limit`. With `depth_aware` a neighbour more than 5% (fully
+//! from 10%) nearer or further than the pixel counts as the pixel itself,
+//! so the outline of a character against the distance is not drawn as a
+//! bright or dark halo. Recorded last, after the lens, reading the staging
+//! image the lens wrote, or a copy of the scene there when something before
+//! wrote our result image (it reads its neighbours, so it never reads the
+//! image it writes).
 //!
 //! # Units
 //!
@@ -221,6 +255,122 @@ pub(crate) static BLOOM: Effect = Effect {
     usage: BLOOM_USAGE,
 };
 
+// ------------------------------------------------------------- lens
+
+pub const LENS_ENV: &str = "INTOXICATED_LENS";
+pub const LENS_LOOK_ENV: &str = "INTOXICATED_LENS_LOOK";
+
+const ABERRATION: f32 = 1.5;
+const VIGNETTE: f32 = 0.15;
+const HALO: f32 = 0.3;
+
+/// Every knob of the lens, in the order `lens get` lists them.
+pub(crate) const LENS_KNOBS: [Knob; 3] = [
+    // How far red and blue are pulled apart in the corners, in pixels at
+    // 1080p; less towards the centre, nothing in it.
+    knob("aberration", "INTOXICATED_LENS_ABERRATION", Kind::Number { min: 0.0, max: 16.0 }, [ABERRATION; 3], 0),
+    // How much darker the corners are.
+    knob("vignette", "INTOXICATED_LENS_VIGNETTE", Kind::Number { min: 0.0, max: 1.0 }, [VIGNETTE; 3], 1),
+    // How strong the rainbow fringe round the brightest areas is.
+    knob("halo", "INTOXICATED_LENS_HALO", Kind::Number { min: 0.0, max: 2.0 }, [HALO; 3], 2),
+];
+
+static LENS_ON: AtomicBool = AtomicBool::new(false);
+static LENS_VALUES: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
+
+pub(crate) const LENS_LOOKS: [Look; 3] = [
+    Look {
+        name: "subtle",
+        description: "A faint colour split towards the screen edges, slightly darker corners, a hint of rainbow round \
+                      bright lights.",
+        values: &[],
+    },
+    Look {
+        name: "prism",
+        description: "For clips: a clear colour split at the edges and a rainbow halo round the brightest areas.",
+        values: &[("aberration", [5.0; 3]), ("vignette", [0.3; 3]), ("halo", [1.0; 3])],
+    },
+    Look {
+        name: "film",
+        description: "Darker corners and a slight colour split, no halo, like an old camera lens.",
+        values: &[("aberration", [2.5; 3]), ("vignette", [0.45; 3]), ("halo", [0.0; 3])],
+    },
+];
+
+pub(crate) const LENS_USAGE: &str = "lens on|off|stats|get|reset|look <name>|set <name> <value>; names: aberration \
+     vignette halo; looks: subtle prism film";
+
+pub(crate) static LENS: Effect = Effect {
+    name: "lens",
+    title: "Lens",
+    summary: "Chromatic aberration towards the screen edges, a rainbow halo round the brightest lights and a \
+              vignette, like a camera lens. The HUD stays clean.",
+    index: 3,
+    env: LENS_ENV,
+    look_env: LENS_LOOK_ENV,
+    knobs: &LENS_KNOBS,
+    looks: &LENS_LOOKS,
+    not_a_look: &[],
+    values: &LENS_VALUES,
+    on: &LENS_ON,
+    usage: LENS_USAGE,
+};
+
+// ------------------------------------------------------------- sharpen
+
+pub const SHARPEN_ENV: &str = "INTOXICATED_SHARPEN";
+pub const SHARPEN_LOOK_ENV: &str = "INTOXICATED_SHARPEN_LOOK";
+
+const SHARPEN_STRENGTH: f32 = 0.5;
+const SHARPEN_LIMIT: f32 = 0.1;
+
+/// Every knob of the sharpen, in the order `sharpen get` lists them.
+pub(crate) const SHARPEN_KNOBS: [Knob; 3] = [
+    // How strongly detail is raised; the adaptive part holds it back where
+    // contrast is already high.
+    knob("strength", "INTOXICATED_SHARPEN_STRENGTH", Kind::Number { min: 0.0, max: 3.0 }, [SHARPEN_STRENGTH; 3], 0),
+    // The most a pixel's red, green or blue changes, 0 to 1.
+    knob("limit", "INTOXICATED_SHARPEN_LIMIT", Kind::Number { min: 0.0, max: 1.0 }, [SHARPEN_LIMIT; 3], 1),
+    // 1: not across depth edges, so outlines get no halo.
+    knob("depth_aware", "INTOXICATED_SHARPEN_DEPTH_AWARE", Kind::Switch, [1.0; 3], 2),
+];
+
+static SHARPEN_ON: AtomicBool = AtomicBool::new(false);
+static SHARPEN_VALUES: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
+
+pub(crate) const SHARPEN_LOOKS: [Look; 3] = [
+    Look { name: "light", description: "Crisper textures without halos round edges.", values: &[] },
+    Look {
+        name: "crisp",
+        description: "Clearly sharper textures and text on signs.",
+        values: &[("strength", [1.0; 3]), ("limit", [0.16; 3])],
+    },
+    Look {
+        name: "crunchy",
+        description: "For clips: strongly sharpened, crunchy texture detail.",
+        values: &[("strength", [2.0; 3]), ("limit", [0.28; 3])],
+    },
+];
+
+pub(crate) const SHARPEN_USAGE: &str = "sharpen on|off|stats|get|reset|look <name>|set <name> <value>; names: \
+     strength limit depth_aware; looks: light crisp crunchy";
+
+pub(crate) static SHARPEN: Effect = Effect {
+    name: "sharpen",
+    title: "Sharpen",
+    summary: "Contrast adaptive sharpening of the 3D scene: crisper texture detail without halos round edges. \
+              The HUD is not sharpened.",
+    index: 4,
+    env: SHARPEN_ENV,
+    look_env: SHARPEN_LOOK_ENV,
+    knobs: &SHARPEN_KNOBS,
+    looks: &SHARPEN_LOOKS,
+    not_a_look: &[],
+    values: &SHARPEN_VALUES,
+    on: &SHARPEN_ON,
+    usage: SHARPEN_USAGE,
+};
+
 // ------------------------------------------------------------- parameters
 
 /// Studs per near-plane unit: a depth `d` is `NEAR_STUDS / d` studs away
@@ -246,6 +396,11 @@ pub(crate) struct PostParams {
     pub radius: f32,
     pub samples: u32,
     pub far_range: f32,
+    pub aberration: f32,
+    pub vignette: f32,
+    pub halo: f32,
+    pub sharpen: f32,
+    pub sharpen_limit: f32,
 }
 
 /// `flags` bits.
@@ -254,20 +409,45 @@ pub(crate) const NEAR_BLUR: u32 = 0x2;
 pub(crate) const AUTOFOCUS: u32 = 0x4;
 pub(crate) const FOCUS_RESET: u32 = 0x8;
 pub(crate) const FOCUS_PAST: u32 = 0x10;
+pub(crate) const SRC_STAGE: u32 = 0x20;
+pub(crate) const DEPTH_AWARE: u32 = 0x40;
 /// The reflections' trace image holds the ray-traced glow above white
 /// (`ssr.comp` GIAPPLY), which the bloom adds.
-pub(crate) const GLOW: u32 = 0x20;
+pub(crate) const GLOW: u32 = 0x80;
 
 fn value(fx: &Effect, values: &[[f32; 3]], name: &str) -> [f32; 3] {
     fx.knobs.iter().position(|k| k.name == name).map_or([0.0; 3], |i| values[i])
 }
 
+/// Every post effect's knob values, each in its knob order.
+#[derive(Clone)]
+pub(crate) struct PostValues {
+    pub dof: Vec<[f32; 3]>,
+    pub bloom: Vec<[f32; 3]>,
+    pub lens: Vec<[f32; 3]>,
+    pub sharpen: Vec<[f32; 3]>,
+}
+
+impl PostValues {
+    pub(crate) fn current() -> PostValues {
+        PostValues { dof: DOF.current(), bloom: BLOOM.current(), lens: LENS.current(), sharpen: SHARPEN.current() }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn defaults() -> PostValues {
+        let d = |fx: &Effect| fx.knobs.iter().map(|k| k.default).collect();
+        PostValues { dof: d(&DOF), bloom: d(&BLOOM), lens: d(&LENS), sharpen: d(&SHARPEN) }
+    }
+}
+
 /// The push constants for a scene of `extent` packed as `mode`, from the
-/// depth of field's and the bloom's knob values (each in its knob order),
-/// `dt` seconds after the last frame with depth of field.
-pub(crate) fn post_params(extent: [u32; 2], dof: &[[f32; 3]], bloom: &[[f32; 3]], mode: u32, dt: f32) -> PostParams {
-    let d = |name| value(&DOF, dof, name)[0];
-    let b = |name| value(&BLOOM, bloom, name);
+/// post effects' knob values, `dt` seconds after the last frame with depth
+/// of field.
+pub(crate) fn post_params(extent: [u32; 2], v: &PostValues, mode: u32, dt: f32) -> PostParams {
+    let d = |name| value(&DOF, &v.dof, name)[0];
+    let b = |name| value(&BLOOM, &v.bloom, name);
+    let l = |name| value(&LENS, &v.lens, name)[0];
+    let s = |name| value(&SHARPEN, &v.sharpen, name)[0];
     let focus_time = d("focus_time");
     let tint = b("tint");
     PostParams {
@@ -280,7 +460,8 @@ pub(crate) fn post_params(extent: [u32; 2], dof: &[[f32; 3]], bloom: &[[f32; 3]]
                 0 => 0,
                 1 => AUTOFOCUS,
                 _ => AUTOFOCUS | FOCUS_PAST,
-            },
+            }
+            | if s("depth_aware") != 0.0 { DEPTH_AWARE } else { 0 },
         coc_scale: d("strength") * extent[1] as f32 / 1080.0 * 0.5,
         focus_fixed: d("focus_distance") / NEAR_STUDS,
         focus_range: d("focus_range"),
@@ -291,6 +472,11 @@ pub(crate) fn post_params(extent: [u32; 2], dof: &[[f32; 3]], bloom: &[[f32; 3]]
         radius: b("radius")[0],
         samples: d("samples") as u32,
         far_range: d("far_range"),
+        aberration: l("aberration") * extent[1] as f32 / 1080.0,
+        vignette: l("vignette"),
+        halo: l("halo"),
+        sharpen: s("strength"),
+        sharpen_limit: s("limit"),
     }
 }
 
@@ -302,6 +488,26 @@ pub(crate) fn dof_changes_nothing(values: &[[f32; 3]]) -> bool {
 /// Whether bloom with these values leaves every pixel as it was.
 pub(crate) fn bloom_changes_nothing(values: &[[f32; 3]]) -> bool {
     value(&BLOOM, values, "intensity")[0] <= 0.0 || value(&BLOOM, values, "tint") == [0.0; 3]
+}
+
+/// Whether the lens with these values leaves every pixel as it was.
+pub(crate) fn lens_changes_nothing(values: &[[f32; 3]]) -> bool {
+    ["aberration", "vignette", "halo"].iter().all(|name| value(&LENS, values, name)[0] <= 0.0)
+}
+
+/// Whether the lens with these values reads the bloom chain.
+pub(crate) fn lens_wants_chain(values: &[[f32; 3]]) -> bool {
+    value(&LENS, values, "halo")[0] > 0.0
+}
+
+/// Whether the sharpen with these values leaves every pixel as it was.
+pub(crate) fn sharpen_changes_nothing(values: &[[f32; 3]]) -> bool {
+    value(&SHARPEN, values, "strength")[0] <= 0.0 || value(&SHARPEN, values, "limit")[0] <= 0.0
+}
+
+/// Whether the sharpen with these values reads the depth copy.
+pub(crate) fn sharpen_wants_depth(values: &[[f32; 3]]) -> bool {
+    value(&SHARPEN, values, "depth_aware")[0] != 0.0
 }
 
 /// Half of `extent`, rounded up.
@@ -325,8 +531,20 @@ pub(crate) fn level_sizes(extent: [u32; 2]) -> [[u32; 2]; LEVELS] {
 
 /// The variants of `post.comp`, in pipeline order, with the define of each.
 #[cfg(test)]
-pub(crate) const VARIANTS: [&str; 8] =
-    ["FOCUS", "DOF_PREP", "DOF_GATHER", "DOF_COMPOSE", "BLOOM_PREFILTER", "BLOOM_DOWN", "BLOOM_UP", "BLOOM_COMPOSE"];
+pub(crate) const VARIANTS: [&str; 12] = [
+    "FOCUS",
+    "DOF_PREP",
+    "DOF_GATHER",
+    "DOF_COMPOSE",
+    "BLOOM_PREFILTER",
+    "BLOOM_DOWN",
+    "BLOOM_UP",
+    "BLOOM_COMPOSE",
+    "LENS",
+    "STAGE_COPY",
+    "STAGE_STORE",
+    "SHARPEN",
+];
 const FOCUS: usize = 0;
 const DOF_PREP: usize = 1;
 const DOF_GATHER: usize = 2;
@@ -335,9 +553,13 @@ const BLOOM_PREFILTER: usize = 4;
 const BLOOM_DOWN: usize = 5;
 const BLOOM_UP: usize = 6;
 const BLOOM_COMPOSE: usize = 7;
+const LENS_PASS: usize = 8;
+const STAGE_COPY: usize = 9;
+const STAGE_STORE: usize = 10;
+const SHARPEN_PASS: usize = 11;
 
 /// `post.comp` with each define, as build.rs made them.
-pub(crate) const SPIRV: [&[u32]; 8] = [
+pub(crate) const SPIRV: [&[u32]; 12] = [
     include!(concat!(env!("OUT_DIR"), "/ssr_post_focus.spv.rs")),
     include!(concat!(env!("OUT_DIR"), "/ssr_post_dof_prep.spv.rs")),
     include!(concat!(env!("OUT_DIR"), "/ssr_post_dof_gather.spv.rs")),
@@ -346,6 +568,10 @@ pub(crate) const SPIRV: [&[u32]; 8] = [
     include!(concat!(env!("OUT_DIR"), "/ssr_post_bloom_down.spv.rs")),
     include!(concat!(env!("OUT_DIR"), "/ssr_post_bloom_up.spv.rs")),
     include!(concat!(env!("OUT_DIR"), "/ssr_post_bloom_compose.spv.rs")),
+    include!(concat!(env!("OUT_DIR"), "/ssr_post_lens.spv.rs")),
+    include!(concat!(env!("OUT_DIR"), "/ssr_post_stage_copy.spv.rs")),
+    include!(concat!(env!("OUT_DIR"), "/ssr_post_stage_store.spv.rs")),
+    include!(concat!(env!("OUT_DIR"), "/ssr_post_sharpen.spv.rs")),
 ];
 
 // ------------------------------------------------------------- our objects
@@ -361,17 +587,26 @@ const SET_DOWN: usize = 4;
 /// Four: level i + 1 into level i.
 const SET_UP: usize = 8;
 const SET_BLOOM_COMPOSE: usize = 12;
-pub(crate) const PASS_SETS: usize = 13;
+/// The lens: the bloom chain's second and fourth levels in, the staging
+/// image out.
+const SET_LENS: usize = 13;
+/// The staging image read (the sharpen after the lens, the store).
+const SET_STAGE_READ: usize = 14;
+/// The staging image written (the copy before a sharpen).
+const SET_STAGE_WRITE: usize = 15;
+pub(crate) const PASS_SETS: usize = 16;
 
 /// Sets of images the post pool holds the pass sets of: the current one and
 /// those retired after a resize that frames in flight may still use.
 const MAX_IMAGE_SETS: u32 = 24;
 
 /// The images of one scene size: the depth of field's half-resolution
-/// preparation and blur, the bloom chain, and their pass sets.
+/// preparation and blur, the bloom chain, the full-resolution staging image
+/// of the lens and the sharpen, and their pass sets.
 pub(crate) struct PostImages {
     pub(super) prep: Owned,
     pub(super) gather: Owned,
+    pub(super) stage: Owned,
     pub(super) levels: [Owned; LEVELS],
     pub(super) sizes: [[u32; 2]; LEVELS],
     pub(super) sets: [u64; PASS_SETS],
@@ -379,7 +614,7 @@ pub(crate) struct PostImages {
 
 impl PostImages {
     pub(crate) fn images(&self) -> impl Iterator<Item = u64> + '_ {
-        [self.prep.image, self.gather.image].into_iter().chain(self.levels.iter().map(|l| l.image))
+        [self.prep.image, self.gather.image, self.stage.image].into_iter().chain(self.levels.iter().map(|l| l.image))
     }
 }
 
@@ -388,8 +623,8 @@ impl PostImages {
 pub(crate) struct PostGpu {
     pub(super) set_layout: u64,
     pub(super) pipeline_layout: u64,
-    pub(super) shaders: [u64; 8],
-    pub(super) pipelines: [u64; 8],
+    pub(super) shaders: [u64; 12],
+    pub(super) pipelines: [u64; 12],
     pub(super) pool: u64,
     /// The focus distance, kept from frame to frame (1x1 R32F).
     pub(super) focus: Owned,
@@ -518,6 +753,7 @@ impl Gpu {
         }
         self.destroy_owned(&p.prep);
         self.destroy_owned(&p.gather);
+        self.destroy_owned(&p.stage);
         for l in &p.levels {
             self.destroy_owned(l);
         }
@@ -529,6 +765,7 @@ impl Gpu {
         let mut p = PostImages {
             prep: Owned::default(),
             gather: Owned::default(),
+            stage: Owned::default(),
             levels: Default::default(),
             sizes: level_sizes(extent),
             sets: [0; PASS_SETS],
@@ -547,11 +784,12 @@ impl Gpu {
         let usage = USAGE_STORAGE | USAGE_SAMPLED;
         self.make_image(&mut p.prep, half(extent), FORMAT_R16G16B16A16_SFLOAT, usage)?;
         self.make_image(&mut p.gather, half(extent), FORMAT_R16G16B16A16_SFLOAT, usage)?;
+        self.make_image(&mut p.stage, extent, FORMAT_R16G16B16A16_SFLOAT, usage)?;
         for i in 0..LEVELS {
             let size = p.sizes[i];
             self.make_image(&mut p.levels[i], size, FORMAT_R16G16B16A16_SFLOAT, usage)?;
         }
-        let (prep, gather) = (p.prep.view, p.gather.view);
+        let (prep, gather, stage) = (p.prep.view, p.gather.view, p.stage.view);
         let level = |i: usize| p.levels[i].view;
         // What each set reads (binding 0), writes (1) and reads besides (2).
         // Every binding is written with something valid, the ones a variant
@@ -566,6 +804,9 @@ impl Gpu {
             wanted[SET_UP + i] = (level(i + 1), level(i), prep);
         }
         wanted[SET_BLOOM_COMPOSE] = (level(0), prep, prep);
+        wanted[SET_LENS] = (level(1), stage, level(3));
+        wanted[SET_STAGE_READ] = (stage, prep, prep);
+        wanted[SET_STAGE_WRITE] = (prep, stage, prep);
         for (i, &(input, output, aux)) in wanted.iter().enumerate() {
             p.sets[i] = self.pass_set(input, output, aux)?;
         }
@@ -665,6 +906,16 @@ pub(super) fn record_dof(g: &Gpu, cmd: *mut c_void, frame_set: u64, images: &Pos
 
 /// The bloom, into our result image.
 pub(super) fn record_bloom(g: &Gpu, cmd: *mut c_void, frame_set: u64, images: &PostImages, p: &PostParams) {
+    record_bloom_chain(g, cmd, frame_set, images, p);
+    let r = Rec { g, cmd, frame_set, images };
+    let mut p = *p;
+    p.dst_size = images.sizes[0];
+    r.dispatch(BLOOM_COMPOSE, SET_BLOOM_COMPOSE, &p, groups(p.size));
+}
+
+/// The bloom chain alone, every level merged with the coarser ones: the
+/// bloom's, and the lens's fringe's when the bloom is off.
+pub(super) fn record_bloom_chain(g: &Gpu, cmd: *mut c_void, frame_set: u64, images: &PostImages, p: &PostParams) {
     let r = Rec { g, cmd, frame_set, images };
     let mut p = *p;
     let sizes = images.sizes;
@@ -678,8 +929,33 @@ pub(super) fn record_bloom(g: &Gpu, cmd: *mut c_void, frame_set: u64, images: &P
         p.dst_size = sizes[i];
         r.dispatch(BLOOM_UP, SET_UP + i, &p, groups(sizes[i]));
     }
-    p.dst_size = sizes[0];
-    r.dispatch(BLOOM_COMPOSE, SET_BLOOM_COMPOSE, &p, groups(p.size));
+}
+
+/// The lens, from the scene (and the bloom chain, which must have been
+/// recorded this frame when `p.halo` is above 0) into the staging image;
+/// with `store`, then into our result image, for when no sharpen follows.
+pub(super) fn record_lens(g: &Gpu, cmd: *mut c_void, frame_set: u64, images: &PostImages, p: &PostParams, store: bool) {
+    let r = Rec { g, cmd, frame_set, images };
+    r.dispatch(LENS_PASS, SET_LENS, p, groups(p.size));
+    if store {
+        r.dispatch(STAGE_STORE, SET_STAGE_READ, p, groups(p.size));
+    }
+}
+
+/// The sharpen, into our result image. `staged`: the scene is already in
+/// the staging image (the lens wrote it). Otherwise, when `p.flags` says
+/// the scene is in our result image, it is copied to the staging image
+/// first, as the sharpen reads neighbours of the pixel it writes.
+pub(super) fn record_sharpen(g: &Gpu, cmd: *mut c_void, frame_set: u64, images: &PostImages, p: &PostParams, staged: bool) {
+    let r = Rec { g, cmd, frame_set, images };
+    let mut p = *p;
+    if staged {
+        p.flags |= SRC_STAGE;
+    } else if p.flags & SRC_RESULT != 0 {
+        r.dispatch(STAGE_COPY, SET_STAGE_WRITE, &p, groups(p.size));
+        p.flags |= SRC_STAGE;
+    }
+    r.dispatch(SHARPEN_PASS, SET_STAGE_READ, &p, groups(p.size));
 }
 
 /// The barrier that moves a fresh focus image out of `UNDEFINED`, once.
@@ -699,8 +975,11 @@ mod tests {
     fn the_push_constants_have_the_std430_layout() {
         use std::mem::{offset_of, size_of};
         // As spirv-dis prints post.comp's block.
-        assert_eq!(size_of::<PostParams>(), 76);
+        assert_eq!(size_of::<PostParams>(), 96);
         assert_eq!(offset_of!(PostParams, far_range), 72);
+        assert_eq!(offset_of!(PostParams, aberration), 76);
+        assert_eq!(offset_of!(PostParams, halo), 84);
+        assert_eq!(offset_of!(PostParams, sharpen_limit), 92);
         assert_eq!(offset_of!(PostParams, dst_size), 8);
         assert_eq!(offset_of!(PostParams, tint), 16);
         assert_eq!(offset_of!(PostParams, flags), 32);
@@ -711,16 +990,19 @@ mod tests {
 
     #[test]
     fn parameters_from_the_knobs() {
-        let dof: Vec<[f32; 3]> = DOF_KNOBS.iter().map(|k| k.default).collect();
-        let bloom: Vec<[f32; 3]> = BLOOM_KNOBS.iter().map(|k| k.default).collect();
-        let p = post_params([1920, 1080], &dof, &bloom, 1, 0.0);
-        assert_eq!((p.size, p.dst_size, p.flags), ([1920, 1080], [960, 540], (1 << 8) | AUTOFOCUS | FOCUS_PAST));
+        let all = PostValues::defaults();
+        let (dof, bloom) = (all.dof.clone(), all.bloom.clone());
+        let p = post_params([1920, 1080], &all, 1, 0.0);
+        assert_eq!((p.size, p.dst_size, p.flags), ([1920, 1080], [960, 540], (1 << 8) | AUTOFOCUS | FOCUS_PAST | DEPTH_AWARE));
+        assert_eq!((p.aberration, p.vignette, p.halo), (ABERRATION, VIGNETTE, HALO));
+        assert_eq!((p.sharpen, p.sharpen_limit), (SHARPEN_STRENGTH, SHARPEN_LIMIT));
         assert_eq!(p.far_range, FAR_RANGE);
         assert!((p.coc_scale - STRENGTH * 0.5).abs() < 1e-6, "strength is a radius at 1080p, in half pixels");
         assert_eq!((p.focus_blend, p.samples, p.focus_range), (0.0, 48, FOCUS_RANGE));
         assert!((p.focus_fixed - 200.0).abs() < 1e-3, "20 studs over a near plane of 0.1");
         assert_eq!((p.threshold, p.knee, p.intensity, p.radius, p.tint), (THRESHOLD, KNEE, BLOOM_INTENSITY, RADIUS, [1.0; 4]));
-        let p = post_params([1667, 1349], &dof, &bloom, 0, 0.3);
+        let p = post_params([1667, 1349], &all, 0, 0.3);
+        assert!((p.aberration - ABERRATION * 1349.0 / 1080.0).abs() < 1e-5, "the aberration is in pixels at 1080p");
         assert!((p.coc_scale - STRENGTH * 1349.0 / 1080.0 * 0.5).abs() < 1e-5, "scaled with the height");
         assert!((p.focus_blend - (1.0 - (-1.0f32).exp())).abs() < 1e-6, "63% of the way after focus_time");
         assert_eq!(p.dst_size, [834, 675]);
@@ -729,7 +1011,10 @@ mod tests {
         dof2[DOF_KNOBS.iter().position(|k| k.name == "near_blur").unwrap()] = [1.0; 3];
         dof2[DOF_KNOBS.iter().position(|k| k.name == "focus_mode").unwrap()] = [0.0; 3];
         dof2[DOF_KNOBS.iter().position(|k| k.name == "focus_time").unwrap()] = [0.0; 3];
-        let p = post_params([8, 8], &dof2, &bloom, 2, 0.0);
+        let mut other = all.clone();
+        other.dof = dof2.clone();
+        other.sharpen[SHARPEN_KNOBS.iter().position(|k| k.name == "depth_aware").unwrap()] = [0.0; 3];
+        let p = post_params([8, 8], &other, 2, 0.0);
         assert_eq!((p.flags, p.focus_blend), ((2 << 8) | NEAR_BLUR, 1.0));
 
         assert!(!dof_changes_nothing(&dof) && !bloom_changes_nothing(&bloom));
@@ -741,6 +1026,20 @@ mod tests {
         let mut bloom3 = bloom.clone();
         bloom3[BLOOM_KNOBS.iter().position(|k| k.name == "tint").unwrap()] = [0.0; 3];
         assert!(bloom_changes_nothing(&bloom3));
+
+        assert!(!lens_changes_nothing(&all.lens) && lens_wants_chain(&all.lens));
+        assert!(!sharpen_changes_nothing(&all.sharpen) && sharpen_wants_depth(&all.sharpen));
+        let mut lens = all.lens.clone();
+        lens[2] = [0.0; 3];
+        assert!(!lens_changes_nothing(&lens) && !lens_wants_chain(&lens), "no halo, no chain");
+        lens[0] = [0.0; 3];
+        lens[1] = [0.0; 3];
+        assert!(lens_changes_nothing(&lens));
+        for i in 0..2 {
+            let mut sharpen = all.sharpen.clone();
+            sharpen[i] = [0.0; 3];
+            assert!(sharpen_changes_nothing(&sharpen), "{}", SHARPEN_KNOBS[i].name);
+        }
     }
 
     #[test]

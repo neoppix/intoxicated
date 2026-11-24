@@ -19,12 +19,19 @@
 #include <QStandardPaths>
 
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/file.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/user.h>
+#include <libutil.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <cerrno>
 #include <climits>
+#include <cstdlib>
+#include <cstring>
 
 namespace intox {
 
@@ -610,7 +617,120 @@ bool profileInUse(const QString &dir) {
 }
 
 bool profileSignedIn(const QString &dir) {
-    return QFileInfo::exists(dir + QStringLiteral("/cookies"));
+    // The client keeps the engine's cookies before anyone signs in, so the
+    // jar alone is not a session; identity is written on sign-in and erased
+    // on sign-out.
+    return QFileInfo::exists(dir + QStringLiteral("/cookies")) && QFileInfo::exists(dir + QStringLiteral("/identity"));
+}
+
+bool processHasOpen(qint64 pid, const QString &file) {
+    if (pid <= 0 || pid > INT_MAX)
+        return false;
+    struct stat st;
+    if (::stat(QFile::encodeName(file).constData(), &st) != 0)
+        return false;
+    int count = 0;
+    // Another user's process, or one that is gone, gives nothing.
+    struct kinfo_file *files = ::kinfo_getfile(pid_t(pid), &count);
+    if (!files)
+        return false;
+    bool found = false;
+    for (int i = 0; i < count && !found; ++i) {
+        const struct kinfo_file &f = files[i];
+        found = f.kf_type == KF_TYPE_VNODE && f.kf_un.kf_file.kf_file_fsid == uint64_t(st.st_dev) &&
+                f.kf_un.kf_file.kf_file_fileid == uint64_t(st.st_ino);
+    }
+    std::free(files);
+    return found;
+}
+
+std::optional<qint64> clientPid(const QString &dir) {
+    QFile file(dir + QLatin1Char('/') + kClientPidFile);
+    if (!file.open(QIODevice::ReadOnly))
+        return std::nullopt;
+    const QByteArray text = file.read(32).trimmed();
+    bool ok = false;
+    const qint64 pid = text.toLongLong(&ok);
+    if (!ok || pid <= 1)
+        return std::nullopt;
+    // Only while that very process holds the profile's lock file open: a file
+    // a crashed client left, or a pid used again since, names nothing.
+    if (!processHasOpen(pid, dir + QStringLiteral("/.lock")))
+        return std::nullopt;
+    return pid;
+}
+
+QList<RunningClient> runningClients() {
+    SettingsConf conf;
+    conf.load(settingsConfPath());
+    QList<RunningClient> out;
+    for (const ProfileInfo &p : listProfiles(defaultProfileName(conf))) {
+        if (!p.inUse)
+            continue;
+        RunningClient c;
+        c.profile = p.name;
+        c.pid = clientPid(profileDir(p.name)).value_or(-1);
+        out.append(c);
+    }
+    return out;
+}
+
+LaunchCommand launchCommand(const QString &profile, const QString &link) {
+    LaunchCommand c;
+    c.program = launcherPath();
+    if (!link.isEmpty())
+        c.arguments.append(link);
+    c.environment = QProcessEnvironment::systemEnvironment();
+    c.environment.insert(QStringLiteral("INTOXICATED_PROFILE"), profile);
+    return c;
+}
+
+bool startClient(const QString &profile, const QString &link, QString *error) {
+    if (!isValidProfileName(profile)) {
+        *error = QStringLiteral("%1 is not a profile name.").arg(profile);
+        return false;
+    }
+    if (profileInUse(profileDir(profile))) {
+        *error = QStringLiteral("Profile %1 is already open in a client.").arg(profile);
+        return false;
+    }
+    const LaunchCommand c = launchCommand(profile, link);
+    if (!QFileInfo(c.program).isExecutable()) {
+        *error = QStringLiteral("intoxicated was not found on PATH or in /usr/local/bin.");
+        return false;
+    }
+    QProcess process;
+    process.setProgram(c.program);
+    process.setArguments(c.arguments);
+    process.setProcessEnvironment(c.environment);
+    process.setWorkingDirectory(QDir::homePath());
+    process.setStandardInputFile(QProcess::nullDevice());
+    if (!process.startDetached()) {
+        *error = QStringLiteral("%1 could not be started: %2").arg(c.program, process.errorString());
+        return false;
+    }
+    return true;
+}
+
+bool stopClient(const QString &profile, QString *error) {
+    if (!isValidProfileName(profile)) {
+        *error = QStringLiteral("%1 is not a profile name.").arg(profile);
+        return false;
+    }
+    const std::optional<qint64> pid = clientPid(profileDir(profile));
+    if (!pid) {
+        *error = profileInUse(profileDir(profile))
+                     ? QStringLiteral("The client on %1 has not said which process it is; close its window instead.")
+                           .arg(profile)
+                     : QStringLiteral("No client runs on profile %1.").arg(profile);
+        return false;
+    }
+    // SIGTERM: the client leaves through its normal teardown, as on Ctrl-C.
+    if (::kill(pid_t(*pid), SIGTERM) != 0) {
+        *error = QStringLiteral("Process %1 could not be stopped: %2").arg(*pid).arg(QString::fromLocal8Bit(std::strerror(errno)));
+        return false;
+    }
+    return true;
 }
 
 QList<ProfileInfo> listProfiles(const QString &extra) {
@@ -1015,17 +1135,154 @@ bool parseShaderTables(const QByteArray &json, QList<SsrTable> *out, QString *er
     return true;
 }
 
-std::optional<QList<SsrTable>> readShaderTables(QString *error) {
+bool effectsUnavailable(const QByteArray &json) {
+    const QJsonDocument doc = QJsonDocument::fromJson(json);
+    if (!doc.isObject())
+        return false;
+    const QJsonValue available = doc.object().value(QStringLiteral("available"));
+    return available.isBool() && !available.toBool();
+}
+
+bool rayTracingBuilt(const QByteArray &json) {
+    const QJsonDocument doc = QJsonDocument::fromJson(json);
+    if (!doc.isObject())
+        return false;
+    const QJsonValue rt = doc.object().value(QStringLiteral("ray_tracing"));
+    return rt.isBool() && rt.toBool();
+}
+
+std::optional<QList<SsrTable>> readShaderTables(QString *error, QList<ShaderMode> *modes, bool *unavailable,
+                                                bool *rayTracing) {
+    if (unavailable)
+        *unavailable = false;
+    if (rayTracing)
+        *rayTracing = false;
     const auto out = runLauncher({QStringLiteral("--shader-looks")}, 10000, error);
     if (!out)
         return std::nullopt;
+    if (rayTracing)
+        *rayTracing = rayTracingBuilt(*out);
+    if (effectsUnavailable(*out)) {
+        if (unavailable)
+            *unavailable = true;
+        *error = QStringLiteral("this Intoxicated was built without visual effects; %1 adds them")
+                     .arg(kAddEffectsCommand);
+        return std::nullopt;
+    }
     QList<SsrTable> tables;
+    QList<ShaderMode> parsedModes;
     QString parseError;
-    if (!parseShaderTables(*out, &tables, &parseError)) {
+    if (!parseShaderTables(*out, &tables, &parseError) || !parseShaderModes(*out, tables, &parsedModes, &parseError)) {
         *error = QStringLiteral("intoxicated --shader-looks printed something else: %1").arg(parseError);
         return std::nullopt;
     }
+    if (modes)
+        *modes = parsedModes;
     return tables;
+}
+
+bool parseShaderModes(const QByteArray &json, const QList<SsrTable> &tables, QList<ShaderMode> *out, QString *error) {
+    const auto fail = [&](const QString &why) {
+        if (error)
+            *error = why;
+        return false;
+    };
+    const QJsonObject root = QJsonDocument::fromJson(json).object();
+    QList<ShaderMode> modes;
+    if (!root.contains(QStringLiteral("modes"))) {
+        *out = modes;
+        return true;
+    }
+    if (root.value(QStringLiteral("mode_env")).toString() != kShaderModeSetting)
+        return fail(QStringLiteral("the modes name another variable than %1").arg(kShaderModeSetting));
+    static const QRegularExpression modeName(QStringLiteral("^[a-z0-9_]+$"));
+    for (const QJsonValue &v : root.value(QStringLiteral("modes")).toArray()) {
+        const QJsonObject o = v.toObject();
+        ShaderMode m;
+        m.name = o.value(QStringLiteral("name")).toString();
+        m.title = o.value(QStringLiteral("title")).toString();
+        m.description = o.value(QStringLiteral("description")).toString();
+        if (!modeName.match(m.name).hasMatch() || m.title.isEmpty() || findShaderMode(modes, m.name))
+            return fail(QStringLiteral("a mode without a usable name or title: %1").arg(m.name));
+        const QJsonObject effects = o.value(QStringLiteral("effects")).toObject();
+        for (const SsrTable &t : tables) {
+            const QJsonObject e = effects.value(t.name).toObject();
+            const QString look = e.value(QStringLiteral("look")).toString();
+            if (!e.value(QStringLiteral("on")).isBool() || !t.look(look))
+                return fail(QStringLiteral("mode %1 has no usable switch and look for %2").arg(m.name, t.name));
+            m.effects.insert(t.name, {e.value(QStringLiteral("on")).toBool(), look});
+        }
+        modes.append(m);
+    }
+    *out = modes;
+    return true;
+}
+
+const ShaderMode *findShaderMode(const QList<ShaderMode> &modes, const QString &name) {
+    for (const ShaderMode &m : modes) {
+        if (m.name == name)
+            return &m;
+    }
+    return nullptr;
+}
+
+bool expandShaderMode(const QList<SsrTable> &tables, const QList<ShaderMode> &modes, SettingsConf &conf) {
+    const auto line = conf.value(kShaderModeSetting);
+    if (!line)
+        return false;
+    // A name that is no mode the client ignores, so it is dropped as it is.
+    if (const ShaderMode *m = findShaderMode(modes, line->trimmed())) {
+        const auto unset = [&](const QString &key) { return conf.value(key).value_or(QString()).trimmed().isEmpty(); };
+        for (const SsrTable &t : tables) {
+            if (!m->effects.contains(t.name))
+                continue;
+            const auto [on, look] = m->effects.value(t.name);
+            if (unset(t.switchEnv))
+                setEffectOn(t.switchEnv, conf, on);
+            if (unset(t.lookEnv)) {
+                if (look == t.defaultLook)
+                    conf.remove(t.lookEnv);
+                else
+                    conf.set(t.lookEnv, look);
+            }
+        }
+    }
+    conf.remove(kShaderModeSetting);
+    return true;
+}
+
+QString currentShaderMode(const QList<SsrTable> &tables, const QList<ShaderMode> &modes, const SettingsConf &conf) {
+    SettingsConf c = conf;
+    expandShaderMode(tables, modes, c);
+    for (const ShaderMode &m : modes) {
+        bool all = true;
+        for (const SsrTable &t : tables) {
+            const auto [on, look] = m.effects.value(t.name, {false, t.defaultLook});
+            const bool isOn = effectOn(t.switchEnv, c);
+            QString unknown;
+            if (isOn != on || (on && (ssrLook(t, c, &unknown) != look || !unknown.isEmpty() || !ssrOverrides(t, c).isEmpty()))) {
+                all = false;
+                break;
+            }
+        }
+        if (all)
+            return m.name;
+    }
+    return QString();
+}
+
+bool applyShaderMode(const QList<SsrTable> &tables, const QList<ShaderMode> &modes, SettingsConf &conf,
+                     const QString &mode) {
+    const ShaderMode *m = findShaderMode(modes, mode);
+    if (!m)
+        return false;
+    conf.remove(kShaderModeSetting);
+    for (const SsrTable &t : tables) {
+        const auto [on, look] = m->effects.value(t.name, {false, t.defaultLook});
+        setEffectOn(t.switchEnv, conf, on);
+        applySsrLook(t, conf, look);
+    }
+    return true;
 }
 
 std::optional<SsrTable> readSsrTable(QString *error) {
@@ -1039,6 +1296,26 @@ std::optional<SsrTable> readSsrTable(QString *error) {
         return std::nullopt;
     }
     return table;
+}
+
+QStringList knobChoices(const QString &effect, const SsrKnob &knob) {
+    struct Choices {
+        const char *effect;
+        const char *knob;
+        QStringList titles;
+    };
+    static const Choices kChoices[] = {
+        {"dof", "focus_mode",
+         {QStringLiteral("Fixed distance"), QStringLiteral("Character"), QStringLiteral("Past the character")}},
+    };
+    for (const Choices &c : kChoices) {
+        if (effect != QLatin1String(c.effect) || knob.name != QLatin1String(c.knob))
+            continue;
+        if (knob.kind != SsrKind::Whole || knob.min != 0 || knob.max != c.titles.size() - 1)
+            return {};
+        return c.titles;
+    }
+    return {};
 }
 
 QString ssrLookTitle(const QString &name) {
@@ -1147,12 +1424,34 @@ QStringList rtWarnings() {
         QStringLiteral("Interface drawn in the world, such as leaderboards and name tags, does not reflect."),
         QStringLiteral("Reflections can flicker while the camera moves."),
         QStringLiteral("Objects the game has never drawn cannot appear in a reflection."),
-        QStringLiteral("Uses up to an eighth of the video memory (at most about 1.6 GB, INTOXICATED_RT_MEMORY in MiB sets it) and about 1 to 2 ms more GPU time a frame."),
+        QStringLiteral("Uses up to an eighth of the video memory (at most about 1.6 GB, INTOXICATED_RT_MEMORY in MiB sets it) and about 3 to 6 ms more GPU time a frame with the indirect light."),
         QStringLiteral("Runs as compute on the shader cores, because NVIDIA's FreeBSD driver has no hardware ray "
                        "tracing."),
         QStringLiteral("May crash or misbehave on other GPUs and drivers: only tested on an RTX 4070 Ti with NVIDIA "
                        "620.70.06."),
     };
+}
+
+bool effectsHotkeyOn(const SettingsConf &conf) {
+    const auto v = conf.value(kEffectsHotkeySetting);
+    if (!v)
+        return false;
+    const QString value = v->trimmed();
+    if (value == QLatin1String("1"))
+        return true;
+    // F1 to F12 as the client reads them, but F11, the window's fullscreen key.
+    if (value.size() < 2 || value[0].toUpper() != QLatin1Char('F'))
+        return false;
+    bool number = false;
+    const int n = value.mid(1).toInt(&number);
+    return number && n >= 1 && n <= 12 && n != 11;
+}
+
+void setEffectsHotkeyOn(SettingsConf &conf, bool on) {
+    if (!on)
+        conf.remove(kEffectsHotkeySetting);
+    else if (!effectsHotkeyOn(conf))
+        conf.set(kEffectsHotkeySetting, QStringLiteral("1"));
 }
 
 bool ssrOn(const SettingsConf &conf) { return effectOn(kSsrSetting, conf); }
@@ -1219,5 +1518,366 @@ bool setSsrKnob(SettingsConf &conf, const SsrKnob &knob, const SsrValue &value) 
 }
 
 void resetSsrKnob(SettingsConf &conf, const SsrKnob &knob) { conf.remove(knob.env); }
+
+// --- Macros ----------------------------------------------------------------
+
+QString macrosPath(const QString &profile) { return profileDir(profile) + QStringLiteral("/macros.json"); }
+
+namespace {
+
+// The step kinds as the file names them, and the client reads them.
+struct KindName {
+    StepKind kind;
+    const char *name;
+};
+const KindName kKindNames[] = {
+    {StepKind::Tap, "tap"},         {StepKind::KeyDown, "keydown"},       {StepKind::KeyUp, "keyup"},
+    {StepKind::Move, "move"},       {StepKind::Click, "click"},           {StepKind::ButtonDown, "buttondown"},
+    {StepKind::ButtonUp, "buttonup"}, {StepKind::Scroll, "scroll"},       {StepKind::Text, "text"},
+    {StepKind::Wait, "wait"},
+};
+
+QString kindName(StepKind kind) {
+    for (const KindName &k : kKindNames)
+        if (k.kind == kind)
+            return QString::fromLatin1(k.name);
+    return QStringLiteral("tap");
+}
+
+std::optional<StepKind> kindFromName(const QString &name) {
+    for (const KindName &k : kKindNames)
+        if (name == QLatin1String(k.name))
+            return k.kind;
+    return std::nullopt;
+}
+
+bool isKeyStep(StepKind k) { return k == StepKind::Tap || k == StepKind::KeyDown || k == StepKind::KeyUp; }
+bool isButtonStep(StepKind k) {
+    return k == StepKind::Click || k == StepKind::ButtonDown || k == StepKind::ButtonUp;
+}
+bool isPointStep(StepKind k) { return isButtonStep(k) || k == StepKind::Move || k == StepKind::Scroll; }
+
+} // namespace
+
+const QList<KeyName> &keyNames() {
+    // A fixed, curated set: the keys a game macro usually wants, each with its
+    // Linux evdev code. The file stores the code; this names it both ways.
+    static const QList<KeyName> table = [] {
+        QList<KeyName> t;
+        const auto add = [&](int evdev, const char *label) { t.append({evdev, QString::fromLatin1(label)}); };
+        add(30, "A"); add(48, "B"); add(46, "C"); add(32, "D"); add(18, "E"); add(33, "F");
+        add(34, "G"); add(35, "H"); add(23, "I"); add(36, "J"); add(37, "K"); add(38, "L");
+        add(50, "M"); add(49, "N"); add(24, "O"); add(25, "P"); add(16, "Q"); add(19, "R");
+        add(31, "S"); add(20, "T"); add(22, "U"); add(47, "V"); add(17, "W"); add(45, "X");
+        add(21, "Y"); add(44, "Z");
+        add(2, "1"); add(3, "2"); add(4, "3"); add(5, "4"); add(6, "5"); add(7, "6");
+        add(8, "7"); add(9, "8"); add(10, "9"); add(11, "0");
+        add(57, "Space"); add(28, "Enter"); add(15, "Tab"); add(1, "Escape"); add(14, "Backspace");
+        add(58, "Caps Lock"); add(29, "Left Ctrl"); add(97, "Right Ctrl"); add(42, "Left Shift");
+        add(54, "Right Shift"); add(56, "Left Alt"); add(100, "Right Alt");
+        add(103, "Up"); add(108, "Down"); add(105, "Left"); add(106, "Right");
+        add(110, "Insert"); add(111, "Delete"); add(102, "Home"); add(107, "End");
+        add(104, "Page Up"); add(109, "Page Down");
+        add(12, "Minus"); add(13, "Equals"); add(26, "Left Bracket"); add(27, "Right Bracket");
+        add(39, "Semicolon"); add(40, "Quote"); add(41, "Backtick"); add(43, "Backslash");
+        add(51, "Comma"); add(52, "Period"); add(53, "Slash");
+        add(59, "F1"); add(60, "F2"); add(61, "F3"); add(62, "F4"); add(63, "F5"); add(64, "F6");
+        add(65, "F7"); add(66, "F8"); add(67, "F9"); add(68, "F10"); add(87, "F11"); add(88, "F12");
+        return t;
+    }();
+    return table;
+}
+
+QString keyLabel(int evdev) {
+    for (const KeyName &k : keyNames())
+        if (k.evdev == evdev)
+            return k.label;
+    return QStringLiteral("Key %1").arg(evdev);
+}
+
+int keyEvdev(const QString &label) {
+    for (const KeyName &k : keyNames())
+        if (k.label == label)
+            return k.evdev;
+    return -1;
+}
+
+QString checkMacroName(const QString &name) {
+    if (name.trimmed().isEmpty())
+        return QStringLiteral("A macro needs a name.");
+    return QString();
+}
+
+QString checkMacro(const MacroDef &m) {
+    if (const QString why = checkMacroName(m.name); !why.isEmpty())
+        return why;
+    if (m.triggerEvdev < 1 || m.triggerEvdev > 255)
+        return QStringLiteral("Pick a trigger key.");
+    if (m.steps.isEmpty())
+        return QStringLiteral("A macro needs at least one step.");
+    for (int i = 0; i < m.steps.size(); ++i) {
+        const MacroStep &s = m.steps[i];
+        if (isKeyStep(s.kind) && (s.evdev < 1 || s.evdev > 255))
+            return QStringLiteral("Step %1 has no key.").arg(i + 1);
+        if (s.kind == StepKind::Text && s.text.isEmpty())
+            return QStringLiteral("Step %1 has no text.").arg(i + 1);
+    }
+    return QString();
+}
+
+QString describeStep(const MacroStep &step) {
+    const auto mods = [&] {
+        QStringList m;
+        if (step.ctrl)
+            m << QStringLiteral("Ctrl");
+        if (step.shift)
+            m << QStringLiteral("Shift");
+        if (step.alt)
+            m << QStringLiteral("Alt");
+        m << keyLabel(step.evdev);
+        return m.join(QStringLiteral(" + "));
+    };
+    const auto button = [&] {
+        switch (step.button) {
+        case 2:
+            return QStringLiteral("right");
+        case 3:
+            return QStringLiteral("middle");
+        default:
+            return QStringLiteral("left");
+        }
+    };
+    const QString xy = QStringLiteral("%1, %2").arg(step.x).arg(step.y);
+    switch (step.kind) {
+    case StepKind::Tap:
+        return QStringLiteral("Tap  %1").arg(mods());
+    case StepKind::KeyDown:
+        return QStringLiteral("Hold  %1").arg(mods());
+    case StepKind::KeyUp:
+        return QStringLiteral("Release  %1").arg(mods());
+    case StepKind::Move:
+        return QStringLiteral("Move  %1").arg(xy);
+    case StepKind::Click:
+        return QStringLiteral("Click %1  at %2").arg(button(), xy);
+    case StepKind::ButtonDown:
+        return QStringLiteral("Press %1  at %2").arg(button(), xy);
+    case StepKind::ButtonUp:
+        return QStringLiteral("Let go %1  at %2").arg(button(), xy);
+    case StepKind::Scroll:
+        return QStringLiteral("Scroll  %1 at %2").arg(step.detents).arg(xy);
+    case StepKind::Text:
+        return QStringLiteral("Type  \"%1\"").arg(step.text);
+    case StepKind::Wait:
+        return QStringLiteral("Wait  %1 ms").arg(step.ms);
+    }
+    return QString();
+}
+
+namespace {
+
+std::optional<MacroStep> parseStep(const QJsonObject &o, QString *why) {
+    const auto fail = [&](const QString &m) -> std::optional<MacroStep> {
+        if (why)
+            *why = m;
+        return std::nullopt;
+    };
+    const std::optional<StepKind> kind = kindFromName(o.value(QStringLiteral("type")).toString());
+    if (!kind)
+        return fail(QStringLiteral("unknown step type %1").arg(o.value(QStringLiteral("type")).toString()));
+    MacroStep s;
+    s.kind = *kind;
+    if (isKeyStep(s.kind)) {
+        if (!o.value(QStringLiteral("key")).isDouble())
+            return fail(QStringLiteral("a key step needs a \"key\" code"));
+        s.evdev = o.value(QStringLiteral("key")).toInt();
+        if (s.evdev < 1 || s.evdev > 255)
+            return fail(QStringLiteral("key %1 is not an evdev code 1..255").arg(s.evdev));
+        s.ctrl = o.value(QStringLiteral("ctrl")).toBool();
+        s.shift = o.value(QStringLiteral("shift")).toBool();
+        s.alt = o.value(QStringLiteral("alt")).toBool();
+    }
+    if (isPointStep(s.kind)) {
+        if (!o.value(QStringLiteral("x")).isDouble() || !o.value(QStringLiteral("y")).isDouble())
+            return fail(QStringLiteral("this step needs \"x\" and \"y\""));
+        s.x = o.value(QStringLiteral("x")).toDouble();
+        s.y = o.value(QStringLiteral("y")).toDouble();
+    }
+    if (isButtonStep(s.kind))
+        s.button = o.contains(QStringLiteral("button")) ? o.value(QStringLiteral("button")).toInt() : 1;
+    if (s.kind == StepKind::Scroll) {
+        if (!o.value(QStringLiteral("detents")).isDouble())
+            return fail(QStringLiteral("a scroll needs \"detents\""));
+        s.detents = o.value(QStringLiteral("detents")).toDouble();
+    }
+    if (s.kind == StepKind::Text) {
+        s.text = o.value(QStringLiteral("text")).toString();
+        if (s.text.isEmpty())
+            return fail(QStringLiteral("empty text"));
+    }
+    if (s.kind == StepKind::Wait) {
+        if (!o.value(QStringLiteral("ms")).isDouble())
+            return fail(QStringLiteral("a wait needs \"ms\""));
+        const double ms = o.value(QStringLiteral("ms")).toDouble();
+        s.ms = quint64(qBound(0.0, ms, 3600000.0));
+    }
+    return s;
+}
+
+std::optional<MacroDef> parseMacro(const QJsonValue &value, QString *why) {
+    const auto fail = [&](const QString &m) -> std::optional<MacroDef> {
+        if (why)
+            *why = m;
+        return std::nullopt;
+    };
+    if (!value.isObject())
+        return fail(QStringLiteral("each macro must be a JSON object"));
+    const QJsonObject o = value.toObject();
+    MacroDef m;
+    m.name = o.value(QStringLiteral("name")).toString().trimmed();
+    if (m.name.isEmpty())
+        return fail(QStringLiteral("a macro needs a name"));
+    const QJsonValue trig = o.value(QStringLiteral("trigger"));
+    if (!trig.isObject())
+        return fail(QStringLiteral("the trigger must be a JSON object"));
+    const QJsonObject to = trig.toObject();
+    if (!to.value(QStringLiteral("key")).isDouble())
+        return fail(QStringLiteral("the trigger needs a \"key\" code"));
+    m.triggerEvdev = to.value(QStringLiteral("key")).toInt();
+    if (m.triggerEvdev < 1 || m.triggerEvdev > 255)
+        return fail(QStringLiteral("trigger key %1 is not an evdev code 1..255").arg(m.triggerEvdev));
+    m.triggerCtrl = to.value(QStringLiteral("ctrl")).toBool();
+    m.triggerShift = to.value(QStringLiteral("shift")).toBool();
+    m.triggerAlt = to.value(QStringLiteral("alt")).toBool();
+    m.enabled = o.contains(QStringLiteral("enabled")) ? o.value(QStringLiteral("enabled")).toBool() : true;
+    m.swallow = o.value(QStringLiteral("swallow")).toBool();
+    m.repeat = o.value(QStringLiteral("repeat")).toBool();
+    const QJsonValue steps = o.value(QStringLiteral("steps"));
+    if (!steps.isArray())
+        return fail(QStringLiteral("a macro needs a \"steps\" array"));
+    const QJsonArray arr = steps.toArray();
+    for (int i = 0; i < arr.size(); ++i) {
+        QString stepWhy;
+        const auto step = parseStep(arr[i].toObject(), &stepWhy);
+        if (!step)
+            return fail(QStringLiteral("step %1: %2").arg(i + 1).arg(stepWhy));
+        m.steps.append(*step);
+    }
+    if (m.steps.isEmpty())
+        return fail(QStringLiteral("a macro needs at least one step"));
+    return m;
+}
+
+QJsonObject stepToJson(const MacroStep &s) {
+    QJsonObject o;
+    o.insert(QStringLiteral("type"), kindName(s.kind));
+    if (isKeyStep(s.kind)) {
+        o.insert(QStringLiteral("key"), s.evdev);
+        if (s.ctrl)
+            o.insert(QStringLiteral("ctrl"), true);
+        if (s.shift)
+            o.insert(QStringLiteral("shift"), true);
+        if (s.alt)
+            o.insert(QStringLiteral("alt"), true);
+    }
+    if (isPointStep(s.kind)) {
+        o.insert(QStringLiteral("x"), s.x);
+        o.insert(QStringLiteral("y"), s.y);
+    }
+    if (isButtonStep(s.kind) && s.button != 1)
+        o.insert(QStringLiteral("button"), s.button);
+    if (s.kind == StepKind::Scroll)
+        o.insert(QStringLiteral("detents"), s.detents);
+    if (s.kind == StepKind::Text)
+        o.insert(QStringLiteral("text"), s.text);
+    if (s.kind == StepKind::Wait)
+        o.insert(QStringLiteral("ms"), double(s.ms));
+    return o;
+}
+
+} // namespace
+
+bool parseMacros(const QByteArray &data, QList<MacroDef> *out, QString *error, QStringList *skipped) {
+    out->clear();
+    if (skipped)
+        skipped->clear();
+    if (data.trimmed().isEmpty())
+        return true;
+    QJsonParseError perr{};
+    const QJsonDocument doc = QJsonDocument::fromJson(data, &perr);
+    if (perr.error != QJsonParseError::NoError) {
+        if (error)
+            *error = QStringLiteral("not valid JSON: %1").arg(perr.errorString());
+        return false;
+    }
+    if (!doc.isObject()) {
+        if (error)
+            *error = QStringLiteral("the document must be a JSON object");
+        return false;
+    }
+    const QJsonValue list = doc.object().value(QStringLiteral("macros"));
+    if (list.isUndefined() || list.isNull())
+        return true;
+    if (!list.isArray()) {
+        if (error)
+            *error = QStringLiteral("\"macros\" must be an array");
+        return false;
+    }
+    const QJsonArray arr = list.toArray();
+    for (int i = 0; i < arr.size(); ++i) {
+        QString why;
+        const auto m = parseMacro(arr[i], &why);
+        if (m)
+            out->append(*m);
+        else if (skipped)
+            skipped->append(QStringLiteral("macro %1: %2").arg(i + 1).arg(why));
+    }
+    return true;
+}
+
+MacrosFile loadMacros(const QString &path) {
+    MacrosFile file;
+    QFile f(path);
+    if (!f.exists())
+        return file;
+    file.exists = true;
+    if (!f.open(QIODevice::ReadOnly)) {
+        file.error = QStringLiteral("%1: %2").arg(path, f.errorString());
+        return file;
+    }
+    if (!parseMacros(f.readAll(), &file.macros, &file.error, &file.skipped))
+        file.macros.clear();
+    return file;
+}
+
+bool saveMacros(const QString &path, const QList<MacroDef> &macros, QString *error) {
+    QJsonArray arr;
+    for (const MacroDef &m : macros) {
+        QJsonObject o;
+        o.insert(QStringLiteral("name"), m.name);
+        o.insert(QStringLiteral("enabled"), m.enabled);
+        QJsonObject trig;
+        trig.insert(QStringLiteral("key"), m.triggerEvdev);
+        if (m.triggerCtrl)
+            trig.insert(QStringLiteral("ctrl"), true);
+        if (m.triggerShift)
+            trig.insert(QStringLiteral("shift"), true);
+        if (m.triggerAlt)
+            trig.insert(QStringLiteral("alt"), true);
+        o.insert(QStringLiteral("trigger"), trig);
+        if (m.swallow)
+            o.insert(QStringLiteral("swallow"), true);
+        if (m.repeat)
+            o.insert(QStringLiteral("repeat"), true);
+        QJsonArray steps;
+        for (const MacroStep &s : m.steps)
+            steps.append(stepToJson(s));
+        o.insert(QStringLiteral("steps"), steps);
+        arr.append(o);
+    }
+    QJsonObject root;
+    root.insert(QStringLiteral("intoxicated-macros"), 1);
+    root.insert(QStringLiteral("macros"), arr);
+    return writeAtomically(path, QJsonDocument(root).toJson(QJsonDocument::Indented), error);
+}
 
 } // namespace intox

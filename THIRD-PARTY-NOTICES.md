@@ -60,6 +60,23 @@ Full text: `third_party/libjnivm/LICENSE`.
 
 ---
 
+## Phosphor Icons: MIT
+
+The icons in Intoxicated Settings (the sidebar and the buttons), from
+[`phosphor-icons/core`](https://github.com/phosphor-icons/core). The upstream
+SVGs are in [`settings/icons/`](settings/icons) with a white PNG rendered from
+each, compiled into `intoxicated-settings`.
+
+```
+MIT License
+
+Copyright (c) 2023 Phosphor Icons
+```
+
+Full text: `settings/icons/LICENSE`.
+
+---
+
 ## Android Game Development Kit: Apache-2.0
 
 Not vendored. AGDK's `GameActivity` source was **read** to get the

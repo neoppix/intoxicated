@@ -1,11 +1,14 @@
 //! Screen-space reflections: `INTOXICATED_SSR=1`, and devctl `ssr` to turn
 //! them on and off, change how they look and read their GPU cost while the
 //! game runs. The same point of the frame also takes the depth of field
-//! (`INTOXICATED_DOF=1`, devctl `dof`) and the bloom (`INTOXICATED_BLOOM=1`,
-//! devctl `bloom`) of [`post`], each switched on its own, recorded in the
-//! order of [`EFFECTS`]: reflections, depth of field, bloom. Everything
-//! below about the frame, the match, what is put back and our objects holds
-//! for all three; a frame that does not match gets none of them.
+//! (`INTOXICATED_DOF=1`, devctl `dof`), the bloom (`INTOXICATED_BLOOM=1`,
+//! devctl `bloom`), the lens effects (`INTOXICATED_LENS=1`, devctl `lens`)
+//! and the sharpening (`INTOXICATED_SHARPEN=1`, devctl `sharpen`) of
+//! [`post`], each switched on its own, recorded in the order of
+//! [`EFFECTS`]: reflections, depth of field, bloom, lens, sharpen.
+//! Everything below about the frame, the match, what is put back and our
+//! objects holds for all of them; a frame that does not match gets none of
+//! them.
 //!
 //! The engine's frame is not changed in any other way than this: a few
 //! commands of ours are recorded into its own command buffer, through the
@@ -55,16 +58,17 @@
 //! with `COMPOSE`) that blurs that over the pixel's own surface, blends it
 //! into the scene colour and writes every pixel, with a reflection blended in
 //! or unchanged, packed in the engine's colour format into a 32-bit image of
-//! ours; then the depth of field's and the bloom's dispatches when they are
-//! on ([`post`]), each reading the scene from that image (or from the
-//! engine's when nothing ran before it) and writing it back there; one copy
-//! of that image over the engine's; and a barrier that puts the engine's
-//! image back in the layout it was in. The depth copy is made when the
-//! reflections or the depth of field need it. Reading needs `SAMPLED` and the copy
+//! ours; then the depth of field's, the bloom's, the lens's and the
+//! sharpen's dispatches when they are on ([`post`]), each reading the scene
+//! from that image (or from the engine's when nothing ran before it) and
+//! writing it back there; one copy of that image over the engine's; and a
+//! barrier that puts the engine's image back in the layout it was in. The
+//! depth copy is made when the reflections, the depth of field or a
+//! depth-aware sharpen need it. Reading needs `SAMPLED` and the copy
 //! `TRANSFER_DST` on the engine's image; a resolve target has both (it was
 //! seen with `0x17`), and with SSR on, a candidate image created without them
 //! gets them added at `vkCreateImage` when its format supports them
-//! ([`widen_usage`]). Six timestamps (before, after the depth copy and
+//! ([`widen_usage`]). Eight timestamps (before, after the depth copy and
 //! after each effect, after the copy back) feed each effect's `stats`, and
 //! the whole for all of them.
 //!
@@ -105,6 +109,19 @@
 //! the surface it hit, on an edge of it, at the end of a finite ray, near the
 //! screen edge, or on a surface seen nearly edge on.
 //!
+//! # All off and back
+//!
+//! The effects hotkey (`crate::effects_hotkey`, F9 with
+//! `INTOXICATED_EFFECTS_HOTKEY=1`) and devctl `effects toggle|on|off|get`
+//! turn every effect off at once and back as configured ([`AllOff`]): off
+//! saves each switch and clears it, so the hooks stop watching the frame and
+//! nothing of ours is recorded into it; back on puts the saved switches back,
+//! the knobs and looks never having been touched. Our objects stay made
+//! meanwhile, costing memory but no GPU time. That in game the hooks then
+//! record nothing and the effects come back as they were is INFERRED from
+//! this code and the unit tests: it was not run in a game when it was
+//! added.
+//!
 //! # Our objects
 //!
 //! Made on the render thread at the first matched frame of a device and kept
@@ -139,6 +156,10 @@ pub(crate) mod post;
 use super::vk_layer::registry::{self, Registry, UNUSED};
 
 // ------------------------------------------------------------- switches
+
+/// Whether the effects are built in (the `shaders` feature): here they are.
+/// `android::no_effects` stands in without them.
+pub const AVAILABLE: bool = true;
 
 /// The switch: `1` draws reflections from the start.
 pub const ENV: &str = "INTOXICATED_SSR";
@@ -347,12 +368,96 @@ pub(crate) static SSR: Effect = Effect {
 /// change the scene first, the depth of field then blurs it, reflections
 /// included, and the bloom glows over the result, so a light blurred out of
 /// focus glows as the soft disc it has become, not as the sharp point it
-/// was.
-pub(crate) static EFFECTS: [&Effect; 3] = [&SSR, &post::DOF, &post::BLOOM];
+/// was. The lens comes after them as a camera's lens would, over the whole
+/// picture, glow included, and its fringe reads the bloom's chain. The
+/// sharpen comes last, so the texture detail it raises is the final
+/// picture's and nothing after it softens it again; it holds back where
+/// contrast is already high (the bloom's and the fringe's smooth gradients
+/// have little to raise), so it does not sharpen the glow into rings.
+pub(crate) static EFFECTS: [&Effect; 5] = [&SSR, &post::DOF, &post::BLOOM, &post::LENS, &post::SHARPEN];
 
 /// The effect a devctl verb names.
 pub(crate) fn effect(name: &str) -> Option<&'static Effect> {
     EFFECTS.iter().copied().find(|fx| fx.name == name)
+}
+
+/// The variable that picks a whole-page mode ([`MODES`]).
+pub const MODE_ENV: &str = "INTOXICATED_SHADERS_MODE";
+
+/// Every effect's switch and look at once. A mode only fills in what is not
+/// set: an effect's own switch or look variable, when it is set, wins over
+/// the mode, and the knobs' variables then change the look as always.
+pub(crate) struct Mode {
+    pub name: &'static str,
+    pub title: &'static str,
+    pub description: &'static str,
+    /// Per effect, in the order of [`EFFECTS`]: on, and the look it starts
+    /// from.
+    pub effects: [(bool, &'static str); N],
+}
+
+/// The modes, for `INTOXICATED_SHADERS_MODE`, devctl `shaders mode` and the
+/// top of the Shaders page.
+pub(crate) const MODES: [Mode; 3] = [
+    Mode {
+        name: "off",
+        title: "Off",
+        description: "Every effect off: the game as the engine draws it.",
+        effects: [(false, "competitive"), (false, "playable"), (false, "soft"), (false, "subtle"), (false, "light")],
+    },
+    Mode {
+        name: "competitive",
+        title: "Competitive",
+        description: "Prettier but playable: faint, soft reflections on floors, only the far background softened, a \
+                      subtle glow and light sharpening. No lens effects, nothing that hides players or blinds.",
+        effects: [(true, "competitive"), (true, "playable"), (true, "soft"), (false, "subtle"), (true, "light")],
+    },
+    Mode {
+        name: "cinematic",
+        title: "Cinematic",
+        description: "For clips: clear reflections, your character in focus against a soft background, strong \
+                      glow, a colour split and rainbow halo like a lens, crunchy sharpening.",
+        effects: [(true, "clean_mirror"), (true, "cinematic"), (true, "neon"), (true, "prism"), (true, "crunchy")],
+    },
+];
+
+pub(crate) fn mode(name: &str) -> Option<&'static Mode> {
+    MODES.iter().find(|m| m.name == name)
+}
+
+pub(crate) const SHADERS_USAGE: &str = "shaders [get]|mode <name>; modes: off competitive cinematic";
+
+/// `var` with the mode `var` names (by [`MODE_ENV`]) filled in for `fx`:
+/// its switch and look variables, where they are unset or blank, read as
+/// the mode sets them. A warning when the mode names no mode.
+fn with_mode<'a>(
+    fx: &'a Effect,
+    var: impl Fn(&str) -> Option<String> + 'a,
+    warnings: &mut Vec<String>,
+) -> impl Fn(&str) -> Option<String> + 'a {
+    let fill = match var(MODE_ENV).as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(name) => match mode(name) {
+            Some(m) => Some(m.effects[fx.index]),
+            None => {
+                warnings.push(format!(
+                    "[android] vulkan: {}: {MODE_ENV}={name:?} is not a mode ({}); using each effect's own settings",
+                    fx.name,
+                    MODES.iter().map(|m| m.name).collect::<Vec<_>>().join(" ")
+                ));
+                None
+            }
+        },
+    };
+    move |name: &str| {
+        let own = var(name);
+        let unset = own.as_deref().is_none_or(|v| v.trim().is_empty());
+        match fill {
+            Some((on, _)) if unset && name == fx.env => Some(if on { "1" } else { "0" }.to_string()),
+            Some((_, look)) if unset && name == fx.look_env => Some(look.to_string()),
+            _ => own,
+        }
+    }
 }
 
 /// What the environment asks for: on or off, every knob's value, and a line
@@ -435,6 +540,18 @@ impl Effect {
         Some(self.knobs.iter().zip(look).map(|(k, v)| v.unwrap_or(k.default)).collect())
     }
 
+    /// The look whose values every knob has now, if any.
+    fn look_now(&self) -> Option<&'static str> {
+        let now = self.current();
+        // Only a colour's three values count; another knob keeps one.
+        let same = |k: &Knob, a: [f32; 3], b: [f32; 3]| a[..k.width()] == b[..k.width()];
+        self.looks.iter().map(|l| l.name).find(|name| {
+            self.look_values(name).is_some_and(|look| {
+                self.knobs.iter().zip(look).zip(&now).all(|((k, want), have)| want.is_none_or(|w| same(k, w, *have)))
+            })
+        })
+    }
+
     fn look_names(&self) -> String {
         self.looks.iter().map(|l| l.name).collect::<Vec<_>>().join(" ")
     }
@@ -483,7 +600,18 @@ impl Effect {
         })
     }
 
+    /// The effect's settings from `var`, with the mode [`MODE_ENV`] names
+    /// filled in.
     pub(crate) fn parse_settings(&self, var: impl Fn(&str) -> Option<String>) -> Settings {
+        let mut warnings = Vec::new();
+        let var = with_mode(self, var, &mut warnings);
+        let mut s = self.parse_own_settings(var);
+        warnings.append(&mut s.warnings);
+        s.warnings = warnings;
+        s
+    }
+
+    fn parse_own_settings(&self, var: impl Fn(&str) -> Option<String>) -> Settings {
         let (name, env, look_env) = (self.name, self.env, self.look_env);
         let mut warnings = Vec::new();
         let on = match var(env).as_deref().map(str::trim) {
@@ -528,7 +656,10 @@ impl Effect {
     fn start_from(&self, var: impl Fn(&str) -> Option<String>) -> bool {
         let s = self.parse_settings(var);
         for w in &s.warnings {
-            println!("{w}");
+            // The same warning about the mode comes for every effect.
+            if self.index == 0 || !w.contains(MODE_ENV) {
+                println!("{w}");
+            }
         }
         for (k, v) in self.knobs.iter().zip(&s.values) {
             self.set(k, *v);
@@ -633,10 +764,25 @@ pub fn looks_json() -> String {
 }
 
 /// What `intoxicated-run --print-shader-looks` prints, for Intoxicated
-/// Settings' Shaders page: `{"effects": [...]}`, every effect in the order
-/// it is recorded, each as [`Effect::json`] writes it plus its devctl name,
-/// its title and a one-line summary.
+/// Settings' Shaders page: `{"available": true, "effects": [...],
+/// "mode_env": ..., "modes": [...]}` (a client built without the effects
+/// prints `{"available": false, ...}` instead), every effect in the order it
+/// is recorded, each as
+/// [`Effect::json`] writes it plus its devctl name, its title and a
+/// one-line summary, and every mode ([`MODES`]) with its title, a
+/// description and each effect's switch and look.
 pub fn shader_looks_json() -> String {
+    let modes: Vec<serde_json::Value> = MODES
+        .iter()
+        .map(|m| {
+            let effects: serde_json::Map<String, serde_json::Value> = EFFECTS
+                .iter()
+                .zip(m.effects)
+                .map(|(fx, (on, look))| (fx.name.to_string(), serde_json::json!({ "on": on, "look": look })))
+                .collect();
+            serde_json::json!({ "name": m.name, "title": m.title, "description": m.description, "effects": effects })
+        })
+        .collect();
     let effects: Vec<serde_json::Value> = EFFECTS
         .iter()
         .map(|fx| {
@@ -648,7 +794,14 @@ pub fn shader_looks_json() -> String {
             v
         })
         .collect();
-    serde_json::to_string_pretty(&serde_json::json!({ "effects": effects })).expect("a JSON value always serialises")
+    serde_json::to_string_pretty(&serde_json::json!({
+        "available": true,
+        "ray_tracing": cfg!(feature = "rt"),
+        "effects": effects,
+        "mode_env": MODE_ENV,
+        "modes": modes
+    }))
+        .expect("a JSON value always serialises")
 }
 
 impl Knob {
@@ -727,11 +880,13 @@ pub(crate) fn requested_at_start() -> bool {
 }
 
 /// Whether the reflections are on, which the ray-traced ones need.
+#[cfg(feature = "rt")]
 pub(crate) fn reflections_on() -> bool {
     SSR.is_on()
 }
 
 /// devctl `rt on`: the reflections on too, as `ssr on` would.
+#[cfg(feature = "rt")]
 pub(crate) fn reflections_on_for_rt() -> Result<(), String> {
     if !passes::wanted() {
         return Err(format!("the pass hooks are not handed out in this run (set {}=1 or dev control)", SSR.env));
@@ -741,14 +896,205 @@ pub(crate) fn reflections_on_for_rt() -> Result<(), String> {
 }
 
 /// Turn an effect on or off for the frames recorded from now on; the
-/// recording hooks watch while any is on.
+/// recording hooks watch while any is on. While everything is off by the
+/// hotkey ([`AllOff`]), this is a choice of the user's that the saved
+/// switches follow.
 fn set_on(fx: &Effect, on: bool) {
+    all_off().switch_changed(fx.index, on);
     fx.on.store(on, Relaxed);
-    if EFFECTS.iter().any(|e| e.is_on()) {
+    watch_follows();
+}
+
+/// Watch the frame for the effects while any is on, and not at all while
+/// none is: then the hooks record nothing and call nothing of ours.
+fn watch_follows() {
+    // The ray tracing draws inside the reflections, but is watched for while
+    // its own switch is on as well (see `ALSO_SWITCHED`).
+    let rt = super::rt::requested() && super::rt::ON.load(Relaxed);
+    if EFFECTS.iter().any(|e| e.is_on()) || rt {
         WATCH.fetch_or(WATCH_POST, Relaxed);
     } else {
         WATCH.fetch_and(!WATCH_POST, Relaxed);
     }
+}
+
+// ------------------------------------------------------------- all off
+
+/// A switch that goes off with the rest when everything is turned off, and
+/// comes back as it was.
+#[derive(Clone, Copy)]
+pub(crate) struct Switched {
+    pub name: &'static str,
+    pub on: &'static AtomicBool,
+}
+
+/// Switches outside [`EFFECTS`] that go off and come back with them: the
+/// ray tracing's (`rt::ON`, devctl `rt on|off`), in a client built with the
+/// `rt` feature, kept apart with a switch of its own; [`watch_follows`]
+/// watches the frame for it while its switch is on, as it does for the
+/// effects.
+#[cfg(feature = "rt")]
+pub(crate) static ALSO_SWITCHED: [Switched; 1] = [Switched { name: "rt", on: &super::rt::ON }];
+#[cfg(not(feature = "rt"))]
+pub(crate) static ALSO_SWITCHED: [Switched; 0] = [];
+
+/// devctl `rt on|off` changed the ray tracing's switch: the hotkey's saved
+/// state and the watch follow, as for an effect's switch.
+#[cfg(feature = "rt")]
+pub(crate) fn rt_switched() {
+    let on = super::rt::ON.load(Relaxed);
+    if let Some(i) = ALSO_SWITCHED.iter().position(|s| s.name == "rt") {
+        all_off().switch_changed(EFFECTS.len() + i, on);
+    }
+    watch_follows();
+}
+
+/// Every switch the hotkey turns off: the effects' in the order of
+/// [`EFFECTS`], then [`ALSO_SWITCHED`].
+fn switched() -> Vec<Switched> {
+    EFFECTS.iter().map(|fx| Switched { name: fx.name, on: fx.on }).chain(ALSO_SWITCHED).collect()
+}
+
+/// Everything off at once, by the effects hotkey (`crate::effects_hotkey`)
+/// or devctl `effects off`, and back as it was. Off saves every switch and
+/// clears it; nothing else is touched, so every look and knob stays as it
+/// is, and back on puts the saved switches back. The environment is never
+/// read again.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct AllOff {
+    /// The switches as they were, by [`switched`]'s order; `None` while the
+    /// effects are as configured.
+    saved: Option<Vec<bool>>,
+}
+
+impl AllOff {
+    const fn new() -> Self {
+        AllOff { saved: None }
+    }
+
+    pub(crate) fn is_off(&self) -> bool {
+        self.saved.is_some()
+    }
+
+    /// Save the switches and clear them; false when they are off already.
+    pub(crate) fn turn_off(&mut self, switches: &[Switched]) -> bool {
+        if self.saved.is_some() {
+            return false;
+        }
+        self.saved = Some(switches.iter().map(|s| s.on.load(Relaxed)).collect());
+        for s in switches {
+            s.on.store(false, Relaxed);
+        }
+        true
+    }
+
+    /// Put the saved switches back; false when nothing was turned off.
+    pub(crate) fn turn_on(&mut self, switches: &[Switched]) -> bool {
+        let Some(saved) = self.saved.take() else { return false };
+        for (s, on) in switches.iter().zip(saved) {
+            s.on.store(on, Relaxed);
+        }
+        true
+    }
+
+    /// devctl switched switch `index` while everything was off. On ends the
+    /// all off with the switches as they are now, as the user has chosen
+    /// again; off is kept, so that one stays off when the rest come back.
+    pub(crate) fn switch_changed(&mut self, index: usize, on: bool) {
+        match &mut self.saved {
+            Some(_) if on => self.saved = None,
+            Some(saved) => {
+                if let Some(s) = saved.get_mut(index) {
+                    *s = false;
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// The names of the saved switches that were on.
+    fn saved_on(&self, switches: &[Switched]) -> Vec<&'static str> {
+        let saved = self.saved.as_deref().unwrap_or(&[]);
+        switches.iter().zip(saved).filter(|(_, &on)| on).map(|(s, _)| s.name).collect()
+    }
+}
+
+static ALL_OFF: Mutex<AllOff> = Mutex::new(AllOff::new());
+
+fn all_off() -> MutexGuard<'static, AllOff> {
+    ALL_OFF.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn names_or_none(names: &[&str]) -> String {
+    if names.is_empty() {
+        "none was on".into()
+    } else {
+        names.join(" ")
+    }
+}
+
+/// Everything off (`to` false), back as configured (true) or the other way
+/// from now (`None`), for the frames recorded from now on; the log line
+/// that says what happened, `by` naming the key or `devctl`.
+fn switch_all(to: Option<bool>, by: &str) -> String {
+    requested_at_start();
+    let switches = switched();
+    let mut all = all_off();
+    let off = to.map_or(!all.is_off(), |on| !on);
+    let line = if off {
+        if all.turn_off(&switches) {
+            format!("all off ({by}); back on with it: {}", names_or_none(&all.saved_on(&switches)))
+        } else {
+            format!("all off already ({by})")
+        }
+    } else {
+        let was_on = all.saved_on(&switches);
+        if all.turn_on(&switches) {
+            format!("back as configured ({by}): {}", names_or_none(&was_on))
+        } else {
+            format!("as configured already ({by})")
+        }
+    };
+    drop(all);
+    watch_follows();
+    format!("[android] vulkan: effects: {line}")
+}
+
+/// The effects hotkey was pressed (`crate::effects_hotkey`): everything off,
+/// or back as configured. One line in the log.
+pub(crate) fn toggle_all(by: &str) {
+    println!("{}", switch_all(None, by));
+}
+
+pub(crate) const EFFECTS_USAGE: &str = "effects [get]|toggle|on|off; off turns every effect off, on puts them back";
+
+/// devctl `effects toggle|on|off|get`: what the hotkey does, without a key.
+/// The answer is the state after the command.
+fn effects_control(args: &[&str]) -> Result<String, String> {
+    let to = match args {
+        [] | ["get"] => None,
+        ["toggle"] => Some(None),
+        ["on"] => Some(Some(true)),
+        ["off"] => Some(Some(false)),
+        _ => return Err(EFFECTS_USAGE.into()),
+    };
+    if let Some(to) = to {
+        println!("{}", switch_all(to, "devctl"));
+    }
+    requested_at_start();
+    let switches = switched();
+    let all = all_off();
+    let now: Vec<String> = switches.iter().map(|s| format!("{}={}", s.name, u8::from(s.on.load(Relaxed)))).collect();
+    let mut answer = format!(
+        "effects={} hotkey={} {}",
+        if all.is_off() { "off" } else { "configured" },
+        crate::effects_hotkey::active_key().unwrap_or_else(|| "off".into()),
+        now.join(" ")
+    );
+    if all.is_off() {
+        answer += &format!("; back on: {}", names_or_none(&all.saved_on(&switches)));
+    }
+    Ok(answer)
 }
 
 // ------------------------------------------------------------- devctl
@@ -763,9 +1109,49 @@ pub fn control(args: &[&str]) -> Result<String, String> {
     SSR.control(args)
 }
 
-/// devctl `ssr ...`, `dof ...` or `bloom ...`; `None` for another verb.
+/// devctl `ssr ...`, `dof ...`, `bloom ...`, `lens ...`, `sharpen ...`,
+/// `shaders ...` or `effects ...`; `None` for another verb.
 pub fn control_verb(verb: &str, args: &[&str]) -> Option<Result<String, String>> {
+    if verb == "shaders" {
+        return Some(shaders_control(args));
+    }
+    if verb == "effects" {
+        return Some(effects_control(args));
+    }
     effect(verb).map(|fx| fx.control(args))
+}
+
+/// devctl `shaders mode <name>`: every effect's switch and look as the mode
+/// sets them; `shaders` or `shaders get`: each effect's switch and the look
+/// its knobs are at (`custom` when they are at none).
+fn shaders_control(args: &[&str]) -> Result<String, String> {
+    requested_at_start();
+    match args {
+        [] | ["get"] => {}
+        ["mode", name] => {
+            let m = mode(name).ok_or_else(|| format!("no mode {name:?}; {SHADERS_USAGE}"))?;
+            if m.effects.iter().any(|(on, _)| *on) && !passes::wanted() {
+                return Err(format!("the pass hooks are not handed out in this run (set {MODE_ENV} or dev control)"));
+            }
+            for (fx, (on, look)) in EFFECTS.iter().zip(m.effects) {
+                for (k, v) in fx.knobs.iter().zip(fx.look_values(look).expect("a mode names looks of the table")) {
+                    if let Some(v) = v {
+                        fx.set(k, v);
+                    }
+                }
+                set_on(fx, on);
+            }
+        }
+        _ => return Err(SHADERS_USAGE.into()),
+    }
+    let mode_now = MODES.iter().find(|m| {
+        EFFECTS.iter().zip(m.effects).all(|(fx, (on, look))| fx.is_on() == on && (!on || fx.look_now() == Some(look)))
+    });
+    let effects: Vec<String> = EFFECTS
+        .iter()
+        .map(|fx| format!("{}={}:{}", fx.name, u8::from(fx.is_on()), fx.look_now().unwrap_or("custom")))
+        .collect();
+    Ok(format!("mode={} {}", mode_now.map_or("custom", |m| m.name), effects.join(" ")))
 }
 
 // ------------------------------------------------------------- the matcher
@@ -1320,6 +1706,7 @@ struct Fns {
     cmd_dispatch: extern "C" fn(*mut c_void, u32, u32, u32),
     cmd_copy_image: extern "C" fn(*mut c_void, u64, i32, u64, i32, u32, *const ImageCopy),
     /// `VkImageResolve` has `VkImageCopy`'s layout.
+    #[cfg(feature = "rt")]
     cmd_resolve_image: extern "C" fn(*mut c_void, u64, i32, u64, i32, u32, *const ImageCopy),
     cmd_reset_query_pool: extern "C" fn(*mut c_void, u64, u32, u32),
     cmd_write_timestamp: extern "C" fn(*mut c_void, u32, u64, u32),
@@ -1360,6 +1747,7 @@ impl Fns {
             cmd_push_constants: device_fn(device, c"vkCmdPushConstants")?,
             cmd_dispatch: device_fn(device, c"vkCmdDispatch")?,
             cmd_copy_image: device_fn(device, c"vkCmdCopyImage")?,
+            #[cfg(feature = "rt")]
             cmd_resolve_image: device_fn(device, c"vkCmdResolveImage")?,
             cmd_reset_query_pool: device_fn(device, c"vkCmdResetQueryPool")?,
             cmd_write_timestamp: device_fn(device, c"vkCmdWriteTimestamp")?,
@@ -1437,16 +1825,17 @@ pub(crate) fn ticks_to_ms(start: u64, end: u64, mask: u64, period_ns: f64) -> f6
 /// How many frames' timestamps can be in flight.
 const RING: usize = 16;
 /// Timestamps per frame: before everything, after the depth copy, after
-/// the reflections, after the depth of field, after the bloom, and after
-/// the copy back.
-const TIMESTAMPS: usize = 6;
+/// each effect of [`EFFECTS`], and after the copy back.
+const TIMESTAMPS: usize = 8;
 
-/// GPU milliseconds of one frame: the reflections, the depth of field and
-/// the bloom (0 for one that did not run), and everything, the depth copy
-/// and the copy back included.
+/// How many effects there are.
+const N: usize = 5;
+
+/// GPU milliseconds of one frame: each effect's (0 for one that did not
+/// run), and everything, the depth copy and the copy back included.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Stages {
-    pub effects: [f64; 3],
+    pub effects: [f64; N],
     pub total: f64,
 }
 /// Presents after which a replaced object can no longer be in use by any
@@ -1467,8 +1856,7 @@ struct Owned {
 /// Our images of the scene's size: the depth copy `depth.comp` writes
 /// (R32F), the trace (RGBA16F, written by the trace and sampled by the
 /// compose), the result the composes write (R32_UINT, copied to the
-/// engine's image), and the depth of field's and the bloom's when either is
-/// on.
+/// engine's image), and the post effects' when any of them is on.
 struct Output {
     depth: Owned,
     trace: Owned,
@@ -1515,11 +1903,11 @@ struct Gpu {
     pipelines: [u64; 4],
     descriptor_pool: u64,
     query_pool: u64,
-    /// The depth of field's and the bloom's.
+    /// The depth of field's, the bloom's, the lens's and the sharpen's.
     post: post::PostGpu,
     /// Which effects ran in the frame each timestamp slot holds, while its
     /// timestamps are still to be read.
-    pending: [Option<[bool; 3]>; RING],
+    pending: [Option<Run>; RING],
     next_slot: usize,
     output: Option<Output>,
     /// The present count when the opaque world's colour was last copied.
@@ -1620,8 +2008,8 @@ impl Gpu {
         Ok(v)
     }
 
-    /// Our images for `extent`, with the depth of field's and the bloom's
-    /// when `post` asks for them, made again when the size changed or they
+    /// Our images for `extent`, with the post effects' when `post` asks for
+    /// them, made again when the size changed or they
     /// are newly asked for. The view of the result, which names them in a
     /// [`SetKey`].
     fn output_for(&mut self, extent: [u32; 2], colour_format: u32, post: bool, presents: u64) -> Result<u64, String> {
@@ -1801,7 +2189,7 @@ impl Gpu {
 
     /// The previous use of timestamp slot `slot`, if its frame has finished:
     /// which effects ran in it and the GPU milliseconds of each stage.
-    fn collect(&mut self, slot: usize) -> Option<([bool; 3], Stages)> {
+    fn collect(&mut self, slot: usize) -> Option<(Run, Stages)> {
         let ran = self.pending[slot].take()?;
         // Each query's value followed by its availability.
         let mut t = [0u64; 2 * TIMESTAMPS];
@@ -1819,7 +2207,7 @@ impl Gpu {
             return None;
         }
         let ms = |a: usize, b: usize| ticks_to_ms(t[2 * a], t[2 * b], self.timestamp_mask, self.period_ns);
-        Some((ran, Stages { effects: [ms(1, 2), ms(2, 3), ms(3, 4)], total: ms(0, 5) }))
+        Some((ran, Stages { effects: [ms(1, 2), ms(2, 3), ms(3, 4), ms(4, 5), ms(5, 6)], total: ms(0, 7) }))
     }
 }
 
@@ -2083,13 +2471,16 @@ fn compute_barrier(fns: &Fns, cmd: *mut c_void) {
 }
 
 /// Which effects a frame gets, in the order of [`EFFECTS`].
-pub(crate) type Run = [bool; 3];
+pub(crate) type Run = [bool; N];
 
 /// Record the work into `cmd`, the engine's command buffer, outside any
 /// render pass (see the module doc), with timestamps in `slot`: the depth
-/// copy when the reflections or the depth of field need it, then each
-/// effect of `run` in turn, each reading the scene as the one before left
-/// it, and one copy of the result over the engine's image.
+/// copy when the reflections, the depth of field or a depth-aware sharpen
+/// need it, then each effect of `run` in turn, each reading the scene as the
+/// one before left it, and one copy of the result over the engine's image.
+/// `chain`: the lens reads the bloom chain, which it records itself when
+/// the bloom does not run; `depth_for_sharpen`: the sharpen reads the depth
+/// copy.
 #[allow(clippy::too_many_arguments)]
 fn record(
     g: &mut Gpu,
@@ -2100,13 +2491,15 @@ fn record(
     run: Run,
     p: &Params,
     post_p: &post::PostParams,
+    chain: bool,
+    depth_for_sharpen: bool,
     presents: u64,
 ) -> Result<(), String> {
-    let [ssr, dof, bloom] = run;
+    let [ssr, dof, bloom, lens, sharpen] = run;
     let (color, depth) = (&f.color, &f.depth);
     let color_read = color_read_layout(color.layout).ok_or("unusable colour layout")?;
     let depth_read = depth_read_layout(depth.layout).ok_or("unusable depth layout")?;
-    let output = g.output_for(color.att.extent, color.att.format, dof || bloom, presents)?;
+    let output = g.output_for(color.att.extent, color.att.format, dof || bloom || lens || sharpen, presents)?;
     g.view_of(color.att.image, color.att.format, ASPECT_COLOR)?;
     g.view_of(depth.att.image, depth.att.format, ASPECT_DEPTH)?;
     let set = g.set_for(SetKey {
@@ -2189,7 +2582,7 @@ fn record(
             (p as *const Params).cast(),
         );
     };
-    if ssr || dof {
+    if ssr || dof || (sharpen && depth_for_sharpen) {
         bind_ssr(if depth.att.samples > 1 { g.pipelines[0] } else { g.pipelines[1] });
         (fns.cmd_dispatch)(cmd, w.div_ceil(8), h.div_ceil(8), 1);
         compute_barrier(fns, cmd);
@@ -2277,6 +2670,30 @@ fn record(
         post::record_bloom(g, cmd, set, post_images.ok_or("no bloom images")?, &pp);
     }
     stamp(4);
+    if lens {
+        let mut pp = *post_p;
+        if ssr || dof || bloom {
+            pp.flags |= post::SRC_RESULT;
+        }
+        let images = post_images.ok_or("no lens images")?;
+        // The fringe reads the chain; the bloom made it already when it ran.
+        if chain && !bloom {
+            post::record_bloom_chain(g, cmd, set, images, &pp);
+        }
+        post::record_lens(g, cmd, set, images, &pp, !sharpen);
+    }
+    stamp(5);
+    if sharpen {
+        let mut pp = *post_p;
+        if ssr || dof || bloom || lens {
+            pp.flags |= post::SRC_RESULT;
+        }
+        if !depth_for_sharpen {
+            pp.flags &= !post::DEPTH_AWARE;
+        }
+        post::record_sharpen(g, cmd, set, post_images.ok_or("no sharpen images")?, &pp, lens);
+    }
+    stamp(6);
 
     // Our image to a copy source, the engine's to a copy destination, the
     // depth back; everything after (the copy, the swapchain pass, the next
@@ -2308,7 +2725,7 @@ fn record(
         ASPECT_COLOR,
     )];
     (fns.cmd_pipeline_barrier)(cmd, STAGE_TRANSFER, STAGE_ALL_COMMANDS, 0, 0, none.cast(), 0, none, 1, after.as_ptr());
-    stamp(5);
+    stamp(7);
 
     // The engine's compute state, as it was.
     if compute.pipeline != 0 {
@@ -2399,7 +2816,7 @@ struct State {
     reported: HashSet<String>,
     /// Each effect's, in the order of [`EFFECTS`]; its GPU time is its own
     /// dispatches'.
-    stats: [Stats; 3],
+    stats: [Stats; N],
     /// Every frame that got any effect; its GPU time is everything recorded,
     /// the depth copy and the copy back included.
     chain: Stats,
@@ -2457,24 +2874,26 @@ pub(crate) fn pass_begun(pass: &Pass) {
     let Some(h) = st.cmds.get_mut(&pass.cmd) else { return };
     let Some(outcome) = h.pass(&desc, &full) else { return };
     let compute = h.compute.clone();
-    let on: Run = [SSR.is_on(), post::DOF.is_on(), post::BLOOM.is_on()];
+    let on: Run = EFFECTS.map(|fx| fx.is_on());
     let found = match outcome {
         Ok(f) => f,
         Err(why) => return st.skipped(on, why),
     };
     let values = SSR.current();
-    let dof_values = post::DOF.current();
-    let bloom_values = post::BLOOM.current();
+    let post_values = post::PostValues::current();
     let run: Run = [
         on[0] && !changes_nothing(&values),
-        on[1] && !post::dof_changes_nothing(&dof_values),
-        on[2] && !post::bloom_changes_nothing(&bloom_values),
+        on[1] && !post::dof_changes_nothing(&post_values.dof),
+        on[2] && !post::bloom_changes_nothing(&post_values.bloom),
+        on[3] && !post::lens_changes_nothing(&post_values.lens),
+        on[4] && !post::sharpen_changes_nothing(&post_values.sharpen),
     ];
-    if run == [false; 3] {
+    if run == [false; N] {
         return st.skipped(
             on,
             "every effect that is on changes nothing (reflections: intensity 0 and wet surfaces neither darkened nor \
-             tinted; depth of field: strength 0; bloom: intensity 0 or a black tint)"
+             tinted; depth of field: strength 0; bloom: intensity 0 or a black tint; lens: no aberration, vignette \
+             or halo; sharpen: strength or limit 0)"
                 .into(),
         );
     }
@@ -2516,12 +2935,15 @@ pub(crate) fn pass_begun(pass: &Pass) {
     } else {
         0.0
     };
-    let post_p = post::post_params(extent, &dof_values, &bloom_values, mode, dt);
+    let post_p = post::post_params(extent, &post_values, mode, dt);
+    let chain = post::lens_wants_chain(&post_values.lens);
+    let depth_for_sharpen = post::sharpen_wants_depth(&post_values.sharpen);
     // The timestamps this slot held last time round, then the slot again.
     let slot = g.next_slot;
     g.next_slot = (slot + 1) % RING;
     let sample = g.collect(slot);
-    let recorded = record(g, pass.cmd as *mut c_void, slot, &found, &compute, run, &p, &post_p, presents);
+    let recorded =
+        record(g, pass.cmd as *mut c_void, slot, &found, &compute, run, &p, &post_p, chain, depth_for_sharpen, presents);
     if let Some((ran, ms)) = sample {
         for ((s, ran), ms) in st.stats.iter_mut().zip(ran).zip(ms.effects) {
             if ran {
@@ -2674,6 +3096,7 @@ pub(crate) fn missing_usage(image_type: u32, format: u32, extent: [u32; 3], mips
 /// over it. False when there is nothing to copy into yet (our images are
 /// made at the first frame the reflections run) or the image does not
 /// allow it.
+#[cfg(feature = "rt")]
 pub(crate) fn copy_opaque(cmd: *mut c_void, src: &Att) -> bool {
     let mut st = state();
     let presents = st.presents;
@@ -3232,7 +3655,7 @@ mod tests {
     #[test]
     fn every_effect_has_its_own_variables_slots_looks_and_verbs() {
         let names: Vec<&str> = EFFECTS.iter().map(|fx| fx.name).collect();
-        assert_eq!(names, ["ssr", "dof", "bloom"], "recorded in this order");
+        assert_eq!(names, ["ssr", "dof", "bloom", "lens", "sharpen"], "recorded in this order");
         for (i, fx) in EFFECTS.iter().enumerate() {
             assert_eq!(fx.index, i, "{}", fx.name);
             assert_eq!(fx.env, format!("INTOXICATED_{}", fx.name.to_uppercase()));
@@ -3304,6 +3727,100 @@ mod tests {
         assert_eq!(bloom.values[post::BLOOM_KNOBS.iter().position(|k| k.name == "tint").unwrap()], [1.0, 0.9, 0.8]);
         assert_eq!(post::BLOOM.parse_command(&["intensity", "0.5"]), Ok(Command::Set("intensity", [0.5; 3])));
         assert_eq!(post::DOF.parse_command(&["intensity", "0.5"]), Err(post::DOF_USAGE.to_string()), "dof has no intensity");
+
+        // The lens and the sharpen likewise.
+        let env = |name: &str| {
+            Some(match name {
+                "INTOXICATED_LENS" => "1",
+                "INTOXICATED_LENS_LOOK" => "prism",
+                "INTOXICATED_LENS_VIGNETTE" => "0",
+                "INTOXICATED_SHARPEN" => "1",
+                "INTOXICATED_SHARPEN_LOOK" => "crunchy",
+                "INTOXICATED_SHARPEN_DEPTH_AWARE" => "2",
+                _ => return None,
+            }
+            .to_string())
+        };
+        let lens = post::LENS.parse_settings(env);
+        assert!(lens.on && lens.warnings.is_empty(), "{:?}", lens.warnings);
+        assert_eq!(lens.values, [[5.0; 3], [0.0; 3], [1.0; 3]], "the look, then the knob");
+        let sharpen = post::SHARPEN.parse_settings(env);
+        assert!(sharpen.on);
+        assert_eq!(sharpen.warnings.len(), 1, "{:?}", sharpen.warnings);
+        assert_eq!(sharpen.values, [[2.0; 3], [0.28; 3], [1.0; 3]], "the default for a value it does not take");
+        assert_eq!(post::LENS.parse_command(&["set", "halo", "0.3"]), Ok(Command::Set("halo", [0.3; 3])));
+        assert!(post::SHARPEN.parse_command(&["set", "strength", "4"]).is_err());
+    }
+
+    #[test]
+    fn modes_name_every_effect_and_fill_in_only_what_is_unset() {
+        assert_eq!(MODES.map(|m| m.name), ["off", "competitive", "cinematic"]);
+        for m in &MODES {
+            assert!(m.title.is_ascii() && m.description.is_ascii() && !m.description.is_empty());
+            assert!(SHADERS_USAGE.contains(m.name));
+            for (fx, (_, look)) in EFFECTS.iter().zip(m.effects) {
+                assert!(fx.looks.iter().any(|l| l.name == look), "{} names no look {look} of {}", m.name, fx.name);
+            }
+        }
+        assert!(MODES[0].effects.iter().all(|(on, _)| !on), "off is off");
+        // Competitive: no lens; the default looks, which are the playable ones.
+        let competitive = mode("competitive").unwrap();
+        for (fx, (on, look)) in EFFECTS.iter().zip(competitive.effects) {
+            assert_eq!(on, fx.name != "lens", "{}", fx.name);
+            assert_eq!(look, fx.looks[0].name, "{}", fx.name);
+        }
+        assert!(mode("cinematic").unwrap().effects.iter().all(|(on, _)| *on));
+        assert!(mode("fancy").is_none());
+
+        // From the environment: the mode, overridden by an effect's own
+        // switch and look, and the knobs as always.
+        let env = |name: &str| {
+            Some(match name {
+                "INTOXICATED_SHADERS_MODE" => "cinematic",
+                "INTOXICATED_SSR" => "0",
+                "INTOXICATED_DOF_LOOK" => "portrait",
+                "INTOXICATED_BLOOM" => " ",
+                "INTOXICATED_SHARPEN_LIMIT" => "0.2",
+                _ => return None,
+            }
+            .to_string())
+        };
+        let ssr = SSR.parse_settings(env);
+        assert!(!ssr.on && ssr.warnings.is_empty(), "its own switch wins");
+        let dof = post::DOF.parse_settings(env);
+        assert!(dof.on);
+        assert_eq!(dof.values[0], [14.0; 3], "its own look wins");
+        let bloom = post::BLOOM.parse_settings(env);
+        assert!(bloom.on, "a blank switch is unset");
+        assert_eq!(bloom.values[0], [0.7; 3], "neon");
+        let sharpen = post::SHARPEN.parse_settings(env);
+        assert!(sharpen.on);
+        assert_eq!(sharpen.values, [[2.0; 3], [0.2; 3], [1.0; 3]], "crunchy, the limit its own");
+        let lens = post::LENS.parse_settings(env);
+        assert!(lens.on && lens.values[2] == [1.0; 3], "prism");
+
+        let off = |name: &str| (name == MODE_ENV).then(|| "off".to_string());
+        assert!(EFFECTS.iter().all(|fx| !fx.parse_settings(off).on));
+        let competitive = |name: &str| (name == MODE_ENV).then(|| "competitive".to_string());
+        let on: Vec<bool> = EFFECTS.iter().map(|fx| fx.parse_settings(competitive).on).collect();
+        assert_eq!(on, [true, true, true, false, true]);
+        // The look the knobs are at, as devctl shaders reports it (seen as
+        // "custom" for every look in game before a knob's unused slots were
+        // left out of the comparison). Only this test touches the lens's
+        // live values.
+        let lens = &post::LENS;
+        for look in ["prism", "subtle"] {
+            for (k, v) in lens.knobs.iter().zip(lens.look_values(look).unwrap()) {
+                lens.set(k, v.unwrap());
+            }
+            assert_eq!(lens.look_now(), Some(look));
+        }
+        lens.set(&lens.knobs[0], [3.0; 3]);
+        assert_eq!(lens.look_now(), None, "tuned");
+        lens.knobs.iter().for_each(|k| lens.set(k, k.default));
+
+        let bad = SSR.parse_settings(|name: &str| (name == MODE_ENV).then(|| "fancy".to_string()));
+        assert!(!bad.on && bad.warnings.len() == 1 && bad.warnings[0].contains("is not a mode"), "{:?}", bad.warnings);
     }
 
     #[test]
@@ -3322,6 +3839,16 @@ mod tests {
             assert_eq!(table, fx.json(), "{}", fx.name);
             assert_eq!(j["looks"].as_array().unwrap().len(), fx.looks.len());
             assert_eq!(j["default_look"], fx.looks[0].name);
+        }
+        assert_eq!(doc["mode_env"], MODE_ENV);
+        let modes = doc["modes"].as_array().unwrap();
+        assert_eq!(modes.len(), MODES.len());
+        for (m, j) in MODES.iter().zip(modes) {
+            assert_eq!((j["name"].as_str(), j["title"].as_str()), (Some(m.name), Some(m.title)));
+            assert_eq!(j["description"], m.description);
+            for (fx, (on, look)) in EFFECTS.iter().zip(m.effects) {
+                assert_eq!(j["effects"][fx.name], serde_json::json!({ "on": on, "look": look }), "{} {}", m.name, fx.name);
+            }
         }
         // The reflections' own table is what --print-ssr-looks prints.
         let ssr: serde_json::Value = serde_json::from_str(&looks_json()).unwrap();
@@ -3441,7 +3968,7 @@ mod tests {
                 .collect()
         };
         // The same list as build.rs's `SHADERS`.
-        let shaders: [(&str, &str, &[&str]); 32] = [
+        let shaders: [(&str, &str, &[&str]); 36] = [
             ("depth_capture/resolve.comp", "depth_capture/resolve_ms", &[]),
             ("depth_capture/resolve.comp", "depth_capture/resolve_1x", &["-DSINGLE_SAMPLE"]),
             ("ssr/depth.comp", "ssr/depth_ms", &[]),
@@ -3456,6 +3983,10 @@ mod tests {
             ("ssr/post.comp", "ssr/post_bloom_down", &["-DBLOOM_DOWN"]),
             ("ssr/post.comp", "ssr/post_bloom_up", &["-DBLOOM_UP"]),
             ("ssr/post.comp", "ssr/post_bloom_compose", &["-DBLOOM_COMPOSE"]),
+            ("ssr/post.comp", "ssr/post_lens", &["-DLENS"]),
+            ("ssr/post.comp", "ssr/post_stage_copy", &["-DSTAGE_COPY"]),
+            ("ssr/post.comp", "ssr/post_stage_store", &["-DSTAGE_STORE"]),
+            ("ssr/post.comp", "ssr/post_sharpen", &["-DSHARPEN"]),
             ("ssr/ssr.comp", "ssr/rt_trace", &["-DRT"]),
             ("ssr/ssr.comp", "ssr/rt_upsample", &["-DRT", "-DUPSAMPLE"]),
             ("ssr/ssr.comp", "ssr/rt_env", &["-DRT", "-DENVMAP"]),
@@ -3507,5 +4038,119 @@ mod tests {
             assert!(shaders.iter().any(|(_, s, d)| *s == stem && d == &[format!("-D{variant}").as_str()]), "{stem} is listed");
             assert_eq!(*built, &words(&std::fs::read_to_string(android.join(format!("{stem}.spv.rs"))).unwrap())[..]);
         }
+    }
+
+    // The all off of the effects hotkey, on switches and an effect of the
+    // test's own, so the client's are never touched.
+
+    static T_ON: [AtomicBool; 3] = [const { AtomicBool::new(false) }; 3];
+
+    fn test_switches() -> Vec<Switched> {
+        ["a", "b", "c"].iter().zip(&T_ON).map(|(&name, on)| Switched { name, on }).collect()
+    }
+
+    fn now(switches: &[Switched]) -> Vec<bool> {
+        switches.iter().map(|s| s.on.load(Relaxed)).collect()
+    }
+
+    #[test]
+    fn all_off_clears_every_switch_and_puts_back_exactly_the_saved_ones() {
+        let sw = test_switches();
+        for (s, on) in sw.iter().zip([true, false, true]) {
+            s.on.store(on, Relaxed);
+        }
+        let mut all = AllOff::new();
+        assert!(!all.is_off());
+        assert!(!all.turn_on(&sw), "nothing to put back yet");
+        assert!(all.turn_off(&sw));
+        assert!(all.is_off());
+        assert_eq!(now(&sw), [false, false, false]);
+        assert_eq!(all.saved_on(&sw), ["a", "c"]);
+        // A second off keeps what was saved the first time.
+        assert!(!all.turn_off(&sw));
+        assert_eq!(all.saved_on(&sw), ["a", "c"]);
+        assert!(all.turn_on(&sw));
+        assert!(!all.is_off());
+        assert_eq!(now(&sw), [true, false, true]);
+        // And again, the same.
+        assert!(all.turn_off(&sw) && all.turn_on(&sw));
+        assert_eq!(now(&sw), [true, false, true]);
+    }
+
+    #[test]
+    fn a_switch_changed_while_all_off_is_followed() {
+        let sw = test_switches();
+        let mut all = AllOff::new();
+        for s in &sw {
+            s.on.store(true, Relaxed);
+        }
+        all.turn_off(&sw);
+        // devctl turns b off: it stays off when the rest come back.
+        all.switch_changed(1, false);
+        assert_eq!(all.saved_on(&sw), ["a", "c"]);
+        all.turn_on(&sw);
+        assert_eq!(now(&sw), [true, false, true]);
+        // devctl turns one on while all are off: that ends the all off, with
+        // the switches as they are.
+        all.turn_off(&sw);
+        all.switch_changed(2, true);
+        assert!(!all.is_off());
+        assert!(!all.turn_on(&sw));
+        assert_eq!(now(&sw), [false, false, false]);
+        // Out of range or with nothing off, nothing happens.
+        all.switch_changed(9, false);
+        assert_eq!(all, AllOff::new());
+    }
+
+    static T_FX_ON: AtomicBool = AtomicBool::new(false);
+    static T_FX_VALUES: [AtomicU32; SLOTS] = [const { AtomicU32::new(0) }; SLOTS];
+    /// The reflections' knobs and looks, with values and a switch of its own.
+    static T_FX: Effect = Effect {
+        name: "test",
+        title: "Test",
+        summary: "",
+        index: 0,
+        env: "INTOXICATED_TEST_EFFECT",
+        look_env: "INTOXICATED_TEST_EFFECT_LOOK",
+        knobs: &KNOBS,
+        looks: &LOOKS,
+        not_a_look: &NOT_A_LOOK,
+        values: &T_FX_VALUES,
+        on: &T_FX_ON,
+        usage: USAGE,
+    };
+
+    #[test]
+    fn back_on_an_effect_has_the_look_it_had() {
+        let fx = &T_FX;
+        let look = fx.start_values("clean_mirror").expect("a look");
+        for (k, v) in fx.knobs.iter().zip(&look) {
+            fx.set(k, *v);
+        }
+        let intensity = fx.find("intensity").unwrap();
+        fx.set(intensity, [0.77; 3]);
+        fx.on.store(true, Relaxed);
+        let before = fx.current();
+        let sw = [Switched { name: fx.name, on: fx.on }];
+        let mut all = AllOff::new();
+        all.turn_off(&sw);
+        assert!(!fx.is_on());
+        assert_eq!(fx.current(), before, "off leaves the knobs alone");
+        all.turn_on(&sw);
+        assert!(fx.is_on());
+        assert_eq!(fx.current(), before);
+        assert_eq!(fx.get(intensity)[0], 0.77);
+    }
+
+    #[test]
+    fn every_effect_is_switched_and_the_verb_is_known() {
+        let names: Vec<&str> = switched().iter().map(|s| s.name).collect();
+        if cfg!(feature = "rt") {
+            assert_eq!(names, ["ssr", "dof", "bloom", "lens", "sharpen", "rt"]);
+        } else {
+            assert_eq!(names, ["ssr", "dof", "bloom", "lens", "sharpen"]);
+        }
+        assert_eq!(control_verb("effects", &["sideways"]), Some(Err(EFFECTS_USAGE.to_string())));
+        assert_eq!(names_or_none(&[]), "none was on");
     }
 }

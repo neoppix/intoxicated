@@ -36,6 +36,8 @@ pub fn finish(ending: Ending<'_>) -> ! {
 /// Flush what was printed and end the process with `code`, without running
 /// `atexit` handlers or destructors.
 pub fn leave(code: i32) -> ! {
+    // `_exit` skips the claim's `Drop`, which would remove it.
+    intoxicated_runtime::profile_lock::withdraw_pid_file();
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     // SAFETY: `_exit` takes a status and does not return.

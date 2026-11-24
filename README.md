@@ -42,6 +42,10 @@ the resulting `SIGILL`, routing each through `bionic_syscall`, so the anticheat
 stops seeing the thing it was killing the client for. That fix is what makes any
 of the rest matter.
 
+On top of that it can draw its own [visual effects](#visual-effects) under the
+HUD: reflections, depth of field, bloom, lens effects and sharpening, with a
+competitive and a cinematic mode, all optional.
+
 ## Get it running
 
 This is a **build-from-source hobby port** on FreeBSD, tested on FreeBSD
@@ -66,10 +70,42 @@ module), lists the commands that need root and asks before running them, with
 the password going to sudo, doas or su. Then it clones the checkout to
 `~/intoxicated` (`INTOXICATED_REPO` picks another place), builds it, installs
 the launcher and the desktop entry, offers
-[Intoxicated Settings](#intoxicated-settings) and to open roblox.com's Play
-button in Intoxicated, and fetches the Roblox build. Running it again, or
+[Intoxicated Settings](#intoxicated-settings), the
+[visual effects](#visual-effects) and to open roblox.com's Play button in
+Intoxicated, and fetches the Roblox build. Running it again, or
 `intoxicated --update`, updates an install. It does what the steps below do,
 which stay here for anyone who would rather do them by hand.
+
+The visual effects (screen-space reflections, depth of field, bloom, lens and
+sharpening) are optional and asked about after Intoxicated Settings, no by
+default; even when installed they stay off until you turn them on. The answer
+is kept in `~/.config/intoxicated/install.conf`, so `intoxicated --update`
+builds the same way and does not ask again. To change it later:
+
+```sh
+intoxicated --update --effects      # add them (or: sh install.sh --effects)
+intoxicated --update --no-effects   # take them out again
+```
+
+Without them the client is built with `cargo build --release
+--no-default-features`: none of their code or shaders is in it, their
+`INTOXICATED_*` variables are ignored (the log says so once), their devctl
+verbs answer `err not built`, and the Shaders page of Intoxicated Settings
+says how to add them. An install from before this choice keeps its effects.
+
+With the visual effects, the installer then asks about the
+[experimental ray tracing](#experimental-ray-traced-reflections), no by
+default (`INTOXICATED_YES=1` does not say yes to it); it is kept as `RT=` in
+the same file. Built in, it still stays off until turned on:
+
+```sh
+intoxicated --update --rt           # add it (needs the effects; or: sh install.sh --rt)
+intoxicated --update --no-rt        # take it out again
+```
+
+With it the client is built with `cargo build --release --features rt`;
+without it none of its code or shaders is in the client, `INTOXICATED_RT=1`
+is ignored (the log says so once) and devctl `rt` answers `err not built`.
 
 **1. Prerequisites** (as root):
 
@@ -96,6 +132,8 @@ git clone --recursive https://github.com/neoppix/intoxicated ~/intoxicated
 cd ~/intoxicated
 cargo build -p intoxicated-runtime --release
 # produces target/release/intoxicated-run, a native FreeBSD binary
+# (add --no-default-features to leave the visual effects out, or
+# --features rt to add the experimental ray tracing)
 ```
 
 **3. Install the launcher** (as root):
@@ -116,11 +154,18 @@ intoxicated '<link>'     # a roblox:// link, roblox.com's Play link, or a
                          # https://www.roblox.com/games/<id> page link
 intoxicated --update-apk # fetch the newest Roblox build, then exit
 intoxicated --update     # update Intoxicated itself (pull, build, reinstall)
+intoxicated --update --effects     # the same, adding the visual effects
+intoxicated --update --no-effects  # the same, taking them out
+intoxicated --update --rt          # the same, adding the experimental ray tracing
 intoxicated --default-flags  # print the flags the client sets itself (JSON)
 intoxicated --ssr-looks  # print the reflections' settings and looks (JSON)
-intoxicated --shader-looks  # the same for reflections, depth of field, bloom
+intoxicated --shader-looks  # the same for every effect, and the modes
+                            # ({"available": false} when built without them)
 intoxicated --version    # print the client's version line
-INTOXICATED_PROFILE=alt intoxicated   # run another profile (see below)
+intoxicated --help       # print the launcher's usage
+intoxicated --profile alt [<placeId> | '<link>']
+                         # run another profile (see below)
+INTOXICATED_PROFILE=alt intoxicated   # the same, from the environment
 ```
 
 To update Intoxicated itself, run `intoxicated --update` (the installer, from
@@ -130,7 +175,8 @@ in step 3:
 ```sh
 cd ~/intoxicated
 git pull --recurse-submodules
-cargo build --release    # the client and the APK fetcher
+cargo build --release    # the client and the APK fetcher; add
+                         # --no-default-features for no visual effects
 ```
 
 The git history was restarted on 2026-11-23, so a clone made before then
@@ -171,10 +217,14 @@ certificate**, so a tampered download is caught rather than trusted. It keeps it
 in `~/.cache/intoxicated/apk` and fetches it again if that is ever cleared.
 
 Your sign-in, settings and Roblox's own storage live in the profile,
-`~/.local/share/intoxicated/profiles/default`. `INTOXICATED_PROFILE=<name>`
-(1 to 32 letters, digits, `-` and `_`) runs another one, in
-`profiles/<name>`, with its own account, storage and `flags.json`; one client
-runs per profile, so two profiles can play at the same time.
+`~/.local/share/intoxicated/profiles/default`. `intoxicated --profile <name>`
+or `INTOXICATED_PROFILE=<name>` (1 to 32 letters, digits, `-` and `_`; the
+switch wins over the variable, which wins over settings.conf) runs another
+one, in `profiles/<name>`, with its own account, storage and `flags.json`;
+one client runs per profile, so two profiles can play at the same time (see
+[Several clients at once](#several-clients-at-once)). A second client on a
+profile that is already open is refused with exit status 3, and the launcher
+says which profile it was.
 
 The launcher also reads `~/.config/intoxicated/settings.conf`
 (`$XDG_CONFIG_HOME`): one `INTOXICATED_*=value` line per switch, exported
@@ -218,6 +268,29 @@ client no longer runs `nvidia-settings` to force NVIDIA's PowerMizer to maximum
 performance (the setting did not hold on FreeBSD's driver and cost about 0.1 s
 of every start), so `INTOXICATED_GPU_MAXPERF` is gone, and the early client
 settings are always sent, so `INTOXICATED_EARLY_SETTINGS` is no longer needed.
+
+## Visual effects
+
+Intoxicated can draw its own effects into the game's picture, before the HUD is
+drawn, so menus, chat and the leaderboard are never blurred, reflected or tinted
+(a ReShade-style overlay cannot do that). All of them are off by default and
+switched on one by one, or all at once with a mode:
+
+| Effect | Switch | What it does |
+|---|---|---|
+| Reflections | `INTOXICATED_SSR=1` | wet, glossy floors reflecting what is on screen |
+| Depth of field | `INTOXICATED_DOF=1` | a camera-lens blur of the far background, or of everything but your character for clips |
+| Bloom | `INTOXICATED_BLOOM=1` | a glow around bright lights and neon |
+| Lens | `INTOXICATED_LENS=1` | chromatic aberration, a vignette, a halo round bright areas |
+| Sharpen | `INTOXICATED_SHARPEN=1` | contrast adaptive sharpening |
+| Modes | `INTOXICATED_SHADERS_MODE=competitive` or `cinematic` | every effect at once, from a playable or a clip look |
+
+The settings app's Shaders page sets all of this. The effects are optional:
+the installer asks whether to build them in (no by default), and a client
+built without them ignores every variable here and says so once in its log.
+`intoxicated --update --effects` adds them later and
+`intoxicated --update --no-effects` takes them out again (see
+[Get it running](#get-it-running)). Each effect is described in detail below.
 
 Screen-space reflections are an experimental extra, off by default:
 `INTOXICATED_SSR=1` (in the environment or in `settings.conf`) makes surfaces
@@ -282,8 +355,90 @@ crosshair is on; mode 2 can settle on the floor just behind the character when
 little else is in view (INFERRED); and the studs of the fixed focus assume a
 near plane of 0.1 studs, which was not measured.
 
+Lens effects and sharpening are two more, each off by default and drawn
+after the bloom, sharpening last, so the HUD is never split into colours or
+sharpened:
+
+- `INTOXICATED_LENS=1`: chromatic aberration, red and blue pulled apart
+  towards the screen edges and not at all in the middle
+  (`_ABERRATION`, pixels at 1080p in the corners, default 1.5), a vignette
+  (`_VIGNETTE`, 0.15) and a rainbow fringe just outside the brightest areas,
+  taken from the bloom's chain (`_HALO`, 0.3; the lens runs the chain
+  itself when the bloom is off). Looks: `subtle` (the default), `prism`,
+  `film`.
+- `INTOXICATED_SHARPEN=1`: contrast adaptive sharpening, written for
+  Intoxicated from the idea of AMD's FidelityFX CAS: fine texture detail is
+  raised most where the neighbourhood has room for it, edges already at full
+  contrast barely, and no pixel changes by more than `_LIMIT` (0.1).
+  `_STRENGTH` is 0.5; `_DEPTH_AWARE=1` (the default) keeps it from reaching
+  across depth edges, so outlines get no halo. Looks: `light` (the default),
+  `crisp`, `crunchy`.
+
+devctl takes `lens` and `sharpen` with the same words. At 3362x1349 on an
+RTX 4070 Ti on Timebomb Duels the sharpen took about 0.14 ms of GPU time per
+frame alone and about 0.2 ms after other effects (it copies the scene once
+first), the lens about 0.11 ms with the bloom on and about 0.15 ms when it
+runs the bloom chain itself; frame times did not change measurably (p50 4.2
+ms). Neither shows anything that is not drawn: the aberration moves drawn
+colours by a few pixels, the vignette only darkens and the fringe only adds
+light around what is already bright. Limits: the fringe shows mostly as a warm
+yellow glow round white surfaces rather than a clear rainbow, faint at the
+default and clear at prism's 1.0; what depth-aware sharpening changes along
+an outline could not be told apart in game, as the character moved between
+the shots; and like the other effects both work on the engine's 10-bit
+picture, not HDR.
+
+`INTOXICATED_SHADERS_MODE` switches all five at once and starts each from a
+look: `off`; `competitive`, pretty but playable (the reflections' competitive
+look, the depth of field's playable focus past your character, the soft
+bloom, light sharpening, no lens effects); or `cinematic`, the clip look
+(clean_mirror reflections, the depth of field focused on your character, the
+neon bloom, the prism lens and crunchy sharpening). An effect's own switch or
+look variable wins over the mode, and its knobs change the look as always;
+devctl `shaders mode <name>` does the same while the game runs and `shaders`
+reports each effect's switch and look. At 3362x1349 on the RTX 4070 Ti the
+competitive set took about 1.3 ms of GPU time per frame and the cinematic
+set about 1.5 ms, everything included (at 1667x1349 about 0.6 and 0.7
+ms); frame times did not change measurably (p50 4.2 ms either way, as with
+all off).
+
+To compare with and without, or to get the frame time back for a round,
+`INTOXICATED_EFFECTS_HOTKEY=1` (the Shaders page's "F9 turns all effects on
+and off in game") makes F9 a hotkey: pressed in game it turns every effect
+off, and pressed again puts back exactly the switches and looks they had,
+live, without a restart. While they are off nothing of theirs is recorded
+into the frame, so they cost no GPU time. It is off by default. While it is
+on, Roblox no longer sees F9, so F9 does not open Roblox's developer console;
+F9 still goes to Roblox while a text box such as the chat has focus, or with
+Shift, Ctrl or Alt held. A key name instead of `1` (`F1` to `F10` or `F12`)
+takes that key instead. Each press is one line in the log, and devctl
+`effects toggle|on|off|get` does the same without a key. A client built
+without the effects ignores the setting, says so once, and leaves F9 to
+Roblox.
+
 Ray-traced reflections are an experimental, opt-in alternative to the
 screen-space ones; see [Experimental: ray-traced reflections](#experimental-ray-traced-reflections).
+
+## Macros
+
+A macro binds a key to a recorded sequence of input. When the key is pressed
+with the Roblox window focused, the client plays the sequence back through its
+own input path, the same path devctl's `move`, `click`, `key` and `text` use;
+nothing is sent to the X server, so a macro never lands on the desktop and only
+ever runs in game. The steps are taps and key holds, pointer moves, clicks,
+scrolls, typed text and waits. A macro can also keep its trigger key from the
+game, and repeat its steps while the key is held.
+
+Macros live in `<profile>/macros.json`, read once at launch. The
+[Macros page](#intoxicated-settings) of Intoxicated Settings writes the file;
+it can also be edited by hand, as a `{"intoxicated-macros": 1, "macros": [...]}`
+object whose macros carry a `name`, a `trigger` (a `key` evdev code and
+optional `ctrl`/`shift`/`alt`), optional `enabled`, `swallow` and `repeat`, and
+a `steps` array. A macro that cannot be read is skipped and the rest kept.
+Macros are off by default: only `INTOXICATED_MACROS=1` (the page's "Run
+macros" switch) turns them on. The in-game trigger and playback are not covered by the automated
+tests (they need a running client); the file's parsing, the step model and the
+settings app's editor are.
 
 When the disk holding the profile's Roblox data runs short, the client says so:
 below 2 GiB free as it hands Roblox its window, below 512 MiB again when the
@@ -295,13 +450,17 @@ syscall sites the anticheat fix needs are found automatically for every build.
 
 ## Experimental: ray-traced reflections
 
-**Experimental. Off by default, opt in at your own risk.** `INTOXICATED_RT=1`
+**Experimental. Off by default, opt in at your own risk.** It is only in a
+client built with it (the installer's ray tracing question, `intoxicated
+--update --rt`, or `cargo build --release --features rt`). Then
+`INTOXICATED_RT=1`
 (in the environment or settings.conf, or the switch under "Ray-traced
 reflections (experimental)" on the Shaders page of Intoxicated Settings, which
 asks for confirmation) replaces the screen-space reflections with ray-traced
 ones; remove the line, or turn the switch off, to go back. No look or preset
 turns it on. The launcher and the client both print a warning when it is on,
-and devctl `rt stats` repeats it.
+and devctl `rt stats` repeats it. The effects hotkey (F9, when on) turns it
+off and back on with the effects.
 
 What it does: each frame the client captures the opaque world geometry the
 engine draws in its 3D scene (transform feedback, enabled through Vulkan: the
@@ -337,7 +496,7 @@ What to know before turning it on:
 - It takes up to an eighth of the video memory, at most about 1.6 GB
   (room for two million triangles on a 12 GB card; `INTOXICATED_RT_MEMORY`
   sets the budget in MiB, `INTOXICATED_RT_TRIANGLES` the triangles), and
-  about 1 to 2 ms more GPU time a frame. Cached parts are traced within
+  about 2 to 3 ms more GPU time a frame, 3 to 6 ms with the indirect light. Cached parts are traced within
   512 studs of the camera (`INTOXICATED_RT_REACH`). Measured in Timebomb Duels at 1667x1349 on an RTX 4070 Ti: 0.2 to
   0.3 ms for the hierarchy and 0.5 to 0.7 ms for the rays (all of the
   reflections' work 0.9 to 1.3 ms, against 0.6 ms for the screen-space
@@ -490,15 +649,29 @@ An optional desktop app for what is otherwise set by hand. FastFlags: presets
 MSAA), every flag in the profile's `flags.json` with inline editing, import of
 a JSON file (a Bloxstrap export or a `ClientAppSettings.json`) with a preview,
 export and reset. Client options: window, input, graphics, audio and session.
-Shaders: the screen-space reflections, the depth of field and the bloom, one
-group each with a switch, the named looks (Competitive, Wet road, Clean
-mirror, Puddles and Glossy for the reflections; Playable, Cinematic and Portrait
-for the depth of field; Soft, Neon and Dreamy for the bloom) and a fine-tune
-row for each of their settings; picking a look clears the fine tuning, after
-asking, and each row has its own reset. Below them, marked experimental, the
-switch for the ray-traced reflections, with their warnings and a confirmation. Like the client options they apply from the
-next launch. Profiles: create, delete and pick the default one. And Play, a place id or
-link field, and the two update commands. It is a Qt 6 Widgets program in
+Shaders: at the top the modes Off, Competitive and Cinematic, with Custom
+lit when the effects were changed by hand (picking a mode sets every
+effect's switch and look and clears the fine tuning, after asking); then the
+screen-space reflections, the depth of field, the bloom, the lens and the
+sharpen, one group each with a switch, the named looks (Competitive, Wet
+road, Clean mirror, Puddles and Glossy for the reflections; Playable,
+Cinematic and Portrait for the depth of field; Soft, Neon and Dreamy for the
+bloom; Subtle, Prism and Film for the lens; Light, Crisp and Crunchy for the
+sharpen) and a fine-tune row for each of their settings (the depth of
+field's focus as Fixed distance, Character or Past the character); picking a
+look clears that effect's fine tuning, after asking, and each row has its
+own reset. Below them, marked experimental, the switch for the ray-traced
+reflections and light, with their warnings and a confirmation; a client
+built without the ray tracing shows instead how to add it (`intoxicated
+--update --rt`). Like the client options they apply from the next launch.
+With a client built without the visual effects the Shaders page only says
+how to add them (`intoxicated --update --effects`). Macros:
+the profile's in-game macros, a list on the left and the selected one's trigger
+key, Ctrl/Shift/Alt, and steps on the right, with a master switch for the lot;
+see [Macros](#macros) below. Profiles: create, delete and pick the default one. And Play, a place id or
+link field, Run several and Running (see
+[Several clients at once](#several-clients-at-once)), and the two update
+commands. It is a Qt 6 Widgets program in
 `settings/` that needs `qt6-base` and nothing else.
 
 The installer asks whether to install it (the answer defaults to yes) while it
@@ -535,9 +708,81 @@ installer asks for the password through the app's own dialog (`sudo -A` with
 `SUDO_ASKPASS`). `ctest --test-dir settings/build` runs the app's self-test
 of its file handling, against scratch directories.
 
-## Status: early, but it plays
+**Macros: use at your own risk.** The Macros page plays back recorded input.
+Roblox's Community Standards forbid gaining an unfair advantage and using
+automation for disruptive tasks, and many games ban macros in their own rules
+and moderate them themselves. Whether a macro is allowed depends on the game
+you use it in; check its rules first. A macro that breaks a game's rules can
+get you kicked or banned from that game, and that is on you, not on
+Intoxicated.
 
-Reason-304 is solved, so the client stays in the game. Sign-in, loading a game,
+## Several clients at once
+
+**Roblox does not officially support running several clients at once, and a
+Byfron developer has said that running multiple clients may be treated as
+malicious. Use alt accounts, and do it at your own risk.** Intoxicated does
+nothing to get around anything of Roblox's: it has no single-instance check
+to defeat. Each client is simply its own process on its own profile.
+
+Every profile is its own Roblox account and storage, and one client runs per
+profile, so starting several means one launch per profile:
+
+```sh
+intoxicated &                         # default
+intoxicated --profile alt &           # a second account, in its own window
+intoxicated --profile farm_2 189707 & # a third, straight into a game
+```
+
+A profile that is not signed in opens at the Roblox login screen in its own
+window. The window title names the profile when it is not `default`
+(`Intoxicated <version> (<commit>) [alt]`); `WM_CLASS` is `intoxicated`,
+`Intoxicated` for all of them, so window rules still match every one.
+
+In Intoxicated Settings, the Play page has **Run several**: a switch per
+profile, with whether it is signed in and whether it is running now, and
+**Play selected**, which starts one launcher per checked profile (with
+`INTOXICATED_PROFILE` set), a second and a half apart. The first time in a
+run of the app that this would leave more than one client running, it shows
+the warning above with Continue and Cancel. **Running** lists the clients
+running now, read from the profiles' locks every two seconds, each with a
+**Stop** button. While a client holds its profile it writes its process id to
+`<profile>/client.pid` and removes it when it exits; Stop sends that process
+SIGTERM, which closes it the way Ctrl-C does, and only while that process
+holds the profile's lock open, so a file left by a crash or a process id
+used again since is never signalled. Nothing is ever stopped by name.
+
+What clients on different profiles share, and how it is kept safe:
+
+- The Roblox build in `~/.cache/intoxicated/apk` is only read. When there is
+  none yet, the first launch downloads it and the others wait for that
+  download instead of failing.
+- `~/.cache/intoxicated/clientsettings.json` and
+  `~/.cache/intoxicated/syscall-sites/` are written through a temporary file
+  of each writer's own and a rename, so two clients refreshing them together
+  leave one whole file. The asset folder (`~/.cache/intoxicated/assets`) is
+  written the same way, and the font links in `~/.cache/intoxicated/system`
+  are replaced by a rename, so a running client never finds one missing
+  while the next client starts.
+- settings.conf is only read by the launcher, and every client reads the
+  same options from it. The devctl socket, macros, logs, the run directory
+  and Roblox's own storage are all in the profile. A devctl socket path
+  shared through `INTOXICATED_DEV_CONTROL_SOCKET` is not taken from a client
+  still listening on it; the second client goes without devctl and says so.
+- Each client owns the X11 `CLIPBOARD` only while its last copy is the
+  newest, as any X program does.
+- Sound: every client opens `/dev/dsp` itself, and sound(4)'s virtual
+  channels mix them. With `dev.pcm.N.play.vchans=1`, the default, three
+  opens of the same device at once all succeed; a device with vchans off
+  needs them turned on for a second client to play.
+- Intoxicated Settings sees whether a profile is in use by taking its lock
+  for an instant; a client starting just then waits up to 0.3 s for it
+  rather than refusing.
+
+## Status: playable
+
+Intoxicated is used for everyday play: full matches, long sessions and fast
+competitive games run start to finish. Reason-304 is solved, so the client
+stays in the game. Sign-in, loading a game,
 moving around, mouse and keyboard (including shift-lock, Ctrl+A/C/X/V and real
 clipboard), uncapped framerate, held-key input, and audio all work. Keys reach
 the game by their position on any keyboard layout, with any modifiers held

@@ -1,10 +1,13 @@
 // Intoxicated Settings: the Shaders page. The effects the client draws into
-// the game before the HUD (screen-space reflections, depth of field, bloom),
-// one group each: the switch, the named looks and a fine-tune row per knob,
-// each written to settings.conf as it changes; and, last, the experimental
-// ray-traced reflections, a switch behind a confirmation. The effects, their knobs and
-// their looks come from `intoxicated --shader-looks`, so nothing here keeps
-// a copy of their values.
+// the game before the HUD (screen-space reflections, depth of field, bloom,
+// lens, sharpen): at the top the whole-page modes and the switch for the F9
+// hotkey that turns them all off and back on in game, then one group each:
+// the switch, the named looks and a fine-tune row per knob, each written to
+// settings.conf as it changes; and, last, the experimental ray-traced
+// reflections, a switch behind a confirmation, shown only when the client
+// was built with them. The effects, their knobs, their looks and the modes
+// come from `intoxicated --shader-looks`, so nothing here keeps a copy of
+// their values.
 
 #include "app.h"
 #include "style.h"
@@ -49,8 +52,8 @@ const KnobText kKnobText[] = {
     {"ssr", "fov", "Field of view", "The camera's vertical field of view the reflections assume; Roblox's is 70"},
     {"ssr", "keep_colour", "Keep colour", "0 the colours it reflects, 1 their brightness in the surface's own hue"},
     {"dof", "strength", "Strength", "The largest blur, as a radius in pixels at 1080p"},
-    {"dof", "focus_mode", "Focus mode", "0 a fixed distance, 1 your character at the screen centre, 2 what lies past it"},
-    {"dof", "focus_distance", "Focus distance", "Where the focus is in mode 0, in studs"},
+    {"dof", "focus_mode", "Focus", "Where the focus is: a fixed distance, your character at the screen centre, or what lies past it"},
+    {"dof", "focus_distance", "Focus distance", "Where the focus is with a fixed distance, in studs"},
     {"dof", "focus_range", "Near range", "How far in front of the focus stays sharp with near blur, relative to its distance"},
     {"dof", "far_range", "Far range", "How far behind the focus stays sharp, relative to its distance"},
     {"dof", "near_blur", "Near blur", "Things nearer than the focus blur too"},
@@ -61,6 +64,12 @@ const KnobText kKnobText[] = {
     {"bloom", "knee", "Softness", "How gently the glow fades in around the threshold"},
     {"bloom", "radius", "Radius", "0 a tight glow around each light, 1 a wide haze"},
     {"bloom", "tint", "Tint", "The colour of the glow (red, green, blue)"},
+    {"lens", "aberration", "Colour split", "How far red and blue part in the corners, in pixels at 1080p; none at the centre"},
+    {"lens", "vignette", "Vignette", "How much darker the corners are"},
+    {"lens", "halo", "Rainbow halo", "A rainbow fringe round the brightest areas, from the bloom's glow"},
+    {"sharpen", "strength", "Strength", "How strongly texture detail is raised"},
+    {"sharpen", "limit", "Limit", "The most any pixel may change, 0 to 1"},
+    {"sharpen", "depth_aware", "Depth aware", "Not across depth edges, so outlines get no halo"},
 };
 
 // The switch row of each effect, and what is offered when the client cannot
@@ -76,6 +85,8 @@ const EffectText kEffectText[] = {
     {"ssr", "Reflections (SSR)", "Screen-space reflections", "INTOXICATED_SSR"},
     {"dof", "Depth of field", "Depth of field", "INTOXICATED_DOF"},
     {"bloom", "Bloom", "Bloom", "INTOXICATED_BLOOM"},
+    {"lens", "Lens", "Lens effects", "INTOXICATED_LENS"},
+    {"sharpen", "Sharpen", "Sharpening", "INTOXICATED_SHARPEN"},
 };
 
 KnobText knobText(const QString &effect, const QString &name) {
@@ -127,7 +138,7 @@ QLabel *problemLabel() {
     auto *l = new QLabel;
     l->setObjectName(QStringLiteral("error"));
     l->setWordWrap(true);
-    l->setContentsMargins(6, 0, 6, 4);
+    l->setContentsMargins(14, 0, 14, 6);
     l->hide();
     return l;
 }
@@ -140,7 +151,28 @@ ShadersPage::ShadersPage(AppState *state) : m_state(state) {
                                                "settings.conf for every profile. Changes apply the next time "
                                                "Intoxicated starts."));
     QString error;
-    const auto tables = readShaderTables(&error);
+    const auto tables = readShaderTables(&error, &m_modes, &m_unavailable, &m_rtBuilt);
+    if (m_unavailable) {
+        // A client built without them (install.sh --no-effects): nothing to
+        // set, so the page only says how to add them.
+        Section s = section(QStringLiteral("Not installed"));
+        auto *v = new QVBoxLayout(s.body);
+        v->setContentsMargins(14, 10, 14, 10);
+        v->setSpacing(6);
+        v->addWidget(note(QStringLiteral("This Intoxicated was installed without the visual effects (reflections, "
+                                         "depth of field, bloom, lens and sharpening). To add them, run %1 in a "
+                                         "terminal, or the installer with --effects. They stay off until you turn "
+                                         "them on here; --no-effects takes them out again.")
+                              .arg(kAddEffectsCommand)));
+        auto *command = new QLabel(kAddEffectsCommand);
+        command->setObjectName(QStringLiteral("rowTitle"));
+        command->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        v->addWidget(command);
+        b->addWidget(s.box);
+        b->addStretch(1);
+        m_tableError = nullptr;
+        return;
+    }
     m_tableError = problemLabel();
     setProblem(m_tableError, tables ? QString()
                                     : QStringLiteral("The effects could not be read, so only their switches are "
@@ -164,6 +196,69 @@ ShadersPage::ShadersPage(AppState *state) : m_state(state) {
             m_effects.append(fx);
         }
     }
+    if (!m_modes.isEmpty()) {
+        Section s = section(QStringLiteral("Mode"));
+        auto *v = new QVBoxLayout(s.body);
+        v->setContentsMargins(14, 10, 14, 10);
+        v->setSpacing(6);
+        auto *row = new QHBoxLayout;
+        row->setSpacing(6);
+        for (int i = 0; i <= m_modes.size(); ++i) {
+            const bool custom = i == m_modes.size();
+            auto *btn = new QPushButton(custom ? QStringLiteral("Custom") : m_modes[i].title);
+            btn->setObjectName(QStringLiteral("segment"));
+            btn->setCheckable(true);
+            btn->setCursor(Qt::PointingHandCursor);
+            btn->setFocusPolicy(Qt::NoFocus);
+            btn->setMinimumHeight(30);
+            btn->setToolTip(custom ? QStringLiteral("The effects below as you set them")
+                                   : QStringLiteral("%1=%2").arg(kShaderModeSetting, m_modes[i].name));
+            row->addWidget(btn, 1);
+            m_modeButtons.append(btn);
+            // Custom is where hand changes land; it is not picked.
+            if (custom)
+                connect(btn, &QPushButton::clicked, this, [this] { reload(); });
+            else
+                connect(btn, &QPushButton::clicked, this, [this, i] { modeChosen(i); });
+        }
+        linkSegments(row, m_modeButtons);
+        v->addLayout(row);
+        m_modeDesc = note(QString());
+        v->addWidget(m_modeDesc);
+        b->addWidget(s.box);
+        b->addSpacing(8);
+    }
+    {
+        // The effects hotkey: its own line, not an effect's, so a mode line
+        // is left as it is when it is written.
+        Section s = section(QStringLiteral("In game"));
+        auto *v = new QVBoxLayout(s.body);
+        v->setContentsMargins(0, 0, 0, 0);
+        v->setSpacing(0);
+        m_hotkey = new Switch;
+        m_hotkey->setToolTip(kEffectsHotkeySetting);
+        v->addWidget(settingRow(QStringLiteral("F9 turns all effects on and off in game"),
+                                QStringLiteral("While this is on, F9 no longer opens Roblox's developer console. "
+                                               "Typing in chat is not affected. Off by default; on writes "
+                                               "INTOXICATED_EFFECTS_HOTKEY=1."),
+                                m_hotkey));
+        b->addWidget(s.box);
+        b->addSpacing(8);
+        connect(m_hotkey, &QCheckBox::clicked, this, [this](bool on) {
+            if (m_filling)
+                return;
+            SettingsConf conf;
+            QString error;
+            bool ok = conf.load(settingsConfPath(), &error);
+            if (ok) {
+                setEffectsHotkeyOn(conf, on);
+                ok = conf.save(&error);
+            }
+            if (!ok)
+                QMessageBox::warning(this, QStringLiteral("Shaders"), error);
+            reload();
+        });
+    }
     for (int i = 0; i < m_effects.size(); ++i)
         buildEffect(b, i);
     buildRayTracing(b);
@@ -176,7 +271,7 @@ void ShadersPage::buildEffect(QVBoxLayout *page, int index) {
     EffectUi &fx = m_effects[index];
     Section s = section(fx.table.title);
     auto *v = new QVBoxLayout(s.body);
-    v->setContentsMargins(8, 2, 8, 4);
+    v->setContentsMargins(0, 0, 0, 0);
     v->setSpacing(0);
     page->addWidget(s.box);
     page->addSpacing(8);
@@ -205,7 +300,7 @@ void ShadersPage::buildEffect(QVBoxLayout *page, int index) {
         d->addWidget(separator());
         auto *look = new QWidget;
         auto *lv = new QVBoxLayout(look);
-        lv->setContentsMargins(6, 8, 6, 8);
+        lv->setContentsMargins(14, 8, 14, 10);
         lv->setSpacing(6);
         auto *title = new QLabel(QStringLiteral("Look"));
         title->setObjectName(QStringLiteral("rowTitle"));
@@ -223,6 +318,7 @@ void ShadersPage::buildEffect(QVBoxLayout *page, int index) {
             fx.lookButtons.append(btn);
             connect(btn, &QPushButton::clicked, this, [this, index, i] { lookChosen(index, i); });
         }
+        linkSegments(row, fx.lookButtons);
         lv->addLayout(row);
         fx.lookDesc = note(QString());
         lv->addWidget(fx.lookDesc);
@@ -269,6 +365,17 @@ void ShadersPage::buildRayTracing(QVBoxLayout *page) {
     v->setSpacing(0);
     page->addWidget(s.box);
     page->addSpacing(8);
+    if (!m_rtBuilt) {
+        // A client built without it (the installer's ray tracing question
+        // answered no): nothing to switch, only how to add it.
+        auto *n = note(QStringLiteral("Not installed. This Intoxicated was built without the experimental ray "
+                                      "tracing. To add it, run %1 in a terminal (it needs the visual effects); it "
+                                      "stays off until you turn it on here.")
+                           .arg(kAddRayTracingCommand));
+        n->setContentsMargins(6, 8, 6, 8);
+        v->addWidget(n);
+        return;
+    }
 
     auto *top = new QHBoxLayout;
     top->setContentsMargins(6, 2, 6, 6);
@@ -330,7 +437,29 @@ void ShadersPage::buildFineTune(QVBoxLayout *rows, int index) {
         auto *h = new QHBoxLayout(control);
         h->setContentsMargins(0, 0, 0, 0);
         h->setSpacing(10);
-        if (knob.kind == SsrKind::Switch) {
+        const QStringList choices = knobChoices(fx.table.name, knob);
+        if (!choices.isEmpty()) {
+            auto *row = new QHBoxLayout;
+            row->setSpacing(6);
+            for (int c = 0; c < choices.size(); ++c) {
+                auto *btn = new QPushButton(choices[c]);
+                btn->setObjectName(QStringLiteral("segment"));
+                btn->setCheckable(true);
+                btn->setCursor(Qt::PointingHandCursor);
+                btn->setFocusPolicy(Qt::NoFocus);
+                btn->setMinimumHeight(28);
+                row->addWidget(btn);
+                kr.choices.append(btn);
+                connect(btn, &QPushButton::clicked, this, [this, index, r, c] {
+                    EffectUi &e = m_effects[index];
+                    for (int k = 0; k < e.rows[r].choices.size(); ++k)
+                        e.rows[r].choices[k]->setChecked(k == c);
+                    knobMoved(index, r);
+                });
+            }
+            linkSegments(row, kr.choices);
+            h->addLayout(row);
+        } else if (knob.kind == SsrKind::Switch) {
             kr.toggle = new Switch;
             h->addWidget(kr.toggle, 0, Qt::AlignVCenter);
             kr.shown = new QLabel;
@@ -418,16 +547,41 @@ void ShadersPage::showSliders(const KnobRow &row, const SsrValue &value) {
 }
 
 void ShadersPage::reload() {
+    if (m_unavailable)
+        return;
     m_filling = true;
     SettingsConf conf;
     QString error;
     if (!conf.load(settingsConfPath(), &error))
         QMessageBox::warning(this, QStringLiteral("Shaders"), error);
+    // What a hand-written mode line asks for, as the effects' own lines.
+    const QList<SsrTable> tables = knownTables();
+    expandShaderMode(tables, m_modes, conf);
     for (EffectUi &fx : m_effects)
         reloadEffect(conf, fx);
     if (m_rtOn)
         m_rtOn->setChecked(rtOn(conf));
+    if (m_hotkey)
+        m_hotkey->setChecked(effectsHotkeyOn(conf));
+    if (!m_modeButtons.isEmpty()) {
+        const QString current = currentShaderMode(tables, m_modes, conf);
+        for (int i = 0; i < m_modeButtons.size(); ++i)
+            m_modeButtons[i]->setChecked(i < m_modes.size() ? m_modes[i].name == current : current.isEmpty());
+        const ShaderMode *m = findShaderMode(m_modes, current);
+        m_modeDesc->setText(m ? m->description
+                              : QStringLiteral("The effects below are set by hand. Picking a mode sets every "
+                                               "effect's switch and look and clears the fine tuning."));
+    }
     m_filling = false;
+}
+
+QList<SsrTable> ShadersPage::knownTables() const {
+    QList<SsrTable> out;
+    for (const EffectUi &fx : m_effects) {
+        if (fx.known)
+            out.append(fx.table);
+    }
+    return out;
 }
 
 void ShadersPage::reloadEffect(const SettingsConf &conf, EffectUi &fx) {
@@ -462,7 +616,12 @@ void ShadersPage::reloadEffect(const SettingsConf &conf, EffectUi &fx) {
         const auto set = ssrOverride(conf, knob);
         const bool usable = set && parseSsrValue(knob, *set);
         const SsrValue value = effectiveSsrValue(fx.table, conf, knob);
-        if (row.toggle) {
+        if (!row.choices.isEmpty()) {
+            for (int c = 0; c < row.choices.size(); ++c) {
+                row.choices[c]->setChecked(qRound(value.value(0) - knob.min) == c);
+                row.choices[c]->setProperty("set", usable);
+            }
+        } else if (row.toggle) {
             row.toggle->setChecked(value.value(0) != 0.0);
             row.shown->setText(value.value(0) != 0.0 ? QStringLiteral("On") : QStringLiteral("Off"));
         } else {
@@ -493,6 +652,10 @@ void ShadersPage::edit(const std::function<bool(SettingsConf &)> &change) {
     SettingsConf conf;
     QString error;
     bool ok = conf.load(settingsConfPath(), &error);
+    // A mode line is written out as the effects' own lines first, so a
+    // change to one effect keeps what the mode set for the others.
+    if (ok)
+        expandShaderMode(knownTables(), m_modes, conf);
     if (ok && !change(conf)) {
         ok = false;
         error = QStringLiteral("That value cannot be written.");
@@ -527,6 +690,33 @@ void ShadersPage::lookChosen(int effect, int index) {
     edit([this, effect, look](SettingsConf &c) { return applySsrLook(m_effects.at(effect).table, c, look.name); });
 }
 
+void ShadersPage::modeChosen(int index) {
+    const ShaderMode mode = m_modes.at(index);
+    SettingsConf conf;
+    conf.load(settingsConfPath());
+    expandShaderMode(knownTables(), m_modes, conf);
+    QStringList tuned;
+    for (const EffectUi &fx : m_effects) {
+        if (!fx.known)
+            continue;
+        for (const QString &name : ssrOverrides(fx.table, conf))
+            tuned.append(QStringLiteral("%1 %2").arg(fx.table.title, knobTitle(fx.table.name, name).toLower()));
+    }
+    if (!tuned.isEmpty()) {
+        const auto answer = QMessageBox::question(
+            this, mode.title,
+            QStringLiteral("Use the %1 mode? It sets every effect's switch and look, and your fine tuning of %2 is "
+                           "removed.")
+                .arg(mode.title, tuned.join(QStringLiteral(", "))),
+            QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
+        if (answer != QMessageBox::Yes) {
+            reload();
+            return;
+        }
+    }
+    edit([this, mode](SettingsConf &c) { return applyShaderMode(knownTables(), m_modes, c, mode.name); });
+}
+
 void ShadersPage::knobMoved(int effect, int row) {
     if (m_filling)
         return;
@@ -534,7 +724,14 @@ void ShadersPage::knobMoved(int effect, int row) {
     const KnobRow &kr = fx.rows.at(row);
     const SsrKnob &knob = *fx.table.knob(kr.name);
     SsrValue value;
-    if (kr.toggle) {
+    if (!kr.choices.isEmpty()) {
+        for (int c = 0; c < kr.choices.size(); ++c) {
+            if (kr.choices[c]->isChecked())
+                value.append(knob.min + c);
+        }
+        if (value.isEmpty())
+            return;
+    } else if (kr.toggle) {
         value.append(kr.toggle->isChecked() ? 1.0 : 0.0);
     } else {
         for (QSlider *s : kr.sliders)

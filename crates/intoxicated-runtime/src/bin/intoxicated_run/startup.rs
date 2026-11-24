@@ -56,10 +56,16 @@ fn claim_profile(opt: &Options) -> Result<intoxicated_runtime::profile_lock::Cla
 
 /// The claim, before anything reads or writes the profile. Refused: exit 3.
 pub fn claim(opt: &Options) -> Result<intoxicated_runtime::profile_lock::Claim, ExitCode> {
-    claim_profile(opt).map_err(|refusal| {
+    let claim = claim_profile(opt).map_err(|refusal| {
         eprintln!("error: {refusal}");
         ExitCode::from(crate::cli::EXIT_PROFILE)
-    })
+    })?;
+    // For Intoxicated Settings' Stop button. Without it the client still
+    // runs; it just cannot be stopped from there.
+    if let Err(e) = claim.publish_pid() {
+        println!("  could not write {}: {e}", claim.profile_dir().join("client.pid").display());
+    }
+    Ok(claim)
 }
 
 /// The two settings that can refuse a profile before it is used.
@@ -188,6 +194,10 @@ fn enter_run_dir(opt: &mut Options, data_root: &Path) {
 
     // Here: the profile has latched and is held, and the socket lives in it.
     intoxicated_runtime::devctl::start();
+    // The profile's macros load from the same directory, read once here.
+    intoxicated_runtime::macros::load();
+    // The effects hotkey's switch, read once beside them.
+    intoxicated_runtime::effects_hotkey::load();
 
     let run = intoxicated_runtime::profile::active().join("run");
     if let Err(e) = std::fs::create_dir_all(run.join("exe")) {

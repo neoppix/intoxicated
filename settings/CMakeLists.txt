@@ -32,17 +32,27 @@ qt_add_executable(intoxicated-settings
   src/flags_page.cpp
   src/client_page.cpp
   src/shaders_page.cpp
+  src/macros_page.cpp
   src/profiles_page.cpp
   src/other_pages.cpp
+  src/several_clients.cpp
   src/selftest.cpp
 )
-target_link_libraries(intoxicated-settings PRIVATE Qt6::Widgets)
+# libutil: kinfo_getfile(3), to see which process holds a profile's lock.
+target_link_libraries(intoxicated-settings PRIVATE Qt6::Widgets util)
 target_compile_options(intoxicated-settings PRIVATE -Wall -Wextra)
 
 # The logo, compiled in, so the app finds it wherever it is installed.
 set(logo "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/branding/intoxicated-logo.png")
 set_source_files_properties("${logo}" PROPERTIES QT_RESOURCE_ALIAS intoxicated-logo.png)
 qt_add_resources(intoxicated-settings branding PREFIX / FILES "${logo}")
+
+# Icons from Phosphor Icons (MIT, icons/LICENSE). icons/*.svg are the upstream
+# files; the .png beside each is that SVG rendered white at 64x64, so the app
+# needs no SVG module (style.cpp tints them):
+#   sed 's/currentColor/#ffffff/' NAME-WEIGHT.svg | rsvg-convert -w 64 -h 64 -o NAME.png
+file(GLOB icons RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/icons/*.png")
+qt_add_resources(intoxicated-settings icons PREFIX / FILES ${icons})
 
 enable_testing()
 add_test(NAME self-test COMMAND intoxicated-settings --self-test)

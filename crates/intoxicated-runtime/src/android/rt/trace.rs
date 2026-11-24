@@ -199,19 +199,15 @@ pub(crate) struct BuildParams {
     pub pad: [u32; 3],
 }
 
-/// Whether the trace replaces the march, while the reflections are on.
-static ON: OnceLock<AtomicBool> = OnceLock::new();
-
-fn on() -> &'static AtomicBool {
-    ON.get_or_init(|| AtomicBool::new(super::requested()))
-}
-
+/// Whether the trace replaces the march, while the reflections are on
+/// (`super::ON`, with the switch on at start).
 pub(crate) fn is_on() -> bool {
-    on().load(Relaxed)
+    super::requested() && super::ON.load(Relaxed)
 }
 
 pub(crate) fn set_on(v: bool) {
-    on().store(v, Relaxed);
+    super::ON.store(v, Relaxed);
+    super::super::ssr::rt_switched();
 }
 
 /// Where a hit's colour comes from: its own (texture times colour) lit as

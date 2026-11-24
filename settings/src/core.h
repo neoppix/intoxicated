@@ -16,6 +16,7 @@
 
 #include <QList>
 #include <QMap>
+#include <QProcessEnvironment>
 #include <QSet>
 #include <QString>
 #include <QStringList>
@@ -198,7 +199,8 @@ struct ProfileInfo {
 // Whether a client holds the profile's lock right now. Taken and released
 // at once with flock(LOCK_EX | LOCK_NB) on a read-only open.
 bool profileInUse(const QString &dir);
-// Signed in means a cookies file exists; its content is never read.
+// Signed in means both the cookies and the identity file exist (the client
+// writes identity on sign-in and erases it on sign-out); neither is read.
 bool profileSignedIn(const QString &dir);
 // `default` first, then every directory with a usable name, sorted, plus
 // EXTRA (the default profile named in settings.conf) when it is missing.
@@ -208,6 +210,45 @@ bool deleteProfile(const QString &name, QString *error);
 // The profile the launcher uses when nothing else is said:
 // settings.conf's INTOXICATED_PROFILE when usable, else `default`.
 QString defaultProfileName(const SettingsConf &conf);
+
+// --- Several clients ---------------------------------------------------------
+
+// <profile>/client.pid: the client writes its process id there while it
+// holds the profile's lock, and removes it when it exits.
+inline const QString kClientPidFile = QStringLiteral("client.pid");
+
+// Whether process PID has FILE open right now (the same device and inode),
+// from the kernel's file table for it. False for a process that is gone or
+// is another user's.
+bool processHasOpen(qint64 pid, const QString &file);
+// The process running profile DIR: client.pid's, but only while that process
+// holds DIR/.lock open, so a file left by a crash or a pid since used again
+// names nothing. Never found by process name.
+std::optional<qint64> clientPid(const QString &dir);
+
+struct RunningClient {
+    QString profile;
+    // -1 when the client has not said (an older client, or just starting).
+    qint64 pid = -1;
+};
+
+// Every profile a client holds right now, in listProfiles() order.
+QList<RunningClient> runningClients();
+
+// What starting a client on PROFILE runs: the launcher, the link (if any)
+// as its one argument, and this app's environment with INTOXICATED_PROFILE.
+struct LaunchCommand {
+    QString program;
+    QStringList arguments;
+    QProcessEnvironment environment;
+};
+LaunchCommand launchCommand(const QString &profile, const QString &link);
+// Start that command detached, from the home directory. Refused for a
+// profile already in use.
+bool startClient(const QString &profile, const QString &link, QString *error);
+// Send SIGTERM to the client on PROFILE (clientPid), which then leaves
+// through its normal teardown.
+bool stopClient(const QString &profile, QString *error);
 
 // --- Profile files ----------------------------------------------------------
 
@@ -259,9 +300,10 @@ std::optional<FlagMap> readDefaultFlags(QString *error);
 
 // --- Effects (the Shaders page) ---------------------------------------------
 
-// The client draws three effects before the HUD: screen-space reflections,
-// depth of field and bloom. Each is set by settings.conf lines the client
-// reads at start: INTOXICATED_SSR=1 (or _DOF, _BLOOM) turns it on,
+// The client draws five effects before the HUD: screen-space reflections,
+// depth of field, bloom, lens and sharpen. Each is set by settings.conf lines
+// the client reads at start: INTOXICATED_SSR=1 (or _DOF, _BLOOM, _LENS,
+// _SHARPEN) turns it on,
 // INTOXICATED_SSR_LOOK=<name> starts from a named look and
 // INTOXICATED_SSR_<KNOB>=<value> overrides one knob of it. The effects, their
 // knobs and looks are the client's own, read from `intoxicated
@@ -316,10 +358,66 @@ std::optional<SsrTable> readSsrTable(QString *error);
 // Parse what `intoxicated --shader-looks` prints: every effect, in the order
 // the client draws them, each a usable table with its own variables.
 bool parseShaderTables(const QByteArray &json, QList<SsrTable> *out, QString *error);
-std::optional<QList<SsrTable>> readShaderTables(QString *error);
+
+// A whole-page mode: every effect's switch and look at once. In
+// settings.conf INTOXICATED_SHADERS_MODE=<name> fills in each effect's switch
+// and look where its own line is unset; this app writes a picked mode as the
+// effects' own lines instead, so the page and the file always agree.
+inline const QString kShaderModeSetting = QStringLiteral("INTOXICATED_SHADERS_MODE");
+
+struct ShaderMode {
+    QString name;
+    QString title;
+    QString description;
+    // Effect name to its switch and look.
+    QMap<QString, QPair<bool, QString>> effects;
+};
+
+// Whether JSON is what a client built without the visual effects prints for
+// `--shader-looks` and `--ssr-looks` (install.sh --no-effects): an object
+// whose "available" is false.
+bool effectsUnavailable(const QByteArray &json);
+// Whether that JSON says the client was built with the experimental ray
+// tracing (the `rt` feature): "ray_tracing" true.
+bool rayTracingBuilt(const QByteArray &json);
+// How the ray tracing is added to a client built without it.
+inline const QString kAddRayTracingCommand = QStringLiteral("intoxicated --update --rt");
+// How the effects are added to such a client.
+inline const QString kAddEffectsCommand = QStringLiteral("intoxicated --update --effects");
+
+// `intoxicated --shader-looks`, parsed. MODES, when given, gets the
+// whole-page modes the client lists (none from a client that lists none).
+// From a client built without the effects: nullopt, with UNAVAILABLE (when
+// given) set and ERROR saying so. RAY_TRACING, when given, says whether the
+// client was built with the ray tracing.
+std::optional<QList<SsrTable>> readShaderTables(QString *error, QList<ShaderMode> *modes = nullptr,
+                                                bool *unavailable = nullptr, bool *rayTracing = nullptr);
+
+// Parse the "modes" of what `intoxicated --shader-looks` prints, against its
+// TABLES: every mode names a look of each effect. No "modes" is no modes.
+bool parseShaderModes(const QByteArray &json, const QList<SsrTable> &tables, QList<ShaderMode> *out, QString *error);
+const ShaderMode *findShaderMode(const QList<ShaderMode> &modes, const QString &name);
+// Write out what an INTOXICATED_SHADERS_MODE line asks for as the effects' own
+// lines, where theirs are unset, and remove it. Whether CONF changed.
+bool expandShaderMode(const QList<SsrTable> &tables, const QList<ShaderMode> &modes, SettingsConf &conf);
+// The mode the client starts in: the name of the one whose switches and
+// looks every effect has (an effect off in both counts as matching whatever
+// its look), an empty string when none (Custom). An effect that is on with
+// fine tuning matches no mode.
+QString currentShaderMode(const QList<SsrTable> &tables, const QList<ShaderMode> &modes, const SettingsConf &conf);
+// Every effect's switch and look as the mode sets them, every knob's
+// override removed. Refused, with CONF unchanged, for a name that is no mode.
+bool applyShaderMode(const QList<SsrTable> &tables, const QList<ShaderMode> &modes, SettingsConf &conf,
+                     const QString &mode);
 
 // "wet_road" as a button says it: "Wet road".
 QString ssrLookTitle(const QString &name);
+
+// A whole knob of EFFECT whose values are named choices rather than numbers
+// (the depth of field's focus mode): one title per value from its minimum
+// to its maximum. Empty for any other knob, and for one whose range no
+// longer has exactly as many values as there are names.
+QStringList knobChoices(const QString &effect, const SsrKnob &knob);
 
 // A value as the client reads it: a number in range, a whole number, 0 or 1,
 // or r,g,b (or one number for all three). nullopt when the client would not
@@ -337,6 +435,14 @@ void setSsrOn(SettingsConf &conf, bool on);
 // The same for any effect's switch (TABLE's, or the variable SWITCHENV).
 bool effectOn(const QString &switchEnv, const SettingsConf &conf);
 void setEffectOn(const QString &switchEnv, SettingsConf &conf, bool on);
+// The effects hotkey: with INTOXICATED_EFFECTS_HOTKEY=1 the client's F9
+// turns every effect off and back on in game (crate::effects_hotkey), and
+// Roblox no longer gets F9 for its developer console. A key name (F1 to
+// F10, F12) takes another key. On reads true only for a value the client
+// takes; on writes 1 unless such a value is there, off removes the line.
+inline const QString kEffectsHotkeySetting = QStringLiteral("INTOXICATED_EFFECTS_HOTKEY");
+bool effectsHotkeyOn(const SettingsConf &conf);
+void setEffectsHotkeyOn(SettingsConf &conf, bool on);
 // The look the client starts from: the one the table's look variable names,
 // else the default one (also when it names no look). UNKNOWN is set to the
 // setting's text when it names no look.
@@ -368,8 +474,100 @@ void setRtOn(SettingsConf &conf, bool on);
 // confirmation.
 QStringList rtWarnings();
 
+// --- Macros ----------------------------------------------------------------
+
+// In-game macros: a key press, seen on the client's own input path while the
+// Roblox window is focused, plays a recorded sequence of input back through
+// that same path. They live in <profile>/macros.json, which the client reads
+// once at launch (crate::macros). The feature is off unless INTOXICATED_MACROS=1.
+inline const QString kMacrosSetting = QStringLiteral("INTOXICATED_MACROS");
+
+// <profile>/macros.json.
+QString macrosPath(const QString &profile);
+
+// What one step of a macro does. The names match the "type" the file stores
+// and the client reads: tap, keydown, keyup, move, click, buttondown,
+// buttonup, scroll, text, wait.
+enum class StepKind { Tap, KeyDown, KeyUp, Move, Click, ButtonDown, ButtonUp, Scroll, Text, Wait };
+
+struct MacroStep {
+    StepKind kind = StepKind::Tap;
+    // Tap, KeyDown, KeyUp: a physical key as a Linux evdev code, and the
+    // modifiers held with it.
+    int evdev = 0;
+    bool ctrl = false;
+    bool shift = false;
+    bool alt = false;
+    // Move, Click, ButtonDown, ButtonUp, Scroll: window coordinates.
+    double x = 0;
+    double y = 0;
+    // Click, ButtonDown, ButtonUp: 1 left, 2 right, 3 middle.
+    int button = 1;
+    // Scroll: wheel detents, away from the user positive.
+    double detents = 0;
+    // Text: what is typed.
+    QString text;
+    // Wait: the pause in milliseconds.
+    quint64 ms = 0;
+};
+
+struct MacroDef {
+    QString name;
+    bool enabled = true;
+    // The trigger: a physical key and the modifiers that must be held with it.
+    int triggerEvdev = 0;
+    bool triggerCtrl = false;
+    bool triggerShift = false;
+    bool triggerAlt = false;
+    // Keep the trigger key from the game while the macro runs.
+    bool swallow = false;
+    // Repeat the steps while the trigger key is held.
+    bool repeat = false;
+    QList<MacroStep> steps;
+};
+
+struct MacrosFile {
+    bool exists = false;
+    // Non-empty when the file cannot be used (not JSON, not an object, or
+    // "macros" is not an array); it is then never written over.
+    QString error;
+    QList<MacroDef> macros;
+    // Macros left out because they could not be read, each with its reason.
+    QStringList skipped;
+};
+
+// Parse a macros document. Blank text is no macros, not an error. A macro that
+// cannot be read is listed in SKIPPED rather than failing the whole document.
+bool parseMacros(const QByteArray &data, QList<MacroDef> *out, QString *error, QStringList *skipped = nullptr);
+MacrosFile loadMacros(const QString &path);
+bool saveMacros(const QString &path, const QList<MacroDef> &macros, QString *error);
+
+// Empty when NAME is a usable macro name (non-blank once trimmed), else why.
+QString checkMacroName(const QString &name);
+// Empty when the macro is complete enough to save (a name, a trigger key and
+// at least one step), else the first reason it is not.
+QString checkMacro(const MacroDef &m);
+
+// The keys the editor offers and the file stores, as (evdev code, label). One
+// fixed table, shared so the label a code shows and the code a label saves
+// always agree.
+struct KeyName {
+    int evdev;
+    QString label;
+};
+const QList<KeyName> &keyNames();
+// A code's label, or "Key <n>" for one not in the table.
+QString keyLabel(int evdev);
+// A label's code, or -1 for one not in the table.
+int keyEvdev(const QString &label);
+// A step as one line for the editor's list, e.g. "Tap  Space" or "Wait  40 ms".
+QString describeStep(const MacroStep &step);
+
 // --- Self-test -------------------------------------------------------------
 
 int runSelfTest();
+// `--self-test-client DIR`, started by the self-test: hold DIR/.lock and
+// write DIR/client.pid as a client would, for at most a minute.
+int runSelfTestClient(const QString &dir);
 
 } // namespace intox

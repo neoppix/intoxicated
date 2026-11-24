@@ -9,6 +9,29 @@ license.workspace = true
 name = "intoxicated-run"
 path = "src/bin/intoxicated_run/main.rs"
 
+[features]
+default = ["shaders"]
+# The visual effects drawn into the 3D scene before the HUD: screen-space
+# reflections, depth of field, bloom, lens and sharpen, with their modes
+# (`android::ssr` and its SPIR-V), their devctl verbs and INTOXICATED_SSR,
+# _DOF, _BLOOM, _LENS, _SHARPEN and _SHADERS_MODE. On by default so `cargo
+# test --workspace` covers them; install.sh builds with
+# `--no-default-features` when they are declined. Without it
+# `android::no_effects` stands in: the switches are ignored with one log
+# line, the verbs answer "not built" and --print-shader-looks prints
+# {"available": false}.
+#
+# Anything else drawn through the same frame matching depends on this one,
+# as the ray tracing does.
+shaders = []
+# The experimental ray-traced reflections and indirect light (`android::rt`
+# and their SPIR-V), drawn inside the reflections: INTOXICATED_RT and
+# devctl `rt`. Off by default; install.sh builds with `--features rt` when
+# its ray tracing question is answered yes. Without it `android::no_rt`
+# stands in: INTOXICATED_RT=1 is ignored with one log line and `rt` answers
+# "not built".
+rt = ["shaders"]
+
 [dependencies]
 # The guest linker, libjnivm and the framework shims under native/.
 intoxicated-linker-sys = { path = "../intoxicated-linker-sys" }

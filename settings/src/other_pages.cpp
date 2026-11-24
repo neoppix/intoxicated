@@ -47,6 +47,7 @@ PlayPage::PlayPage(AppState *state) : m_state(state) {
     jh->addWidget(m_link, 1);
     auto *join = new QPushButton(QStringLiteral("Join"));
     join->setObjectName(QStringLiteral("addBtn"));
+    setButtonIcon(join, QStringLiteral("sign-in"));
     join->setCursor(Qt::PointingHandCursor);
     jh->addWidget(join);
     jv->addLayout(jh);
@@ -57,15 +58,19 @@ PlayPage::PlayPage(AppState *state) : m_state(state) {
     jv->addWidget(hint);
     b->addWidget(joinBox.box);
     b->addSpacing(8);
+    b->addWidget(new SeveralClients(state));
+    b->addSpacing(8);
     connect(join, &QPushButton::clicked, this, &PlayPage::join);
     connect(m_link, &QLineEdit::returnPressed, this, &PlayPage::join);
 
     Section updates = section(QStringLiteral("Updates"));
     auto *uv = new QVBoxLayout(updates.body);
-    uv->setContentsMargins(8, 2, 8, 8);
+    uv->setContentsMargins(0, 0, 0, 0);
     uv->setSpacing(0);
     m_updateApk = new QPushButton(QStringLiteral("Update Roblox build"));
     m_updateApp = new QPushButton(QStringLiteral("Update Intoxicated"));
+    setButtonIcon(m_updateApk, QStringLiteral("download-simple"));
+    setButtonIcon(m_updateApp, QStringLiteral("arrows-clockwise"));
     for (QPushButton *button : {m_updateApk, m_updateApp}) {
         button->setCursor(Qt::PointingHandCursor);
         button->setFocusPolicy(Qt::NoFocus);
@@ -80,7 +85,11 @@ PlayPage::PlayPage(AppState *state) : m_state(state) {
                              QStringLiteral("Pull, build and reinstall Intoxicated and this app (intoxicated "
                                             "--update). Installing asks for your password."),
                              m_updateApp));
-    uv->addSpacing(6);
+    // The log and the result, inset from the group's edges.
+    auto *logBox = new QVBoxLayout;
+    logBox->setContentsMargins(14, 4, 14, 14);
+    logBox->setSpacing(0);
+    uv->addLayout(logBox, 1);
     m_log = new QPlainTextEdit;
     m_log->setObjectName(QStringLiteral("log"));
     m_log->setReadOnly(true);
@@ -91,13 +100,13 @@ PlayPage::PlayPage(AppState *state) : m_state(state) {
     m_log->setFont(mono);
     m_log->setMinimumHeight(190);
     m_log->setLineWrapMode(QPlainTextEdit::WidgetWidth);
-    uv->addWidget(m_log, 1);
+    logBox->addWidget(m_log, 1);
     m_result = new QLabel;
     m_result->setObjectName(QStringLiteral("status"));
     m_result->setWordWrap(true);
     m_result->setContentsMargins(2, 6, 2, 0);
     m_result->hide();
-    uv->addWidget(m_result);
+    logBox->addWidget(m_result);
     b->addWidget(updates.box, 1);
     b->addStretch(0);
 
@@ -242,6 +251,7 @@ ModsPage::ModsPage() {
     b->addSpacing(8);
     auto *row = new QHBoxLayout;
     auto *open = new QPushButton(QStringLiteral("Open mods folder"));
+    setButtonIcon(open, QStringLiteral("folder"));
     open->setEnabled(false);
     row->addWidget(open);
     row->addStretch(1);

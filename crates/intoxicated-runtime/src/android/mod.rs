@@ -33,7 +33,25 @@ pub mod looper;
 pub mod native_window;
 pub mod physical_size;
 pub mod present_stats;
+// The ray-traced reflections and indirect light (experimental), built with
+// the `rt` feature (which needs `shaders`); without it `no_rt` takes the
+// same place with the entry points the layer and the effects call, never
+// on: INTOXICATED_RT is ignored with one log line and devctl `rt` answers
+// "not built".
+#[cfg(feature = "rt")]
 pub mod rt;
+#[cfg(not(feature = "rt"))]
+#[path = "no_rt.rs"]
+pub mod rt;
+// The visual effects drawn before the HUD, built with the `shaders` feature.
+// Without it `no_effects` takes the same place and the same entry points, so
+// the rest of the client calls `ssr::...` either way and nothing else is
+// gated: the switches are ignored with one log line, the devctl verbs answer
+// "not built", and the pass hooks never watch for the effects.
+#[cfg(feature = "shaders")]
+pub mod ssr;
+#[cfg(not(feature = "shaders"))]
+#[path = "no_effects.rs"]
 pub mod ssr;
 pub mod system;
 pub mod vk_layer;

@@ -21,8 +21,13 @@
 //!   the next frame's render passes to stderr. `ssr on|off|stats|get|reset|
 //!   look <name>|intensity <x>|set <name> <value>` drives the screen-space
 //!   reflections and answers with their state, their looks and their GPU
-//!   time; `dof ...` and `bloom ...` take the same words for the depth of
-//!   field and the bloom.
+//!   time; `dof ...`, `bloom ...`, `lens ...` and `sharpen ...` take the
+//!   same words for the depth of field, the bloom, the lens effects and the
+//!   sharpening; `shaders mode <name>` sets every effect's switch and look
+//!   from a mode (off, competitive, cinematic) and `shaders` reports them.
+//!   `effects toggle|on|off|get` does what the effects hotkey does: every
+//!   effect off, or back as configured. A client built without the
+//!   `shaders` feature answers all seven with `err not built: ...`.
 //! - `bussub`, `buslast` and `deeplink` reach the engine's message bus through
 //!   `deeplink::dev_request`, which blocks this thread for at most 5 s.
 //!
@@ -121,10 +126,19 @@ fn bind(path: &Path) -> std::io::Result<UnixListener> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    // A socket a killed client left behind. Removing it is safe because this
-    // process already holds the profile's lock. Anything that is not a
-    // socket is left where it is, and the bind below reports it.
+    // A socket a killed client left behind: nothing answers on it. One that
+    // does answer belongs to a live client, which an
+    // INTOXICATED_DEV_CONTROL_SOCKET shared by two profiles (from
+    // settings.conf, say) would otherwise take away from it; that one is
+    // left alone and the bind refused. Anything that is not a socket is left
+    // where it is too, and the bind below reports it.
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket()) {
+        if UnixStream::connect(path).is_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "another client is listening there; give each profile its own socket",
+            ));
+        }
         let _ = std::fs::remove_file(path);
     }
     let listener = UnixListener::bind(path)?;
@@ -375,9 +389,11 @@ fn reply(line: &str) -> String {
             },
             None => "err depthshot <path>".into(),
         },
-        // Screen-space reflections, depth of field and bloom: on, off, their
-        // settings and GPU cost. See `android::ssr`.
-        verb @ ("ssr" | "dof" | "bloom") => {
+        // Screen-space reflections, depth of field, bloom, lens effects and
+        // sharpening: on, off, their settings and GPU cost; the modes that
+        // set them all; and all of them off and back, as the effects hotkey
+        // does. See `android::ssr`.
+        verb @ ("ssr" | "dof" | "bloom" | "lens" | "sharpen" | "shaders" | "effects") => {
             let args: Vec<&str> = it.collect();
             match crate::android::ssr::control_verb(verb, &args) {
                 Some(Ok(state)) => format!("ok {state}"),
@@ -513,37 +529,45 @@ pub fn apply_queued(handle: i64) {
     }
     for (queued_at, cmd) in drain() {
         crate::android::input::note_devctl_command(queued_at);
-        match cmd {
-            Cmd::Move { x, y } => crate::android::input::script_move(handle, x, y, now_ms()),
-            Cmd::Button { x, y, down, button } => {
-                crate::android::input::script_button(handle, x, y, down, button, now_ms())
+        apply_cmd(handle, cmd);
+    }
+    crate::android::input::clear_input_origin();
+}
+
+/// Apply one command through the client's own input path, on the thread that
+/// owns it (the looper pump). Shared by [`apply_queued`] and the macro player
+/// in [`crate::macros`], so both reach the engine the one way, as if the
+/// events had come from the window.
+pub fn apply_cmd(handle: i64, cmd: Cmd) {
+    match cmd {
+        Cmd::Move { x, y } => crate::android::input::script_move(handle, x, y, now_ms()),
+        Cmd::Button { x, y, down, button } => {
+            crate::android::input::script_button(handle, x, y, down, button, now_ms())
+        }
+        Cmd::Key { down, evdev, modifiers } => crate::android::input::pass_key_event(down, evdev, modifiers),
+        Cmd::Text(text) => {
+            // Typed per character through the path a keystroke takes, so
+            // the client's own text buffer and the editor both see it.
+            // The handle is the GameActivity handle
+            // `script_type` wants -- the handle the pump was given and
+            // passes to `apply_queued`. Handing it the *focused textbox*
+            // handle instead crashed the client on the first keystroke
+            // (recorded in the inherited notes, not re-run).
+            crate::android::input::script_type(handle, &text, now_ms());
+        }
+        Cmd::Scroll { x, y, detents } => crate::android::input::wheel(handle, x, y, 0.0, detents, now_ms()),
+        Cmd::Fullscreen(on) => crate::android::backend_set_fullscreen(on),
+        Cmd::Focus(focus_in) => {
+            if let Some(w) = crate::android::x11_window::current() {
+                w.devctl_focus(handle, focus_in);
             }
-            Cmd::Key { down, evdev, modifiers } => crate::android::input::pass_key_event(down, evdev, modifiers),
-            Cmd::Text(text) => {
-                // Typed per character through the path a keystroke takes, so
-                // the client's own text buffer and the editor both see it.
-                // The handle is the GameActivity handle
-                // `script_type` wants -- the handle the pump was given and
-                // passes to `apply_queued`. Handing it the *focused textbox*
-                // handle instead crashed the client on the first keystroke
-                // (recorded in the inherited notes, not re-run).
-                crate::android::input::script_type(handle, &text, now_ms());
-            }
-            Cmd::Scroll { x, y, detents } => crate::android::input::wheel(handle, x, y, 0.0, detents, now_ms()),
-            Cmd::Fullscreen(on) => crate::android::backend_set_fullscreen(on),
-            Cmd::Focus(focus_in) => {
-                if let Some(w) = crate::android::x11_window::current() {
-                    w.devctl_focus(handle, focus_in);
-                }
-            }
-            Cmd::XKey { down, keycode, state } => {
-                if let Some(w) = crate::android::x11_window::current() {
-                    w.devctl_xkey(handle, down, keycode, state);
-                }
+        }
+        Cmd::XKey { down, keycode, state } => {
+            if let Some(w) = crate::android::x11_window::current() {
+                w.devctl_xkey(handle, down, keycode, state);
             }
         }
     }
-    crate::android::input::clear_input_origin();
 }
 
 #[cfg(test)]
@@ -734,6 +758,24 @@ mod tests {
         std::fs::write(&file, b"keep").unwrap();
         assert!(bind(&file).is_err());
         assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_socket_a_live_client_listens_on_is_not_taken_over() {
+        // Two profiles pointed at one INTOXICATED_DEV_CONTROL_SOCKET: the
+        // second client must not unlink the first one's socket.
+        let dir = scratch("live");
+        let path = dir.join("shared.sock");
+        let first = bind(&path).unwrap();
+        let err = bind(&path).expect_err("a live socket must not be rebound");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
+        // The first client's socket still answers.
+        let _c = UnixStream::connect(&path).expect("the first socket is still there");
+        let (_s, _) = first.accept().unwrap();
+        drop(first);
+        // Once nothing listens it is stale, and replaced.
+        drop(bind(&path).expect("a stale socket is replaced"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

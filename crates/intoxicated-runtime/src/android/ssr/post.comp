@@ -1,7 +1,7 @@
-// Depth of field and bloom on the engine's resolved scene colour (see
-// `ssr/post.rs`), recorded after the reflections and before the swapchain
-// pass that draws the HUD, so neither ever touches the interface. One source,
-// one variant per dispatch, chosen by a define:
+// Depth of field, bloom, lens effects and sharpening on the engine's resolved
+// scene colour (see `ssr/post.rs`), recorded after the reflections and before
+// the swapchain pass that draws the HUD, so none of them ever touches the
+// interface. One source, one variant per dispatch, chosen by a define:
 //
 //   FOCUS            one group: where the camera is focused, from the depth
 //                    of a region around the screen centre (the subject
@@ -19,11 +19,23 @@
 //   BLOOM_UP         one level up: the coarser level, tent filtered, blended
 //                    into this one; how much is the radius.
 //   BLOOM_COMPOSE    full resolution: the glow screened over the scene.
+//   LENS             full resolution: a radial split of red and blue that
+//                    grows towards the edges, a rainbow fringe round the
+//                    brightest areas from the bloom chain, and a vignette;
+//                    into our staging image, as it reads its neighbours.
+//   STAGE_COPY       full resolution: the scene into the staging image, for
+//                    a sharpen that has to read neighbours of our own result.
+//   STAGE_STORE      full resolution: the staging image into the result.
+//   SHARPEN          full resolution: contrast adaptive sharpening, kept
+//                    from reaching across depth edges.
 //
 // The scene colour is read from the engine's image when nothing before ran,
 // and from our own 32-bit result image (packed in the engine's format) when
 // the reflections or the depth of field already wrote it; the composes write
-// that image, which `ssr.rs` then copies over the engine's once.
+// that image, which `ssr.rs` then copies over the engine's once. The lens
+// and the sharpen read the pixels around each one, so they never read the
+// image they write: the lens writes the staging image (RGBA16F, which holds
+// a 10-bit value exactly), and the sharpen reads it.
 //
 // Depth is reversed-Z with the far plane at infinity: depth = near / z, the
 // sky is 0, so a distance in near-plane units is 1 / depth and anything
@@ -91,6 +103,14 @@ layout(push_constant) uniform Params {
     // The band behind the focus that stays sharp, as a fraction of the
     // focus distance.
     float far_range;
+    // Lens: how far red and blue are pulled apart at the corners, in pixels;
+    // how much the corners are darkened; how strong the rainbow fringe is.
+    float aberration;
+    float vignette;
+    float halo;
+    // Sharpen: how strong, and the most it changes a pixel (0 to 1).
+    float sharpen;
+    float sharpen_limit;
 } pc;
 
 const uint SRC_RESULT = 1u;
@@ -98,7 +118,12 @@ const uint NEAR_BLUR = 2u;
 const uint AUTOFOCUS = 4u;
 const uint FOCUS_RESET = 8u;
 const uint FOCUS_PAST = 16u;
-const uint GLOW = 32u;
+// The sharpen reads the staging image rather than the scene.
+const uint SRC_STAGE = 32u;
+// The sharpen leaves out neighbours across a depth edge.
+const uint DEPTH_AWARE = 64u;
+// The bloom adds the ray-traced glow above white from the trace image.
+const uint GLOW = 128u;
 
 // The sky, in near-plane units: far enough to count as infinity.
 const float SKY_Z = 1e7;
@@ -409,6 +434,149 @@ void main() {
     imageStore(out_img, q, vec4(c / 8.0, 1.0));
 }
 
+#elif defined(LENS)
+
+// The scene between pixels, filtered by hand: our result image has no
+// sampler.
+vec3 src_between(vec2 pos) {
+    vec2 q = pos - 0.5;
+    ivec2 i = ivec2(floor(q));
+    vec2 f = q - vec2(i);
+    vec3 a = mix(src_at(i).rgb, src_at(i + ivec2(1, 0)).rgb, f.x);
+    vec3 b = mix(src_at(i + ivec2(0, 1)).rgb, src_at(i + ivec2(1, 1)).rgb, f.x);
+    return mix(a, b, f.y);
+}
+
+// 0 red, through yellow, green and blue, to 1 violet.
+vec3 spectrum(float h) {
+    float x = 4.8 * h;
+    return clamp(vec3(abs(x - 3.0) - 1.0, 2.0 - abs(x - 2.0), 2.0 - abs(x - 4.0)), 0.0, 1.0);
+}
+
+// How bright the fringe gets for a given difference of the two glows.
+const float HALO_GAIN = 20.0;
+
+// in_tex: the bloom chain's second level (a quarter of the size), aux_tex
+// its fourth (a sixteenth), both merged with every coarser one; read only
+// with a halo. out_img: the staging image.
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(p), pc.size))) {
+        return;
+    }
+    vec4 base = src_at(p);
+    vec2 pos = vec2(p) + 0.5;
+    vec2 centre = 0.5 * vec2(pc.size);
+    vec2 d = pos - centre;
+    // 0 at the centre, 1 in the corners.
+    float r = length(d) / length(centre);
+    vec3 c = base.rgb;
+    if (pc.aberration > 0.0) {
+        // A lens bends red less than blue: red is pulled out, blue in, by
+        // more the further from the centre, so the centre stays clean.
+        vec2 dir = d / max(length(d), 1e-3);
+        vec2 shift = dir * (pc.aberration * r * r);
+        c.r = src_between(pos + shift).r;
+        c.b = src_between(pos - shift).b;
+    }
+    if (pc.halo > 0.0) {
+        // Outside a bright area the wide glow is stronger than the tight
+        // one; how much stronger says how far out, which picks the colour:
+        // red at the inner edge of the fringe, violet at the outer.
+        vec2 uv = pos / vec2(pc.size);
+        float tight = luma(textureLod(in_tex, uv, 0.0).rgb);
+        float wide = luma(textureLod(aux_tex, uv, 0.0).rgb);
+        float ring = max(wide - tight, 0.0);
+        float h = clamp(2.0 * wide / (tight + wide + 1e-4) - 1.0, 0.0, 1.0);
+        vec3 fringe = clamp(spectrum(h) * ring * pc.halo * HALO_GAIN, 0.0, 1.0);
+        c = 1.0 - (1.0 - c) * (1.0 - fringe);
+    }
+    if (pc.vignette > 0.0) {
+        float v = smoothstep(0.25, 1.0, r);
+        c *= 1.0 - pc.vignette * v * v;
+    }
+    imageStore(out_img, p, vec4(c, base.a));
+}
+
+#elif defined(STAGE_COPY)
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(p), pc.size))) {
+        return;
+    }
+    imageStore(out_img, p, src_at(p));
+}
+
+#elif defined(STAGE_STORE)
+
+// in_tex: the staging image.
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(p), pc.size))) {
+        return;
+    }
+    imageStore(result_img, p, uvec4(pack(texelFetch(in_tex, p, 0)), 0u, 0u, 0u));
+}
+
+#elif defined(SHARPEN)
+
+// A neighbour this much further or nearer (relative to its distance) than
+// the pixel starts to be left out, and is left out at twice it.
+const float DEPTH_EDGE = 0.05;
+
+vec4 scene_px(ivec2 p) {
+    if ((pc.flags & SRC_STAGE) != 0u) {
+        return texelFetch(in_tex, clamp(p, ivec2(0), ivec2(pc.size) - 1), 0);
+    }
+    return src_at(p);
+}
+
+// in_tex: the staging image when SRC_STAGE says so.
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(p), pc.size))) {
+        return;
+    }
+    vec4 base = scene_px(p);
+    vec3 c = base.rgb;
+    bool aware = (pc.flags & DEPTH_AWARE) != 0u;
+    float dc = aware ? depth_at(p) : 0.0;
+    // The four sides first, then the corners.
+    const ivec2 around[8] = ivec2[8](ivec2(0, -1), ivec2(-1, 0), ivec2(1, 0), ivec2(0, 1),
+                                     ivec2(-1, -1), ivec2(1, -1), ivec2(-1, 1), ivec2(1, 1));
+    vec3 lo = c;
+    vec3 hi = c;
+    vec3 sides = vec3(0.0);
+    for (int k = 0; k < 8; ++k) {
+        vec3 s = scene_px(p + around[k]).rgb;
+        if (aware) {
+            // A neighbour on another surface in depth (the edge of a
+            // character against what is behind it) counts as the pixel
+            // itself, so the edge is neither sharpened into a halo nor
+            // allowed to hold the contrast down.
+            float dn = depth_at(p + around[k]);
+            float apart = abs(dn - dc) / max(max(dn, dc), 1e-7);
+            s = mix(s, c, smoothstep(DEPTH_EDGE, 2.0 * DEPTH_EDGE, apart));
+        }
+        lo = min(lo, s);
+        hi = max(hi, s);
+        if (k < 4) {
+            sides += s;
+        }
+    }
+    // Adaptive: how much room the neighbourhood leaves before black or
+    // white, against how bright it gets. Flat, mid-tone texture has the
+    // most and is sharpened most; an edge already at full contrast has
+    // little and is barely touched, so it does not ring.
+    vec3 room = clamp(min(lo, 1.0 - hi) / max(hi, vec3(1e-4)), 0.0, 1.0);
+    vec3 amount = sqrt(room) * pc.sharpen;
+    vec3 detail = c - 0.25 * sides;
+    vec3 delta = clamp(2.0 * amount * detail, -pc.sharpen_limit, pc.sharpen_limit);
+    base.rgb = clamp(c + delta, 0.0, 1.0);
+    imageStore(result_img, p, uvec4(pack(base), 0u, 0u, 0u));
+}
+
 #else
 
 // A 3 by 3 tent over `tex` around `uv`, one texel of it apart.
@@ -458,7 +626,7 @@ void main() {
 }
 
 #else
-#error "post.comp needs one of FOCUS, DOF_PREP, DOF_GATHER, DOF_COMPOSE, BLOOM_PREFILTER, BLOOM_DOWN, BLOOM_UP, BLOOM_COMPOSE"
+#error "post.comp needs one of FOCUS, DOF_PREP, DOF_GATHER, DOF_COMPOSE, BLOOM_PREFILTER, BLOOM_DOWN, BLOOM_UP, BLOOM_COMPOSE, LENS, STAGE_COPY, STAGE_STORE, SHARPEN"
 #endif
 
 #endif

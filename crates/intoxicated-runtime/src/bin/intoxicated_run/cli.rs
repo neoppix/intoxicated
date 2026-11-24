@@ -240,7 +240,7 @@ pub fn print_ssr_looks() -> ExitCode {
 }
 
 /// `--print-shader-looks`: every effect drawn before the HUD (reflections,
-/// depth of field, bloom), each with its switch, knobs and named looks
+/// depth of field, bloom, lens, sharpen), each with its switch, knobs and named looks
 /// ([`intoxicated_runtime::android::ssr::shader_looks_json`]), as one JSON
 /// object on stdout. Nothing else runs. The launcher's `--shader-looks` runs
 /// it for Intoxicated Settings' Shaders page.
@@ -304,9 +304,11 @@ usage: intoxicated-run --lib-dir <dir> [options]
                     starts every knob at) as one JSON object, and exit 0.
                     Runs nothing else; the launcher's --ssr-looks runs it
   --print-shader-looks  the same for every effect drawn before the HUD
-                    (reflections, depth of field, bloom), as one JSON object
-                    with a list of effects, and exit 0. Runs nothing else;
-                    the launcher's --shader-looks runs it
+                    (reflections, depth of field, bloom, lens, sharpen), as
+                    one JSON object with a list of effects, and exit 0. Runs
+                    nothing else; the launcher's --shader-looks runs it. A
+                    client built without the visual effects prints
+                    a JSON object whose available is false for both instead
   --run <secs>      how long to let Roblox run after handover (default 15).
                     0 means no timer: run until the window is closed or the
                     process is sent SIGTERM/SIGINT. Closing the window ends the
@@ -438,6 +440,27 @@ env:
                                      grayscale PNG, with a screenshot of the
                                      same frame and the raw floats beside it);
                                      without either they are not installed
+  INTOXICATED_SHADERS_MODE=<name>    off, competitive or cinematic: every
+                                     effect below switched on or off and
+                                     started from a look at once; an
+                                     effect's own switch or LOOK variable
+                                     wins over it, its knobs change it as
+                                     always. devctl's shaders mode <name>
+                                     does the same live. A client built
+                                     without the visual effects (install.sh
+                                     --no-effects) ignores this and every
+                                     effect's variables below, says so once,
+                                     and answers their devctl verbs with
+                                     err not built
+  INTOXICATED_EFFECTS_HOTKEY=1       F9 in game turns every visual effect
+                                     off and back as configured, live. A key
+                                     name (F1 to F10, F12) takes another key.
+                                     Not while a text box has focus or with
+                                     Shift, Ctrl or Alt held. Roblox no
+                                     longer sees the key, so its F9
+                                     developer console does not open. Off by
+                                     default; devctl's effects
+                                     toggle|on|off|get does the same
   INTOXICATED_SSR=1                  screen-space reflections (experimental):
                                      wet-ground style reflections drawn into
                                      the 3D scene before the HUD, by compute
@@ -521,7 +544,35 @@ env:
                                      threshold (0.5)
   INTOXICATED_BLOOM_RADIUS=<0..1>    0 a tight glow, 1 a wide one (0.7)
   INTOXICATED_BLOOM_TINT=<r,g,b>     colour of the glow, each 0 to 2 (1,1,1)
-  INTOXICATED_RT=1                   EXPERIMENTAL ray-traced reflections: the
+  INTOXICATED_LENS=1                 lens effects (experimental): red and
+                                     blue split apart towards the screen
+                                     edges, a rainbow halo round the
+                                     brightest areas and darker corners,
+                                     drawn before the HUD. Off by default.
+                                     devctl's lens takes the same words as
+                                     ssr
+  INTOXICATED_LENS_LOOK=<name>       subtle (the defaults), prism or film
+  INTOXICATED_LENS_ABERRATION=<0..16>
+                                     how far red and blue are pulled apart
+                                     in the corners, in pixels at 1080p
+                                     (1.5); none at the centre
+  INTOXICATED_LENS_VIGNETTE=<0..1>   how much darker the corners are (0.15)
+  INTOXICATED_LENS_HALO=<0..2>       the rainbow fringe round the brightest
+                                     areas, from the bloom's chain (0.3)
+  INTOXICATED_SHARPEN=1              contrast adaptive sharpening
+                                     (experimental) of the 3D scene, drawn
+                                     before the HUD. Off by default.
+                                     devctl's sharpen takes the same words as
+                                     ssr
+  INTOXICATED_SHARPEN_LOOK=<name>    light (the defaults), crisp or crunchy
+  INTOXICATED_SHARPEN_STRENGTH=<0..3>
+                                     how strongly detail is raised (0.5)
+  INTOXICATED_SHARPEN_LIMIT=<0..1>   the most a pixel changes (0.1)
+  INTOXICATED_SHARPEN_DEPTH_AWARE=<0|1>
+                                     1 not across depth edges, so outlines
+                                     get no halo (1)
+  INTOXICATED_RT=1                   EXPERIMENTAL ray-traced reflections (in
+                                     a client built with the rt feature): the
                                      scene's triangles are captured as the
                                      engine draws them and the reflections'
                                      rays are traced against them, so they
@@ -542,6 +593,8 @@ env:
   INTOXICATED_RT_ENV=0               no sky environment for rays that miss
   INTOXICATED_RT_GI=1                experimental diffuse indirect light
                                      with the ray tracing (devctl rt gi)
+  INTOXICATED_RT_GI_GAIN=<0..4>      how strongly its bounces show (1.6)
+  INTOXICATED_RT_GLOW=0              the bloom leaves out the traced glow
   INTOXICATED_RT_DUMP=<dir>          research: the engine's shader modules and
                                      pipelines to <dir>; devctl rt draws and
                                      rt dump <path> write a frame's draws and

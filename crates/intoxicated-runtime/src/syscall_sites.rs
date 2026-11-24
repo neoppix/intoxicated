@@ -243,14 +243,20 @@ fn parse_cache(text: &str, build_id: &str) -> Option<Vec<u64>> {
 
 /// Writes the cache through a temporary file in the same directory and a
 /// rename, so a reader sees either the old file or the complete new one.
+/// Clients on two profiles share the cache and may both scan a new build at
+/// once; each write has a temporary name of its own (process id and a
+/// counter), so neither can truncate the other's before its rename.
 fn write_cache(dir: &Path, build_id: &str, sites: &[u64]) -> io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WRITES: AtomicU64 = AtomicU64::new(0);
     std::fs::create_dir_all(dir)?;
     let mut text = header(build_id, sites.len());
     text.push('\n');
     for s in sites {
         text.push_str(&format!("{s:#x}\n"));
     }
-    let tmp = dir.join(format!(".{build_id}.txt.{}.tmp", std::process::id()));
+    let n = WRITES.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{build_id}.txt.{}.{n}.tmp", std::process::id()));
     let result = (|| {
         let mut f = File::create(&tmp)?;
         f.write_all(text.as_bytes())?;
@@ -438,6 +444,34 @@ mod tests {
         assert_eq!(found.build_id.as_deref(), Some("deadbeef"));
         assert_eq!(found.sites, vec![0x400c]);
         assert_eq!(found.source, Source::Scanned);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clients_scanning_one_build_at_once_leave_a_valid_cache() {
+        // Two profiles starting together on a new build: both scan and both
+        // write. Every writer and every reader must see a whole list.
+        let dir = scratch("race");
+        let cache = dir.join("cache");
+        let lib = dir.join("lib.so");
+        std::fs::write(&lib, tiny_elf(DECOY_CODE, 0x4000, &[0xab, 0xcd])).unwrap();
+        let sites: Vec<u64> = (0..20_000u64).map(|i| 0x4000 + i * 16).collect();
+        std::thread::scope(|s| {
+            for _ in 0..6 {
+                s.spawn(|| {
+                    for _ in 0..5 {
+                        write_cache(&cache, "abcd", &sites).unwrap();
+                        let text = std::fs::read_to_string(cache_path(&cache, "abcd")).unwrap();
+                        assert_eq!(parse_cache(&text, "abcd").as_deref(), Some(&sites[..]));
+                    }
+                });
+            }
+        });
+        let left: Vec<_> = std::fs::read_dir(&cache)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["abcd.txt"], "no temporary file is left behind");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

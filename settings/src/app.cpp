@@ -18,11 +18,13 @@
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QPushButton>
+#include <QSignalBlocker>
 #include <QStackedWidget>
 #include <QTimer>
 #include <QVBoxLayout>
 
 #include <cstdio>
+#include <iterator>
 
 namespace intox {
 
@@ -52,21 +54,9 @@ bool AppState::launch(const QString &link) {
                         .arg(m_profile));
         return false;
     }
-    const QString program = launcherPath();
-    if (!QFileInfo(program).isExecutable()) {
-        emit status(QStringLiteral("intoxicated was not found on PATH or in /usr/local/bin."));
-        return false;
-    }
-    QProcess process;
-    process.setProgram(program);
-    process.setArguments(link.isEmpty() ? QStringList() : QStringList{link});
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-    env.insert(QStringLiteral("INTOXICATED_PROFILE"), m_profile);
-    process.setProcessEnvironment(env);
-    process.setWorkingDirectory(QDir::homePath());
-    process.setStandardInputFile(QProcess::nullDevice());
-    if (!process.startDetached()) {
-        emit status(QStringLiteral("%1 could not be started: %2").arg(program, process.errorString()));
+    QString error;
+    if (!startClient(m_profile, link, &error)) {
+        emit status(error);
         return false;
     }
     emit status(link.isEmpty() ? QStringLiteral("Starting Intoxicated on profile %1.").arg(m_profile)
@@ -117,8 +107,8 @@ QString NameDialog::text() const { return m_edit->text(); }
 
 QStringList MainWindow::pageNames() {
     return {QStringLiteral("Play"),     QStringLiteral("FastFlags"), QStringLiteral("Client"),
-            QStringLiteral("Shaders"),  QStringLiteral("Profiles"),  QStringLiteral("Mods"),
-            QStringLiteral("About")};
+            QStringLiteral("Shaders"),  QStringLiteral("Macros"),    QStringLiteral("Profiles"),
+            QStringLiteral("Mods"),     QStringLiteral("About")};
 }
 
 MainWindow::MainWindow(AppState *state, int startPage) : m_state(state) {
@@ -141,6 +131,7 @@ MainWindow::MainWindow(AppState *state, int startPage) : m_state(state) {
     m_stack->addWidget(new FlagsPage(state));
     m_stack->addWidget(new ClientPage(state));
     m_stack->addWidget(new ShadersPage(state));
+    m_stack->addWidget(new MacrosPage(state));
     m_stack->addWidget(new ProfilesPage(state));
     m_stack->addWidget(new ModsPage);
     m_stack->addWidget(new AboutPage);
@@ -149,6 +140,14 @@ MainWindow::MainWindow(AppState *state, int startPage) : m_state(state) {
     h->addWidget(main, 1);
 
     connect(m_nav, &QListWidget::currentRowChanged, this, [this](int row) {
+        if (row < 0)
+            return;
+        if (isVisible() && row == int(pageNames().indexOf(QStringLiteral("Macros"))) && !acceptMacrosWarning()) {
+            const QSignalBlocker block(m_nav);
+            m_nav->setCurrentRow(m_lastPage);
+            return;
+        }
+        m_lastPage = row;
         m_stack->setCurrentIndex(row);
         for (int i = 0; i < m_nav->count(); ++i) {
             QFont f = m_nav->font();
@@ -171,12 +170,30 @@ MainWindow::MainWindow(AppState *state, int startPage) : m_state(state) {
 // -geometry option still applies.
 QSize MainWindow::sizeHint() const { return {980, 680}; }
 
+bool MainWindow::acceptMacrosWarning() {
+    if (m_macrosWarned)
+        return true;
+    QMessageBox box(QMessageBox::Warning, QStringLiteral("Macros"),
+                    QStringLiteral("Macros play back recorded input in the game."),
+                    QMessageBox::NoButton, this);
+    box.setInformativeText(
+        QStringLiteral("Many games ban macros in their own rules, and Roblox's Community Standards forbid gaining "
+                       "an unfair advantage. A macro that breaks a game's rules can get you kicked or banned from "
+                       "that game. Check the rules of the game first; using macros is at your own risk."));
+    QPushButton *go = box.addButton(QStringLiteral("I understand"), QMessageBox::AcceptRole);
+    box.addButton(QStringLiteral("Go back"), QMessageBox::RejectRole);
+    box.setDefaultButton(go);
+    box.exec();
+    m_macrosWarned = box.clickedButton() == go;
+    return m_macrosWarned;
+}
+
 QWidget *MainWindow::sidebar() {
     auto *side = new QFrame;
     side->setObjectName(QStringLiteral("sidebar"));
     side->setFixedWidth(200);
     auto *lay = new QVBoxLayout(side);
-    lay->setContentsMargins(14, 24, 14, 16);
+    lay->setContentsMargins(8, 24, 8, 16);
     lay->setSpacing(0);
 
     auto *mark = new QLabel;
@@ -197,10 +214,18 @@ QWidget *MainWindow::sidebar() {
     m_nav->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_nav->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_nav->setSpacing(2);
+    m_nav->setIconSize(QSize(18, 18));
     m_nav->setCursor(Qt::PointingHandCursor);
+    // One icon per page, in pageNames() order.
+    static const char *const icons[] = {"play",  "gauge", "monitor",      "magic-wand",
+                                        "keyboard", "users", "puzzle-piece", "info"};
+    int i = 0;
     for (const QString &name : pageNames()) {
         auto *item = new QListWidgetItem(name, m_nav);
-        item->setSizeHint(QSize(0, 34));
+        item->setSizeHint(QSize(0, 36));
+        if (i < int(std::size(icons)))
+            item->setIcon(icon(QString::fromLatin1(icons[i])));
+        ++i;
     }
     lay->addWidget(m_nav, 1);
     return side;
@@ -210,7 +235,7 @@ QWidget *MainWindow::bottomBar() {
     auto *bar = new QFrame;
     bar->setObjectName(QStringLiteral("bottomBar"));
     auto *h = new QHBoxLayout(bar);
-    h->setContentsMargins(28, 10, 28, 10);
+    h->setContentsMargins(12, 9, 12, 9);
     h->setSpacing(14);
 
     m_profiles = new Combo;

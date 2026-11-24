@@ -5,8 +5,12 @@
 
 #include "core.h"
 
+#include <QCoreApplication>
 #include <QDebug>
 #include <QDir>
+#include <QElapsedTimer>
+#include <QProcess>
+#include <QThread>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -442,7 +446,9 @@ void testProfiles() {
 
     check(!profileSignedIn(alt), "not signed in without cookies");
     writeAll(alt + "/cookies", "secret");
-    check(profileSignedIn(alt), "signed in with a cookies file");
+    check(!profileSignedIn(alt), "not signed in with cookies alone (a fresh profile has them too)");
+    writeAll(alt + "/identity", "someone");
+    check(profileSignedIn(alt), "signed in with cookies and an identity");
 
     // A client's lock, held by another open file description.
     const QByteArray lockPath = QFile::encodeName(alt + "/.lock");
@@ -745,7 +751,7 @@ void testSsrLauncher(const QString &scratch) {
 }
 
 // What `intoxicated --shader-looks` prints, cut down: the reflections with
-// one knob, the depth of field and the bloom with two each.
+// one knob, the depth of field and the bloom with two each, and three modes.
 const QByteArray kShaderLooks = R"json({
   "effects": [
     {"name": "ssr", "title": "Reflections (SSR)", "summary": "Reflections.",
@@ -764,6 +770,18 @@ const QByteArray kShaderLooks = R"json({
                {"default": [1, 1, 1], "env": "INTOXICATED_BLOOM_TINT", "kind": "rgb", "max": 2, "min": 0, "name": "tint"}],
      "looks": [{"description": "Soft.", "name": "soft", "values": {"intensity": 0.35, "tint": [1, 1, 1]}},
                {"description": "Neon.", "name": "neon", "values": {"intensity": 0.7, "tint": [1, 1, 1]}}]}
+  ],
+  "mode_env": "INTOXICATED_SHADERS_MODE",
+  "modes": [
+    {"name": "off", "title": "Off", "description": "Nothing.",
+     "effects": {"ssr": {"on": false, "look": "competitive"}, "dof": {"on": false, "look": "cinematic"},
+                 "bloom": {"on": false, "look": "soft"}}},
+    {"name": "competitive", "title": "Competitive", "description": "Playable.",
+     "effects": {"ssr": {"on": true, "look": "competitive"}, "dof": {"on": false, "look": "cinematic"},
+                 "bloom": {"on": true, "look": "soft"}}},
+    {"name": "cinematic", "title": "Cinematic", "description": "Clips.",
+     "effects": {"ssr": {"on": true, "look": "competitive"}, "dof": {"on": true, "look": "portrait"},
+                 "bloom": {"on": true, "look": "neon"}}}
   ]
 })json";
 
@@ -852,6 +870,152 @@ void testEffectSettings() {
     QFile::remove(path);
 }
 
+void testShaderModes() {
+    QList<SsrTable> tables;
+    parseShaderTables(kShaderLooks, &tables, nullptr);
+    QList<ShaderMode> modes;
+    QString error;
+    check(parseShaderModes(kShaderLooks, tables, &modes, &error), "the modes parse: " + error);
+    same(modes.size(), 3, "three modes");
+    if (tables.size() != 3 || modes.size() != 3)
+        return;
+    same(modes[1].title, QString("Competitive"), "a mode's title");
+    check(modes[2].effects.value("dof") == qMakePair(true, QString("portrait")), "a mode's switch and look");
+    QList<ShaderMode> none;
+    check(parseShaderModes(QByteArray(kShaderLooks).replace("\"modes\"", "\"later\""), tables, &none, &error) &&
+              none.isEmpty(),
+          "a client without modes lists none");
+    const auto refused = [&](const QByteArray &json, const QString &what) {
+        QList<ShaderMode> m;
+        QString why;
+        check(!parseShaderModes(json, tables, &m, &why) && !why.isEmpty(), "refused: " + what + " (" + why + ")");
+    };
+    refused(QByteArray(kShaderLooks).replace("\"look\": \"portrait\"", "\"look\": \"blurry\""), "a look of no effect");
+    refused(QByteArray(kShaderLooks).replace("\"name\": \"cinematic\", \"title\"", "\"name\": \"off\", \"title\""),
+            "a mode listed twice");
+    refused(QByteArray(kShaderLooks).replace("\"mode_env\": \"INTOXICATED_SHADERS_MODE\"", "\"mode_env\": \"PATH\""),
+            "another variable");
+
+    const QString path = settingsConfPath();
+    const auto reloaded = [&] {
+        SettingsConf c;
+        c.load(path);
+        return c;
+    };
+    writeAll(path, "");
+    SettingsConf conf = reloaded();
+    same(currentShaderMode(tables, modes, conf), QString("off"), "nothing set is Off");
+    check(applyShaderMode(tables, modes, conf, "cinematic"), "pick Cinematic");
+    check(!applyShaderMode(tables, modes, conf, "fancy"), "a name that is no mode is refused");
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path),
+         QByteArray("INTOXICATED_SSR=1\nINTOXICATED_DOF=1\nINTOXICATED_DOF_LOOK=portrait\nINTOXICATED_BLOOM=1\n"
+                    "INTOXICATED_BLOOM_LOOK=neon\n"),
+         "a mode is written as every effect's own switch and look");
+    conf = reloaded();
+    same(currentShaderMode(tables, modes, conf), QString("cinematic"), "and reads back as the mode");
+    setSsrKnob(conf, *tables[2].knob("intensity"), {1.0});
+    same(currentShaderMode(tables, modes, conf), QString(), "fine tuning an effect that is on is Custom");
+    check(applyShaderMode(tables, modes, conf, "competitive"), "pick Competitive");
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path), QByteArray("INTOXICATED_SSR=1\nINTOXICATED_BLOOM=1\n"),
+         "the looks back at their defaults, the depth of field off, the fine tuning gone");
+    conf = reloaded();
+    same(currentShaderMode(tables, modes, conf), QString("competitive"), "Competitive");
+    setEffectOn(tables[1].switchEnv, conf, true);
+    same(currentShaderMode(tables, modes, conf), QString(), "one more effect on is Custom");
+    check(applyShaderMode(tables, modes, conf, "off"), "pick Off");
+    same(conf.text(), QString(), "Off writes nothing");
+    setSsrKnob(conf, *tables[2].knob("intensity"), {1.0});
+    same(currentShaderMode(tables, modes, conf), QString("off"), "fine tuning of an effect that is off is still Off");
+
+    // A hand-written mode line: what it asks for where an effect's own line
+    // is unset, written out as the effects' lines.
+    writeAll(path, "INTOXICATED_SHADERS_MODE=cinematic\nINTOXICATED_SSR=0\nINTOXICATED_BLOOM_LOOK=soft\n");
+    conf = reloaded();
+    same(currentShaderMode(tables, modes, conf), QString(), "the mode with the reflections off is Custom");
+    check(expandShaderMode(tables, modes, conf), "the mode line is expanded");
+    same(conf.text(), QString("INTOXICATED_SSR=0\nINTOXICATED_BLOOM_LOOK=soft\nINTOXICATED_DOF=1\nINTOXICATED_DOF_LOOK=portrait\n"
+                              "INTOXICATED_BLOOM=1\n"),
+         "an effect's own lines win, the rest come from the mode");
+    check(!expandShaderMode(tables, modes, conf), "and only once");
+    writeAll(path, "INTOXICATED_SHADERS_MODE=competitive\n");
+    same(currentShaderMode(tables, modes, reloaded()), QString("competitive"), "a mode line alone is that mode");
+    writeAll(path, "INTOXICATED_SHADERS_MODE=fancy\n");
+    conf = reloaded();
+    check(expandShaderMode(tables, modes, conf) && conf.text().isEmpty(), "a line naming no mode is dropped");
+    QFile::remove(path);
+}
+
+// The lens and the sharpen as the client lists them, cut down to a knob or
+// two, after one reflections knob, and a mode that names all three.
+const QByteArray kFiveLooks = R"json({
+  "effects": [
+    {"name": "ssr", "title": "Reflections (SSR)", "summary": "Reflections.",
+     "switch": "INTOXICATED_SSR", "look_env": "INTOXICATED_SSR_LOOK", "default_look": "competitive",
+     "knobs": [{"default": 0.4, "env": "INTOXICATED_SSR_INTENSITY", "kind": "number", "max": 1.0, "min": 0.0, "name": "intensity"}],
+     "looks": [{"description": "Faint.", "name": "competitive", "values": {"intensity": 0.4}}]},
+    {"name": "lens", "title": "Lens", "summary": "Like a camera lens.",
+     "switch": "INTOXICATED_LENS", "look_env": "INTOXICATED_LENS_LOOK", "default_look": "subtle",
+     "knobs": [{"default": 1.5, "env": "INTOXICATED_LENS_ABERRATION", "kind": "number", "max": 16.0, "min": 0.0, "name": "aberration"},
+               {"default": 0.15, "env": "INTOXICATED_LENS_HALO", "kind": "number", "max": 2.0, "min": 0.0, "name": "halo"}],
+     "looks": [{"description": "Faint.", "name": "subtle", "values": {"aberration": 1.5, "halo": 0.15}},
+               {"description": "For clips.", "name": "prism", "values": {"aberration": 5.0, "halo": 0.7}}]},
+    {"name": "sharpen", "title": "Sharpen", "summary": "Crisper.",
+     "switch": "INTOXICATED_SHARPEN", "look_env": "INTOXICATED_SHARPEN_LOOK", "default_look": "light",
+     "knobs": [{"default": 0.5, "env": "INTOXICATED_SHARPEN_STRENGTH", "kind": "number", "max": 3.0, "min": 0.0, "name": "strength"},
+               {"default": 1, "env": "INTOXICATED_SHARPEN_DEPTH_AWARE", "kind": "switch", "max": 1, "min": 0, "name": "depth_aware"}],
+     "looks": [{"description": "Light.", "name": "light", "values": {"strength": 0.5, "depth_aware": 1}},
+               {"description": "Crunchy.", "name": "crunchy", "values": {"strength": 2.0, "depth_aware": 1}}]}
+  ],
+  "mode_env": "INTOXICATED_SHADERS_MODE",
+  "modes": [
+    {"name": "cinematic", "title": "Cinematic", "description": "Clips.",
+     "effects": {"ssr": {"on": true, "look": "competitive"}, "lens": {"on": true, "look": "prism"},
+                 "sharpen": {"on": true, "look": "crunchy"}}}
+  ]
+})json";
+
+void testLensAndSharpen() {
+    QList<SsrTable> tables;
+    QList<ShaderMode> modes;
+    QString error;
+    check(parseShaderTables(kFiveLooks, &tables, &error), "the lens and the sharpen parse: " + error);
+    check(parseShaderModes(kFiveLooks, tables, &modes, &error), "and a mode naming them: " + error);
+    if (tables.size() != 3 || modes.size() != 1)
+        return;
+    same(tables[1].switchEnv, QString("INTOXICATED_LENS"), "the lens's switch");
+    same(tables[2].lookEnv, QString("INTOXICATED_SHARPEN_LOOK"), "the sharpen's look variable");
+    check(tables[2].knob("depth_aware") && tables[2].knob("depth_aware")->kind == SsrKind::Switch,
+          "depth aware is a switch");
+    SettingsConf conf;
+    check(applyShaderMode(tables, modes, conf, "cinematic"), "Cinematic with the lens and the sharpen");
+    same(conf.text(), QString("INTOXICATED_SSR=1\nINTOXICATED_LENS=1\nINTOXICATED_LENS_LOOK=prism\nINTOXICATED_SHARPEN=1\n"
+                              "INTOXICATED_SHARPEN_LOOK=crunchy\n"),
+         "their switches and looks");
+    check(setSsrKnob(conf, *tables[1].knob("halo"), {0.4}), "a halo of 0.4");
+    check(!setSsrKnob(conf, *tables[1].knob("aberration"), {20.0}), "an aberration out of range is refused");
+    check(!setSsrKnob(conf, *tables[2].knob("depth_aware"), {2.0}), "depth aware takes 0 or 1");
+    same(effectiveSsrValue(tables[2], conf, *tables[2].knob("strength")), SsrValue({2.0}), "crunchy's strength");
+    same(currentShaderMode(tables, modes, conf), QString(), "tuned is Custom");
+
+    // The depth of field's focus mode as named choices.
+    SsrKnob focus;
+    focus.name = "focus_mode";
+    focus.kind = SsrKind::Whole;
+    focus.min = 0;
+    focus.max = 2;
+    same(knobChoices("dof", focus), QStringList({"Fixed distance", "Character", "Past the character"}),
+         "three named focus modes");
+    focus.max = 3;
+    check(knobChoices("dof", focus).isEmpty(), "a range that no longer fits the names gets a slider");
+    focus.max = 2;
+    check(knobChoices("bloom", focus).isEmpty(), "only the depth of field's");
+    SsrKnob strength = focus;
+    strength.name = "strength";
+    check(knobChoices("dof", strength).isEmpty(), "and only its focus mode");
+}
+
 // The ray-traced reflections: their own switch only, never a look's.
 void testRayTracing() {
     const QString path = settingsConfPath();
@@ -892,13 +1056,56 @@ void testRayTracing() {
     check(!readAll(path).contains("INTOXICATED_RT"), "off removes the line");
     const QStringList warnings = rtWarnings();
     const QString all = warnings.join(QLatin1Char(' '));
-    for (const char *word : {"replaces", "textures", "leaderboards", "flicker", "never drawn", "1.6 GB", "1 to 2 ms",
+    for (const char *word : {"replaces", "textures", "leaderboards", "flicker", "never drawn", "1.6 GB", "3 to 6 ms",
                              "no hardware ray tracing", "RTX 4070 Ti", "620.70.06"})
         check(all.contains(QLatin1String(word)), QStringLiteral("the warnings say %1").arg(word));
     QFile::remove(path);
 }
 
 // readShaderTables runs `intoxicated --shader-looks`.
+void testEffectsHotkey() {
+    const QString path = settingsConfPath();
+    const auto reloaded = [&] {
+        SettingsConf c;
+        c.load(path);
+        return c;
+    };
+    QString error;
+    writeAll(path, "INTOXICATED_SHADERS_MODE=competitive\n");
+    SettingsConf conf = reloaded();
+    check(!effectsHotkeyOn(conf), "the effects hotkey starts off");
+    setEffectsHotkeyOn(conf, true);
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path), QByteArray("INTOXICATED_SHADERS_MODE=competitive\nINTOXICATED_EFFECTS_HOTKEY=1\n"),
+         "on writes INTOXICATED_EFFECTS_HOTKEY=1 and leaves the mode line alone");
+    conf = reloaded();
+    check(effectsHotkeyOn(conf), "and reads back on");
+    setEffectsHotkeyOn(conf, false);
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path), QByteArray("INTOXICATED_SHADERS_MODE=competitive\n"), "off removes the line");
+    // Hand-written values, as the client reads them.
+    for (const char *on : {"1", "F9", "f10", "F12", " F1 "}) {
+        writeAll(path, QByteArray("INTOXICATED_EFFECTS_HOTKEY=") + on + "\n");
+        check(effectsHotkeyOn(reloaded()), QString("%1 is on").arg(on));
+    }
+    for (const char *off : {"", "0", "F11", "F13", "F0", "2", "yes", "F"}) {
+        writeAll(path, QByteArray("INTOXICATED_EFFECTS_HOTKEY=") + off + "\n");
+        check(!effectsHotkeyOn(reloaded()), QString("%1 is off").arg(off));
+    }
+    // On keeps a key name the client takes, and replaces one it does not.
+    writeAll(path, "INTOXICATED_EFFECTS_HOTKEY=F10\n");
+    conf = reloaded();
+    setEffectsHotkeyOn(conf, true);
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path), QByteArray("INTOXICATED_EFFECTS_HOTKEY=F10\n"), "on keeps F10");
+    writeAll(path, "INTOXICATED_EFFECTS_HOTKEY=F11\n");
+    conf = reloaded();
+    setEffectsHotkeyOn(conf, true);
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path), QByteArray("INTOXICATED_EFFECTS_HOTKEY=1\n"), "on replaces F11 with 1");
+    QFile::remove(path);
+}
+
 void testShaderLauncher(const QString &scratch) {
     const QString bin = scratch + "/bin2";
     QDir().mkpath(bin);
@@ -910,17 +1117,232 @@ void testShaderLauncher(const QString &scratch) {
     const QByteArray savedPath = qgetenv("PATH");
     qputenv("PATH", QFile::encodeName(bin) + ":" + savedPath);
     QString error;
-    const auto tables = readShaderTables(&error);
+    QList<ShaderMode> modes;
+    const auto tables = readShaderTables(&error, &modes);
     check(tables.has_value(), "the effects come from intoxicated --shader-looks: " + error);
     if (tables)
         same(tables->size(), 3, "all of them");
+    same(modes.size(), 3, "and the modes");
+    bool unavailable = true;
+    check(readShaderTables(&error, nullptr, &unavailable).has_value() && !unavailable,
+          "a client with the effects has them available");
     writeAll(launcher, "#!/bin/sh\necho '{\"effects\": 1}'\n");
-    check(!readShaderTables(&error), "something else is refused");
+    check(!readShaderTables(&error, nullptr, &unavailable), "something else is refused");
     check(error.startsWith("intoxicated --shader-looks printed something else"), "and said: " + error);
+    check(!unavailable, "which is not the effects being left out");
+
+    // A client built without the visual effects, as the runtime prints it.
+    const QByteArray without = "{\n  \"available\": false,\n  \"reason\": \"built without visual effects\",\n"
+                               "  \"how_to_add\": \"run install.sh with --effects (intoxicated --update --effects)\"\n}\n";
+    check(effectsUnavailable(without), "available false is the effects left out");
+    check(!effectsUnavailable(kShaderLooks), "a table is not");
+    check(!effectsUnavailable("{\"available\": \"no\"}"), "only a false counts");
+    check(rayTracingBuilt("{\"available\": true, \"ray_tracing\": true}"), "ray_tracing true is the ray tracing built in");
+    check(!rayTracingBuilt(kShaderLooks), "a table without it is built without");
+    check(!rayTracingBuilt("{\"ray_tracing\": \"yes\"}"), "only a true counts");
+    check(!effectsUnavailable("not json"), "nor anything that is not JSON");
+    writeAll(scratch + "/without.json", without);
+    writeAll(launcher, "#!/bin/sh\n[ \"$1\" = --shader-looks ] && [ $# -eq 1 ] && exec cat '" + QFile::encodeName(scratch) +
+                           "/without.json'\nexit 7\n");
+    QList<ShaderMode> noModes;
+    check(!readShaderTables(&error, &noModes, &unavailable), "no tables from a client without the effects");
+    check(unavailable, "and it says they are unavailable");
+    check(noModes.isEmpty(), "and no modes");
+    check(error.contains(kAddEffectsCommand), "with how to add them: " + error);
+    // Without asking for it, still refused, with the same word.
+    check(!readShaderTables(&error), "refused without the flag too");
+    check(error.contains("built without visual effects"), "and said: " + error);
     qputenv("PATH", savedPath);
 }
 
+void testMacros() {
+    same(macrosPath("alt"), profileDir("alt") + "/macros.json", "macros.json path");
+
+    // The key table names a code both ways, and an unknown code gets a label.
+    same(keyEvdev("W"), 17, "W is evdev 17");
+    same(keyLabel(17), QString("W"), "and back");
+    same(keyLabel(200), QString("Key 200"), "a code not in the table still has a label");
+    same(keyEvdev("Nope"), -1, "a label not in the table has no code");
+
+    const QString path = macrosPath("default");
+    MacrosFile missing = loadMacros(path);
+    check(!missing.exists && missing.error.isEmpty() && missing.macros.isEmpty(), "a missing macros.json is empty");
+
+    // A full document, and a bad macro that is skipped rather than fatal.
+    writeAll(path, R"({"intoxicated-macros":1,"macros":[
+        {"name":"Rapid fire","enabled":true,"swallow":true,"repeat":true,
+         "trigger":{"key":33,"ctrl":true},
+         "steps":[{"type":"tap","key":57},{"type":"wait","ms":40},
+                  {"type":"click","x":640,"y":360,"button":2},{"type":"text","text":"gg"}]},
+        {"name":"no steps","trigger":{"key":34},"steps":[]},
+        {"name":"Spin","trigger":{"key":35},"steps":[{"type":"move","x":10,"y":20},{"type":"scroll","x":1,"y":2,"detents":-1}]}
+    ]})");
+    MacrosFile file = loadMacros(path);
+    check(file.exists && file.error.isEmpty(), "macros.json loads: " + file.error);
+    same(file.macros.size(), 2, "the two usable macros are kept");
+    same(file.skipped.size(), 1, "the empty one is skipped, not fatal");
+    if (file.macros.size() == 2) {
+        const MacroDef &m = file.macros[0];
+        same(m.name, QString("Rapid fire"), "the name");
+        check(m.enabled && m.swallow && m.repeat, "its switches");
+        check(m.triggerEvdev == 33 && m.triggerCtrl && !m.triggerShift, "its trigger");
+        same(m.steps.size(), 4, "its steps");
+        check(m.steps[0].kind == StepKind::Tap && m.steps[0].evdev == 57, "a tap");
+        check(m.steps[1].kind == StepKind::Wait && m.steps[1].ms == 40, "a wait");
+        check(m.steps[2].kind == StepKind::Click && m.steps[2].button == 2 && m.steps[2].x == 640, "a right click");
+        check(m.steps[3].kind == StepKind::Text && m.steps[3].text == "gg", "typed text");
+    }
+
+    // Round trip: what loads saves and loads back the same.
+    QString error;
+    check(saveMacros(path, file.macros, &error), "macros.json saves: " + error);
+    MacrosFile back = loadMacros(path);
+    same(back.macros.size(), 2, "the same count comes back");
+    check(back.skipped.isEmpty(), "and nothing is skipped the second time");
+    same(strays(QFileInfo(path).absolutePath(), {"macros.json"}), QStringList(), "no temporary file is left");
+    if (back.macros.size() == 2 && file.macros.size() == 2) {
+        const MacroStep &a = file.macros[0].steps[2];
+        const MacroStep &b = back.macros[0].steps[2];
+        check(a.kind == b.kind && a.button == b.button && a.x == b.x && a.y == b.y, "a click round trips");
+    }
+
+    // checkMacro names what is missing.
+    MacroDef empty;
+    check(!checkMacro(empty).isEmpty(), "a blank macro is refused");
+    MacroDef named;
+    named.name = "x";
+    check(checkMacro(named).contains("trigger"), "a macro with no trigger key is refused");
+    named.triggerEvdev = 33;
+    check(checkMacro(named).contains("step"), "a macro with no steps is refused");
+    named.steps.append(MacroStep{});
+    named.steps[0].kind = StepKind::Tap;
+    check(checkMacro(named).contains("key"), "a key step with no key is refused");
+    named.steps[0].evdev = 57;
+    check(checkMacro(named).isEmpty(), "a complete macro passes");
+
+    // A file that is not a usable object is reported and never written over.
+    for (const QByteArray &broken : {QByteArray("not json"), QByteArray("[1, 2]"),
+                                     QByteArray("{\"macros\": 5}")}) {
+        writeAll(path, broken);
+        MacrosFile f = loadMacros(path);
+        check(!f.error.isEmpty() && f.macros.isEmpty(), "broken macros.json is reported: " + QString::fromUtf8(broken));
+    }
+
+    // Blank is empty, not broken.
+    writeAll(path, "  \n");
+    check(loadMacros(path).error.isEmpty(), "a blank macros.json is an empty one");
+    QDir(profileDir("default")).removeRecursively();
+}
+
+// Wait up to MS for CONDITION, checking every 50 ms.
+bool waitFor(const std::function<bool()> &condition, int ms) {
+    QElapsedTimer t;
+    t.start();
+    while (!condition()) {
+        if (t.elapsed() > ms)
+            return false;
+        QThread::msleep(50);
+    }
+    return true;
+}
+
+void testSeveralClients(const QString &scratch) {
+    QString error;
+    QDir(profilesRoot()).removeRecursively();
+    check(createProfile("one", &error) && createProfile("two", &error), "two profiles: " + error);
+    const QString one = profileDir("one");
+    const QString two = profileDir("two");
+    const qint64 me = QCoreApplication::applicationPid();
+
+    // client.pid alone names nothing: not without the lock held by that process.
+    check(!clientPid(one), "no pid file, no client");
+    check(runningClients().isEmpty(), "nothing runs");
+    writeAll(one + "/client.pid", QByteArray::number(me) + "\n");
+    check(!clientPid(one), "a pid file whose process does not hold the lock names nothing");
+    writeAll(one + "/client.pid", "not a pid\n");
+    check(!clientPid(one), "a pid file that is not a number names nothing");
+
+    // This process as the client: the lock held, and the pid published.
+    writeAll(one + "/client.pid", QByteArray::number(me) + "\n");
+    const QByteArray lockPath = QFile::encodeName(one + "/.lock");
+    const int fd = ::open(lockPath.constData(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    check(fd >= 0 && ::flock(fd, LOCK_EX | LOCK_NB) == 0, "the test holds one's lock");
+    check(processHasOpen(me, one + "/.lock"), "this process has the lock file open");
+    check(!processHasOpen(me, two + "/flags.json"), "and not a file it never opened");
+    same(clientPid(one).value_or(-1), me, "the pid file names the lock's holder");
+    QList<RunningClient> running = runningClients();
+    check(running.size() == 1 && running[0].profile == "one" && running[0].pid == me,
+          "one is listed as running, with its process");
+    QString why;
+    check(!startClient("one", QString(), &why) && why.contains("already open"),
+          "a profile in use is not started again: " + why);
+    ::close(fd);
+    check(!clientPid(one) && runningClients().isEmpty(), "a released lock is no longer running");
+    QFile::remove(one + "/client.pid");
+
+    // Another process as the client: this program run as a stand-in that
+    // holds two's lock and publishes its pid as the client does. Stop must
+    // end exactly that process.
+    QProcess holder;
+    holder.setProgram(QCoreApplication::applicationFilePath());
+    holder.setArguments({"--self-test-client", two});
+    holder.start();
+    check(holder.waitForStarted(5000), "the stand-in client starts");
+    check(waitFor([&] { return clientPid(two).has_value(); }, 5000), "the other process is found as two's client");
+    const qint64 child = clientPid(two).value_or(-1);
+    same(child, holder.processId(), "by the pid it wrote");
+    running = runningClients();
+    check(running.size() == 1 && running[0].profile == "two" && running[0].pid == child, "two is listed as running");
+    check(stopClient("two", &why), "stop two: " + why);
+    check(holder.waitForFinished(5000), "stopping the client ends it");
+    check(holder.exitStatus() == QProcess::CrashExit, "by SIGTERM");
+    check(!profileInUse(two), "two's lock is free again");
+    check(QFileInfo::exists(two + "/client.pid") && !clientPid(two),
+          "the pid file the fake left behind names nothing");
+    check(!stopClient("two", &why) && why.startsWith("No client runs"), "stopping it again is refused: " + why);
+    check(!stopClient("../x", &why), "a path is not a profile to stop");
+
+    // The launch command, per profile, through a fake launcher.
+    const QString bin = scratch + "/bin";
+    QDir().mkpath(bin);
+    const QString launcher = bin + "/intoxicated";
+    const QString record = scratch + "/launched";
+    QDir().mkpath(record);
+    writeAll(launcher, "#!/bin/sh\nprintf '%s|%s|%s\\n' \"$INTOXICATED_PROFILE\" \"$#\" \"$*\" > '" +
+                           QFile::encodeName(record) + "/'\"$INTOXICATED_PROFILE\"\n");
+    QFile::setPermissions(launcher, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+    const QByteArray savedPath = qgetenv("PATH");
+    qputenv("PATH", QFile::encodeName(bin) + ":" + savedPath);
+    const LaunchCommand c = launchCommand("two", "189707");
+    same(c.program, launcher, "the launcher on PATH is run");
+    same(c.arguments, QStringList({"189707"}), "with the link as its one argument");
+    same(c.environment.value("INTOXICATED_PROFILE"), QString("two"), "and INTOXICATED_PROFILE set");
+    same(launchCommand("one", QString()).arguments, QStringList(), "no link, no argument");
+    check(startClient("one", QString(), &why), "start one: " + why);
+    check(startClient("two", "189707", &why), "start two: " + why);
+    check(waitFor([&] { return QFileInfo::exists(record + "/one") && QFileInfo::exists(record + "/two"); }, 5000),
+          "both launchers ran");
+    same(readAll(record + "/one"), QByteArray("one|0|\n"), "one's launcher got its profile and no argument");
+    same(readAll(record + "/two"), QByteArray("two|1|189707\n"), "two's launcher got its profile and the link");
+    check(!startClient("../x", QString(), &why), "a path is not a profile to start");
+    qputenv("PATH", savedPath);
+    QDir(profilesRoot()).removeRecursively();
+}
+
 } // namespace
+
+int runSelfTestClient(const QString &dir) {
+    // What the client does with a profile, and nothing else: hold its lock
+    // and publish this process's id, until a signal ends the process.
+    const QByteArray lock = QFile::encodeName(dir + "/.lock");
+    const int fd = ::open(lock.constData(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0 || ::flock(fd, LOCK_EX | LOCK_NB) != 0)
+        return 3;
+    writeAll(dir + "/client.pid", QByteArray::number(QCoreApplication::applicationPid()) + "\n");
+    for (int i = 0; i < 600; ++i)
+        QThread::msleep(100);
+    return 0;
+}
 
 int runSelfTest() {
     QTemporaryDir scratch;
@@ -953,8 +1375,13 @@ int runSelfTest() {
     testSsrLauncher(root);
     testShaderTables();
     testEffectSettings();
+    testShaderModes();
+    testLensAndSharpen();
+    testEffectsHotkey();
     testRayTracing();
     testShaderLauncher(root);
+    testMacros();
+    testSeveralClients(root);
 
     std::printf("self-test: %d checks, %d failed (scratch %s)\n", g_checks, g_failures, qPrintable(root));
     return g_failures == 0 ? 0 : 1;

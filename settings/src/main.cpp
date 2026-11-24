@@ -3,7 +3,7 @@
 //
 //   intoxicated-settings                 the window
 //   intoxicated-settings --page <name>   open on a page (play, fastflags,
-//                                        client, shaders, profiles, mods,
+//                                        client, shaders, macros, profiles, mods,
 //                                        about)
 //   intoxicated-settings --size WxH      open at that size
 //                                        (--page and --size are for tests
@@ -26,7 +26,7 @@
 
 namespace {
 
-const char *kUsage = "usage: intoxicated-settings [--page play|fastflags|client|shaders|profiles|mods|about] [--size WxH]\n"
+const char *kUsage = "usage: intoxicated-settings [--page play|fastflags|client|shaders|macros|profiles|mods|about] [--size WxH]\n"
                      "       intoxicated-settings --askpass PROMPT\n"
                      "       intoxicated-settings --self-test\n";
 
@@ -41,6 +41,11 @@ int main(int argc, char **argv) {
         if (std::strcmp(argv[i], "--self-test") == 0) {
             QCoreApplication app(argc, argv);
             return intox::runSelfTest();
+        }
+        // The stand-in client the self-test starts and stops; not for use.
+        if (std::strcmp(argv[i], "--self-test-client") == 0 && i + 1 < argc) {
+            QCoreApplication app(argc, argv);
+            return intox::runSelfTestClient(QString::fromLocal8Bit(argv[i + 1]));
         }
         if (std::strcmp(argv[i], "--askpass") == 0)
             return intox::runAskpass(argc, argv);

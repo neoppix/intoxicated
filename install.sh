@@ -12,6 +12,22 @@
 # there; `intoxicated --update` does the same. README.md has the same steps
 # done by hand.
 #
+# It also asks whether to build in the visual effects (reflections, depth of
+# field, bloom, lens, sharpening), no by default. The answer is kept in
+# ~/.config/intoxicated/install.conf, so an update builds the same way
+# without asking again; either of these changes it:
+#
+#   --effects      build the visual effects in (they stay off until turned on)
+#   --no-effects   build without them
+#
+# With the visual effects it also asks whether to build in the experimental
+# ray-traced reflections and lighting (the runtime's `rt` feature), no by
+# default, kept the same way:
+#
+#   --rt           build the ray tracing in (off until turned on; needs the
+#                  visual effects)
+#   --no-rt        build without it
+#
 #   INTOXICATED_REPO   where the checkout goes (default ~/intoxicated)
 #   INTOXICATED_YES=1  answer yes to every question
 #   PREFIX             where the launcher goes (default /usr/local)
@@ -27,6 +43,9 @@ BRANCH=freebsd-port
 PREFIX="${PREFIX:-/usr/local}"
 REPO="${INTOXICATED_REPO:-$HOME/intoxicated}"
 APKDIR="${XDG_CACHE_HOME:-$HOME/.cache}/intoxicated/apk"
+# Choices kept between runs, one KEY=VALUE per line: EFFECTS=yes or no, RT=yes
+# or no.
+INSTALL_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/intoxicated/install.conf"
 
 # Built, run, or loaded at run time by the client and the launcher.
 PACKAGES="git rust cmake pkgconf libepoll-shim libX11 libXi libXinerama libXrandr libxkbcommon vulkan-loader jq"
@@ -140,16 +159,122 @@ want_settings() {
   fi
 }
 
+# The visual effects (the runtime's `shaders` feature): yes when they are
+# built in. --effects or --no-effects decides; otherwise the choice kept in
+# INSTALL_CONF; otherwise an install from before there was a choice, whose
+# client had them, keeps them; otherwise ask, no by default.
+EFFECTS=""
+EFFECTS_FLAG=""
+
+remembered_effects() {
+  [ -f "$INSTALL_CONF" ] || return 0
+  sed -n 's/^EFFECTS=//p' "$INSTALL_CONF" | tail -n 1
+}
+
+want_effects() {
+  if [ -n "$EFFECTS_FLAG" ]; then
+    EFFECTS=$EFFECTS_FLAG
+    if [ "$EFFECTS" = yes ]; then
+      note "visual effects: built in (--effects)"
+    else
+      note "visual effects: left out (--no-effects)"
+    fi
+    return
+  fi
+  case $(remembered_effects) in
+    yes) EFFECTS=yes; note "visual effects: built in, as before (--no-effects leaves them out)"; return ;;
+    no) EFFECTS=no; note "visual effects: left out, as before (--effects adds them)"; return ;;
+  esac
+  if [ -e "$PREFIX/bin/intoxicated" ]; then
+    EFFECTS=yes
+    note "visual effects: kept, as this install had them (--no-effects leaves them out)"
+    return
+  fi
+  if ask "Install visual effects (reflections, depth of field, bloom, sharpening; optional, off until you turn them on)?" n; then
+    EFFECTS=yes
+  else
+    EFFECTS=no
+    note "visual effects left out; install.sh --effects (or intoxicated --update --effects) adds them later"
+  fi
+}
+
+# The experimental ray tracing (the runtime's `rt` feature, which needs the
+# visual effects): yes when it is built in. Never without the effects;
+# --rt or --no-rt decides; otherwise the choice kept in INSTALL_CONF;
+# otherwise ask, no by default.
+RT=""
+RT_FLAG=""
+
+remembered_rt() {
+  [ -f "$INSTALL_CONF" ] || return 0
+  sed -n 's/^RT=//p' "$INSTALL_CONF" | tail -n 1
+}
+
+want_rt() {
+  if [ "$EFFECTS" != yes ]; then
+    RT=no
+    [ "$RT_FLAG" = yes ] && note "ray tracing: left out, it needs the visual effects (--effects --rt)"
+    return
+  fi
+  if [ -n "$RT_FLAG" ]; then
+    RT=$RT_FLAG
+    if [ "$RT" = yes ]; then
+      note "ray tracing (experimental): built in (--rt)"
+    else
+      note "ray tracing: left out (--no-rt)"
+    fi
+    return
+  fi
+  case $(remembered_rt) in
+    yes) RT=yes; note "ray tracing (experimental): built in, as before (--no-rt leaves it out)"; return ;;
+    no) RT=no; note "ray tracing: left out, as before (--rt adds it)"; return ;;
+  esac
+  # Experimental: INTOXICATED_YES=1 does not say yes to it, only --rt or a
+  # typed yes does; with no terminal to ask (an update from Intoxicated
+  # Settings, an install from before the question) it is left out.
+  if ! has_tty; then
+    RT=no
+    note "ray tracing: left out (experimental; --rt adds it)"
+    return
+  fi
+  if [ "${INTOXICATED_YES:-}" = 1 ]; then
+    RT=no
+    note "ray tracing: left out (experimental, INTOXICATED_YES does not add it; --rt does)"
+    return
+  fi
+  note "EXPERIMENTAL ray-traced reflections and lighting: compute on the shader cores (no hardware ray"
+  note "tracing on FreeBSD), up to an eighth of the video memory and 3 to 6 ms of GPU time a frame when on,"
+  note "can flicker, only tried on an RTX 4070 Ti; off until turned on on the Shaders page"
+  if ask "Install the experimental ray tracing (optional, off until you turn it on)?" n; then
+    RT=yes
+  else
+    RT=no
+    note "ray tracing left out; install.sh --rt (or intoxicated --update --rt) adds it later"
+  fi
+}
+
+# Keep the choices for the next run, once a build has them.
+remember_effects() {
+  dir=$(dirname "$INSTALL_CONF")
+  mkdir -p "$dir" || die "could not create $dir"
+  { [ -f "$INSTALL_CONF" ] && grep -v '^EFFECTS=' "$INSTALL_CONF" | grep -v '^RT='; printf 'EFFECTS=%s\nRT=%s\n' "$EFFECTS" "$RT"; } > "$INSTALL_CONF.new" &&
+    mv "$INSTALL_CONF.new" "$INSTALL_CONF" || die "could not write $INSTALL_CONF"
+}
+
 check_packages() {
   step "Checking packages"
   if ! pkg -N >/dev/null 2>&1; then
     note "pkg is not set up yet"
     queue "env ASSUME_ALWAYS_YES=yes pkg bootstrap"
     want_settings no
+    want_effects
+    want_rt
     missing=" $PACKAGES $DESKTOP_PACKAGES"
     [ "$SETTINGS_APP" = yes ] && missing="$missing $SETTINGS_PACKAGE"
   else
     want_settings yes
+    want_effects
+    want_rt
     missing=""
     for p in $PACKAGES $DESKTOP_PACKAGES; do
       installed "$p" || missing="$missing $p"
@@ -307,9 +432,20 @@ install_files() {
   [ "$launcher" = "$REPO/packaging/freebsd/intoxicated" ] || rm -f "$launcher"
 }
 
+# The effects are the runtime's one default feature, so without them every
+# default feature is turned off; the ray tracing is the `rt` feature on top.
 build() {
-  step "Building (a first build takes a few minutes)"
-  (cd "$REPO" && cargo build --release) || die "the build failed; the output above says why"
+  if [ "$EFFECTS" = yes ] && [ "$RT" = yes ]; then
+    step "Building, with the visual effects and the experimental ray tracing (a first build takes a few minutes)"
+    (cd "$REPO" && cargo build --release --features rt) || die "the build failed; the output above says why"
+  elif [ "$EFFECTS" = yes ]; then
+    step "Building, with the visual effects (a first build takes a few minutes)"
+    (cd "$REPO" && cargo build --release) || die "the build failed; the output above says why"
+  else
+    step "Building, without the visual effects (a first build takes a few minutes)"
+    (cd "$REPO" && cargo build --release --no-default-features) || die "the build failed; the output above says why"
+  fi
+  remember_effects
 }
 
 link_handler() {
@@ -336,7 +472,26 @@ check_session() {
   [ -n "${DISPLAY:-}" ] || note "start Intoxicated from an X11 session (DISPLAY is not set here)"
 }
 
+usage() {
+  printf 'usage: install.sh [--effects | --no-effects] [--rt | --no-rt]\n'
+  printf '  --effects     build the visual effects in (off until turned on)\n'
+  printf '  --no-effects  build without them\n'
+  printf '  --rt          build the experimental ray tracing in (needs the effects)\n'
+  printf '  --no-rt       build without it\n'
+  printf 'Without either, the last choice is kept; a first install asks.\n'
+}
+
 main() {
+  for arg in "$@"; do
+    case $arg in
+      --effects) EFFECTS_FLAG=yes ;;
+      --no-effects) EFFECTS_FLAG=no ;;
+      --rt) RT_FLAG=yes ;;
+      --no-rt) RT_FLAG=no ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage >&2; die "unknown argument: $arg" ;;
+    esac
+  done
   check_system
   check_packages
   check_gpu
@@ -351,6 +506,12 @@ main() {
   note "Start it with: intoxicated"
   note "or straight into a game: intoxicated <placeId>, or a roblox.com game link"
   [ "$SETTINGS_BUILT" = yes ] && note "Flags, client options and profiles: intoxicated-settings"
+  if [ "$EFFECTS" = yes ]; then
+    note "Visual effects are built in, off until turned on (the Shaders page, or README.md)"
+    [ "$RT" = yes ] && note "The experimental ray tracing is built in, off until turned on (the Shaders page)"
+  else
+    note "Built without visual effects; intoxicated --update --effects adds them"
+  fi
   note "Update later with: intoxicated --update"
 }
 
