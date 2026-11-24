@@ -194,6 +194,8 @@ private:
         QList<QLabel *> values;
         double step = 0.01;
         Switch *toggle = nullptr;
+        // Named choices, one per value from the knob's minimum.
+        QList<QPushButton *> choices;
         QLabel *shown = nullptr;
         QPushButton *reset = nullptr;
     };

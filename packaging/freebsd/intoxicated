@@ -16,8 +16,8 @@
 #   intoxicated --ssr-looks          # print the reflections' knobs and looks
 #                                    # as JSON
 #   intoxicated --shader-looks       # the same for every effect drawn before
-#                                    # the HUD: reflections, depth of field,
-#                                    # bloom
+#                                    # the HUD (reflections, depth of field,
+#                                    # bloom, lens, sharpen) and the modes
 #   intoxicated --version            # print the client's version line
 #
 # INTOXICATED_PROFILE=<name> picks the profile (default: default).

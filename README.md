@@ -118,7 +118,7 @@ intoxicated --update-apk # fetch the newest Roblox build, then exit
 intoxicated --update     # update Intoxicated itself (pull, build, reinstall)
 intoxicated --default-flags  # print the flags the client sets itself (JSON)
 intoxicated --ssr-looks  # print the reflections' settings and looks (JSON)
-intoxicated --shader-looks  # the same for reflections, depth of field, bloom
+intoxicated --shader-looks  # the same for every effect, and the modes
 intoxicated --version    # print the client's version line
 INTOXICATED_PROFILE=alt intoxicated   # run another profile (see below)
 ```
@@ -308,7 +308,11 @@ first), the lens about 0.11 ms with the bloom on and about 0.15 ms when it
 runs the bloom chain itself; frame times did not change measurably (p50 4.2
 ms). Neither shows anything that is not drawn: the aberration moves drawn
 colours by a few pixels, the vignette only darkens and the fringe only adds
-light around what is already bright.
+light around what is already bright. Limits: the rainbow fringe was made
+stronger after it was last seen in game, so its default strength is
+INFERRED; depth-aware sharpening was not yet compared in game against a
+near outline; and like the other effects both work on the engine's 10-bit
+picture, not HDR.
 
 `INTOXICATED_SHADERS_MODE` switches all five at once and starts each from a
 look: `off`; `competitive`, pretty but playable (the reflections' competitive
@@ -318,7 +322,10 @@ bloom, light sharpening, no lens effects); or `cinematic`, the clip look
 neon bloom, the prism lens and crunchy sharpening). An effect's own switch or
 look variable wins over the mode, and its knobs change the look as always;
 devctl `shaders mode <name>` does the same while the game runs and `shaders`
-reports each effect's switch and look.
+reports each effect's switch and look. At 3362x1349 on the RTX 4070 Ti the
+competitive set took about 1.3 ms of GPU time per frame and the cinematic
+set about 1.5 ms, everything included; frame times did not change
+measurably (p50 4.2 ms either way, as with all off).
 
 When the disk holding the profile's Roblox data runs short, the client says so:
 below 2 GiB free as it hands Roblox its window, below 512 MiB again when the
@@ -335,13 +342,18 @@ An optional desktop app for what is otherwise set by hand. FastFlags: presets
 MSAA), every flag in the profile's `flags.json` with inline editing, import of
 a JSON file (a Bloxstrap export or a `ClientAppSettings.json`) with a preview,
 export and reset. Client options: window, input, graphics, audio and session.
-Shaders: the screen-space reflections, the depth of field and the bloom, one
-group each with a switch, the named looks (Competitive, Wet road, Clean
-mirror, Puddles and Glossy for the reflections; Cinematic, Subtle and Portrait
-for the depth of field; Soft, Neon and Dreamy for the bloom) and a fine-tune
-row for each of their settings; picking a look clears the fine tuning, after
-asking, and each row has its own reset. Like the client options they apply from the
-next launch. Profiles: create, delete and pick the default one. And Play, a place id or
+Shaders: at the top the modes Off, Competitive and Cinematic, with Custom
+lit when the effects were changed by hand (picking a mode sets every
+effect's switch and look and clears the fine tuning, after asking); then the
+screen-space reflections, the depth of field, the bloom, the lens and the
+sharpen, one group each with a switch, the named looks (Competitive, Wet
+road, Clean mirror, Puddles and Glossy for the reflections; Playable,
+Cinematic and Portrait for the depth of field; Soft, Neon and Dreamy for the
+bloom; Subtle, Prism and Film for the lens; Light, Crisp and Crunchy for the
+sharpen) and a fine-tune row for each of their settings (the depth of
+field's focus as Fixed distance, Character or Past the character); picking a
+look clears that effect's fine tuning, after asking, and each row has its
+own reset. Like the client options they apply from the next launch. Profiles: create, delete and pick the default one. And Play, a place id or
 link field, and the two update commands. It is a Qt 6 Widgets program in
 `settings/` that needs `qt6-base` and nothing else.
 

@@ -1148,6 +1148,26 @@ std::optional<SsrTable> readSsrTable(QString *error) {
     return table;
 }
 
+QStringList knobChoices(const QString &effect, const SsrKnob &knob) {
+    struct Choices {
+        const char *effect;
+        const char *knob;
+        QStringList titles;
+    };
+    static const Choices kChoices[] = {
+        {"dof", "focus_mode",
+         {QStringLiteral("Fixed distance"), QStringLiteral("Character"), QStringLiteral("Past the character")}},
+    };
+    for (const Choices &c : kChoices) {
+        if (effect != QLatin1String(c.effect) || knob.name != QLatin1String(c.knob))
+            continue;
+        if (knob.kind != SsrKind::Whole || knob.min != 0 || knob.max != c.titles.size() - 1)
+            return {};
+        return c.titles;
+    }
+    return {};
+}
+
 QString ssrLookTitle(const QString &name) {
     QString title = name;
     title.replace(QLatin1Char('_'), QLatin1Char(' '));

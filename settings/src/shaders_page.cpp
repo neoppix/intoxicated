@@ -49,8 +49,8 @@ const KnobText kKnobText[] = {
     {"ssr", "fov", "Field of view", "The camera's vertical field of view the reflections assume; Roblox's is 70"},
     {"ssr", "keep_colour", "Keep colour", "0 the colours it reflects, 1 their brightness in the surface's own hue"},
     {"dof", "strength", "Strength", "The largest blur, as a radius in pixels at 1080p"},
-    {"dof", "focus_mode", "Focus mode", "0 a fixed distance, 1 your character at the screen centre, 2 what lies past it"},
-    {"dof", "focus_distance", "Focus distance", "Where the focus is in mode 0, in studs"},
+    {"dof", "focus_mode", "Focus", "Where the focus is: a fixed distance, your character at the screen centre, or what lies past it"},
+    {"dof", "focus_distance", "Focus distance", "Where the focus is with a fixed distance, in studs"},
     {"dof", "focus_range", "Near range", "How far in front of the focus stays sharp with near blur, relative to its distance"},
     {"dof", "far_range", "Far range", "How far behind the focus stays sharp, relative to its distance"},
     {"dof", "near_blur", "Near blur", "Things nearer than the focus blur too"},
@@ -61,6 +61,12 @@ const KnobText kKnobText[] = {
     {"bloom", "knee", "Softness", "How gently the glow fades in around the threshold"},
     {"bloom", "radius", "Radius", "0 a tight glow around each light, 1 a wide haze"},
     {"bloom", "tint", "Tint", "The colour of the glow (red, green, blue)"},
+    {"lens", "aberration", "Colour split", "How far red and blue part in the corners, in pixels at 1080p; none at the centre"},
+    {"lens", "vignette", "Vignette", "How much darker the corners are"},
+    {"lens", "halo", "Rainbow halo", "A rainbow fringe round the brightest areas, from the bloom's glow"},
+    {"sharpen", "strength", "Strength", "How strongly texture detail is raised"},
+    {"sharpen", "limit", "Limit", "The most any pixel may change, 0 to 1"},
+    {"sharpen", "depth_aware", "Depth aware", "Not across depth edges, so outlines get no halo"},
 };
 
 // The switch row of each effect, and what is offered when the client cannot
@@ -76,6 +82,8 @@ const EffectText kEffectText[] = {
     {"ssr", "Reflections (SSR)", "Screen-space reflections", "INTOXICATED_SSR"},
     {"dof", "Depth of field", "Depth of field", "INTOXICATED_DOF"},
     {"bloom", "Bloom", "Bloom", "INTOXICATED_BLOOM"},
+    {"lens", "Lens", "Lens effects", "INTOXICATED_LENS"},
+    {"sharpen", "Sharpen", "Sharpening", "INTOXICATED_SHARPEN"},
 };
 
 KnobText knobText(const QString &effect, const QString &name) {
@@ -304,7 +312,28 @@ void ShadersPage::buildFineTune(QVBoxLayout *rows, int index) {
         auto *h = new QHBoxLayout(control);
         h->setContentsMargins(0, 0, 0, 0);
         h->setSpacing(10);
-        if (knob.kind == SsrKind::Switch) {
+        const QStringList choices = knobChoices(fx.table.name, knob);
+        if (!choices.isEmpty()) {
+            auto *row = new QHBoxLayout;
+            row->setSpacing(6);
+            for (int c = 0; c < choices.size(); ++c) {
+                auto *btn = new QPushButton(choices[c]);
+                btn->setObjectName(QStringLiteral("segment"));
+                btn->setCheckable(true);
+                btn->setCursor(Qt::PointingHandCursor);
+                btn->setFocusPolicy(Qt::NoFocus);
+                btn->setMinimumHeight(28);
+                row->addWidget(btn);
+                kr.choices.append(btn);
+                connect(btn, &QPushButton::clicked, this, [this, index, r, c] {
+                    EffectUi &e = m_effects[index];
+                    for (int k = 0; k < e.rows[r].choices.size(); ++k)
+                        e.rows[r].choices[k]->setChecked(k == c);
+                    knobMoved(index, r);
+                });
+            }
+            h->addLayout(row);
+        } else if (knob.kind == SsrKind::Switch) {
             kr.toggle = new Switch;
             h->addWidget(kr.toggle, 0, Qt::AlignVCenter);
             kr.shown = new QLabel;
@@ -455,7 +484,12 @@ void ShadersPage::reloadEffect(const SettingsConf &conf, EffectUi &fx) {
         const auto set = ssrOverride(conf, knob);
         const bool usable = set && parseSsrValue(knob, *set);
         const SsrValue value = effectiveSsrValue(fx.table, conf, knob);
-        if (row.toggle) {
+        if (!row.choices.isEmpty()) {
+            for (int c = 0; c < row.choices.size(); ++c) {
+                row.choices[c]->setChecked(qRound(value.value(0) - knob.min) == c);
+                row.choices[c]->setProperty("set", usable);
+            }
+        } else if (row.toggle) {
             row.toggle->setChecked(value.value(0) != 0.0);
             row.shown->setText(value.value(0) != 0.0 ? QStringLiteral("On") : QStringLiteral("Off"));
         } else {
@@ -558,7 +592,14 @@ void ShadersPage::knobMoved(int effect, int row) {
     const KnobRow &kr = fx.rows.at(row);
     const SsrKnob &knob = *fx.table.knob(kr.name);
     SsrValue value;
-    if (kr.toggle) {
+    if (!kr.choices.isEmpty()) {
+        for (int c = 0; c < kr.choices.size(); ++c) {
+            if (kr.choices[c]->isChecked())
+                value.append(knob.min + c);
+        }
+        if (value.isEmpty())
+            return;
+    } else if (kr.toggle) {
         value.append(kr.toggle->isChecked() ? 1.0 : 0.0);
     } else {
         for (QSlider *s : kr.sliders)

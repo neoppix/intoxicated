@@ -941,6 +941,75 @@ void testShaderModes() {
     QFile::remove(path);
 }
 
+// The lens and the sharpen as the client lists them, cut down to a knob or
+// two, after one reflections knob, and a mode that names all three.
+const QByteArray kFiveLooks = R"json({
+  "effects": [
+    {"name": "ssr", "title": "Reflections (SSR)", "summary": "Reflections.",
+     "switch": "INTOXICATED_SSR", "look_env": "INTOXICATED_SSR_LOOK", "default_look": "competitive",
+     "knobs": [{"default": 0.4, "env": "INTOXICATED_SSR_INTENSITY", "kind": "number", "max": 1.0, "min": 0.0, "name": "intensity"}],
+     "looks": [{"description": "Faint.", "name": "competitive", "values": {"intensity": 0.4}}]},
+    {"name": "lens", "title": "Lens", "summary": "Like a camera lens.",
+     "switch": "INTOXICATED_LENS", "look_env": "INTOXICATED_LENS_LOOK", "default_look": "subtle",
+     "knobs": [{"default": 1.5, "env": "INTOXICATED_LENS_ABERRATION", "kind": "number", "max": 16.0, "min": 0.0, "name": "aberration"},
+               {"default": 0.15, "env": "INTOXICATED_LENS_HALO", "kind": "number", "max": 2.0, "min": 0.0, "name": "halo"}],
+     "looks": [{"description": "Faint.", "name": "subtle", "values": {"aberration": 1.5, "halo": 0.15}},
+               {"description": "For clips.", "name": "prism", "values": {"aberration": 5.0, "halo": 0.7}}]},
+    {"name": "sharpen", "title": "Sharpen", "summary": "Crisper.",
+     "switch": "INTOXICATED_SHARPEN", "look_env": "INTOXICATED_SHARPEN_LOOK", "default_look": "light",
+     "knobs": [{"default": 0.5, "env": "INTOXICATED_SHARPEN_STRENGTH", "kind": "number", "max": 3.0, "min": 0.0, "name": "strength"},
+               {"default": 1, "env": "INTOXICATED_SHARPEN_DEPTH_AWARE", "kind": "switch", "max": 1, "min": 0, "name": "depth_aware"}],
+     "looks": [{"description": "Light.", "name": "light", "values": {"strength": 0.5, "depth_aware": 1}},
+               {"description": "Crunchy.", "name": "crunchy", "values": {"strength": 2.0, "depth_aware": 1}}]}
+  ],
+  "mode_env": "INTOXICATED_SHADERS_MODE",
+  "modes": [
+    {"name": "cinematic", "title": "Cinematic", "description": "Clips.",
+     "effects": {"ssr": {"on": true, "look": "competitive"}, "lens": {"on": true, "look": "prism"},
+                 "sharpen": {"on": true, "look": "crunchy"}}}
+  ]
+})json";
+
+void testLensAndSharpen() {
+    QList<SsrTable> tables;
+    QList<ShaderMode> modes;
+    QString error;
+    check(parseShaderTables(kFiveLooks, &tables, &error), "the lens and the sharpen parse: " + error);
+    check(parseShaderModes(kFiveLooks, tables, &modes, &error), "and a mode naming them: " + error);
+    if (tables.size() != 3 || modes.size() != 1)
+        return;
+    same(tables[1].switchEnv, QString("INTOXICATED_LENS"), "the lens's switch");
+    same(tables[2].lookEnv, QString("INTOXICATED_SHARPEN_LOOK"), "the sharpen's look variable");
+    check(tables[2].knob("depth_aware") && tables[2].knob("depth_aware")->kind == SsrKind::Switch,
+          "depth aware is a switch");
+    SettingsConf conf;
+    check(applyShaderMode(tables, modes, conf, "cinematic"), "Cinematic with the lens and the sharpen");
+    same(conf.text(), QString("INTOXICATED_SSR=1\nINTOXICATED_LENS=1\nINTOXICATED_LENS_LOOK=prism\nINTOXICATED_SHARPEN=1\n"
+                              "INTOXICATED_SHARPEN_LOOK=crunchy\n"),
+         "their switches and looks");
+    check(setSsrKnob(conf, *tables[1].knob("halo"), {0.4}), "a halo of 0.4");
+    check(!setSsrKnob(conf, *tables[1].knob("aberration"), {20.0}), "an aberration out of range is refused");
+    check(!setSsrKnob(conf, *tables[2].knob("depth_aware"), {2.0}), "depth aware takes 0 or 1");
+    same(effectiveSsrValue(tables[2], conf, *tables[2].knob("strength")), SsrValue({2.0}), "crunchy's strength");
+    same(currentShaderMode(tables, modes, conf), QString(), "tuned is Custom");
+
+    // The depth of field's focus mode as named choices.
+    SsrKnob focus;
+    focus.name = "focus_mode";
+    focus.kind = SsrKind::Whole;
+    focus.min = 0;
+    focus.max = 2;
+    same(knobChoices("dof", focus), QStringList({"Fixed distance", "Character", "Past the character"}),
+         "three named focus modes");
+    focus.max = 3;
+    check(knobChoices("dof", focus).isEmpty(), "a range that no longer fits the names gets a slider");
+    focus.max = 2;
+    check(knobChoices("bloom", focus).isEmpty(), "only the depth of field's");
+    SsrKnob strength = focus;
+    strength.name = "strength";
+    check(knobChoices("dof", strength).isEmpty(), "and only its focus mode");
+}
+
 // readShaderTables runs `intoxicated --shader-looks`.
 void testShaderLauncher(const QString &scratch) {
     const QString bin = scratch + "/bin2";
@@ -999,6 +1068,7 @@ int runSelfTest() {
     testShaderTables();
     testEffectSettings();
     testShaderModes();
+    testLensAndSharpen();
     testShaderLauncher(root);
 
     std::printf("self-test: %d checks, %d failed (scratch %s)\n", g_checks, g_failures, qPrintable(root));

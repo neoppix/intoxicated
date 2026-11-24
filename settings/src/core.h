@@ -356,6 +356,12 @@ bool applyShaderMode(const QList<SsrTable> &tables, const QList<ShaderMode> &mod
 // "wet_road" as a button says it: "Wet road".
 QString ssrLookTitle(const QString &name);
 
+// A whole knob of EFFECT whose values are named choices rather than numbers
+// (the depth of field's focus mode): one title per value from its minimum
+// to its maximum. Empty for any other knob, and for one whose range no
+// longer has exactly as many values as there are names.
+QStringList knobChoices(const QString &effect, const SsrKnob &knob);
+
 // A value as the client reads it: a number in range, a whole number, 0 or 1,
 // or r,g,b (or one number for all three). nullopt when the client would not
 // take TEXT.
