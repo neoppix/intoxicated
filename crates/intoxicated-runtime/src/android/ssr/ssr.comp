@@ -460,27 +460,39 @@ vec4 reflection(ivec2 p, vec3 P, vec3 N, float wet) {
 // brighter the screen is than the bare colours of hits it shows, measured
 // over recent frames (see `rt/build.comp`).
 //
-// Everything is in the view space of the camera FIT measured (see
-// `rt/build.comp`), the depth buffer and the captured triangles alike, so a
-// ray leaves a surface at its true angle. Each block's result is kept for
-// the next frame and blended in again while its pixel stays at the same
-// depth, which steadies it.
+// The surface is found in the depth buffer and its normal in view space,
+// with the projection FIT measured (see `rt/build.comp`); the ray is traced
+// in world space, against this frame's triangles and the cached static ones
+// that are out of view, so the walls behind the camera are still there when
+// it looks down. Each block's result is kept for the next frame and blended
+// in again while its pixel stays at the same depth, which steadies it.
+//
+// The screen colour is taken from a copy of the scene made after its first
+// pass (the opaque world), before anything transparent, the interface drawn
+// in the world or a billboard is drawn over it (flags bit 2; `ssr.rs`),
+// which write no depth and so would pass the depth test. Without such a copy
+// this frame, every hit takes its captured colour.
 
-layout(std430, set = 1, binding = 0) readonly buffer Xfb { vec4 xfb[]; };
+layout(binding = 6) uniform sampler2D opaque_tex;
 layout(std430, set = 1, binding = 2) readonly buffer Sorted { uvec2 sorted[]; };
 layout(std430, set = 1, binding = 3) readonly buffer Nodes { vec4 nodes[]; };
 layout(std430, set = 1, binding = 6) buffer Globals {
     uint leaves;
-    uint captured;
-    uint fit_ok;
     uint fit_samples;
+    uint fit_ok;
+    uint cached;
     vec4 camera;
     vec4 world_up;
     uint lit_screen;
     uint lit_colour;
     float exposure;
-    uint unused;
+    uint frame;
+    vec4 cam_pos;
+    vec4 right;
+    vec4 up;
+    vec4 forward;
 };
+layout(std430, set = 1, binding = 8) readonly buffer Tris { vec4 tris[]; };
 // Per block: the premultiplied colour and strength as four halves, the
 // pixel the ray left from (x | y << 16, or ~0 for none).
 layout(std430, set = 1, binding = 7) buffer Blocks { uvec4 blocks[]; };
@@ -501,17 +513,44 @@ uvec2 half_size() {
 
 #ifndef UPSAMPLE
 
-vec3 tri_view(uint v) {
-    vec4 c = xfb[3u * v];
-    if (g_fit) {
-        return vec3(c.x * g_tan.x, -c.y * g_tan.y, c.w) / g_near;
+// View space (near-plane units) to world space (studs), and back.
+vec3 world_dir(vec3 d) {
+    return d.x * right.xyz + d.y * up.xyz + d.z * forward.xyz;
+}
+
+vec3 to_world(vec3 P) {
+    return cam_pos.xyz + world_dir(P) * g_near;
+}
+
+vec3 to_view_space(vec3 W) {
+    vec3 r = W - cam_pos.xyz;
+    return vec3(dot(r, right.xyz), dot(r, up.xyz), dot(r, forward.xyz)) / g_near;
+}
+
+vec3 tri_world(uint v) {
+    return tris[v].xyz;
+}
+
+// The scene colour of the opaque world around `at`, as `reflected_color`
+// takes it from the finished scene.
+vec3 opaque_color(vec2 at, float pixels, int cell) {
+    vec2 inv = 1.0 / vec2(pc.size);
+    if (pc.roughness <= 0.0) {
+        return textureLod(opaque_tex, at * inv, 0.0).rgb;
     }
-    return vec3(c.x * g_tan.x, -c.y * g_tan.y, c.w) / c.z;
+    float radius = min(pc.roughness * (1.0 + 0.06 * pixels), 32.0);
+    vec3 c = vec3(0.0);
+    for (int i = 0; i < 4; ++i) {
+        float a = 0.3926991 * float(cell) + 1.5707963 * float(i);
+        float r = radius * (i % 2 == 0 ? 0.5 : 1.0);
+        c += textureLod(opaque_tex, (at + r * vec2(cos(a), sin(a))) * inv, 0.0).rgb;
+    }
+    return 0.25 * c;
 }
 
 // Moller-Trumbore, both faces: t (or -1) and the barycentrics of B and C.
 float hit_triangle(vec3 O, vec3 D, uint tri, float t_min, out vec2 uv) {
-    vec3 A = tri_view(3u * tri), B = tri_view(3u * tri + 1u), C = tri_view(3u * tri + 2u);
+    vec3 A = tri_world(3u * tri), B = tri_world(3u * tri + 1u), C = tri_world(3u * tri + 2u);
     vec3 e1 = B - A, e2 = C - A;
     vec3 q = cross(D, e2);
     float det = dot(e1, q);
@@ -624,8 +663,10 @@ float trace_ray(vec3 O, vec3 D, float t_min, float t_max, out uint tri_hit, out 
 // at the end), so as it is, it is the part's colour under a light of 1; no
 // light of ours is added.
 vec3 hit_colour(uint tri, vec2 uv) {
-    vec4 ca = xfb[3u * (3u * tri) + 1u], cb = xfb[3u * (3u * tri + 1u) + 1u], cc = xfb[3u * (3u * tri + 2u) + 1u];
-    vec3 c = ca.rgb * (1.0 - uv.x - uv.y) + cb.rgb * uv.x + cc.rgb * uv.y;
+    vec3 ca = unpackUnorm4x8(floatBitsToUint(tris[3u * tri].w)).rgb;
+    vec3 cb = unpackUnorm4x8(floatBitsToUint(tris[3u * tri + 1u].w)).rgb;
+    vec3 cc = unpackUnorm4x8(floatBitsToUint(tris[3u * tri + 2u].w)).rgb;
+    vec3 c = ca * (1.0 - uv.x - uv.y) + cb * uv.x + cc * uv.y;
     return any(isnan(c)) ? vec3(0.5) : clamp(c, 0.0, 1.0);
 }
 
@@ -634,39 +675,43 @@ vec4 reflection_rt(ivec2 p, vec3 P, vec3 N, float wet) {
     float cos_v = clamp(dot(-V, N), 0.0, 1.0);
     float schlick = 0.04 + 0.96 * pow(1.0 - cos_v, 5.0);
     float w = pc.intensity * mix(1.0, schlick, pc.fresnel) * wet * smoothstep(GRAZING_LO, GRAZING_HI, cos_v);
-    if (w < 1.0 / 1024.0) {
+    if (w < 1.0 / 1024.0 || !g_fit) {
         return vec4(0.0);
     }
     vec3 R = reflect(V, N);
+    bool opaque = (pc.flags & 4u) != 0u;
     // Off the surface a little, so the ray does not find the triangle the
-    // pixel lies on; the depth it came from is only so precise.
-    vec3 O = P + N * (0.002 * P.z);
-    float t_max = pc.max_distance > 0.0 ? pc.max_distance * length(P) : 3.0e38;
+    // pixel lies on; the depth it came from is only so precise. In world
+    // space, studs.
+    vec3 O = to_world(P + N * (0.002 * P.z));
+    vec3 Rw = normalize(world_dir(R));
+    float scale = g_near;
+    float t_max = pc.max_distance > 0.0 ? pc.max_distance * length(P) * scale : 3.0e38;
     uint tri;
     vec2 uv;
-    float t = trace_ray(O, R, 0.002 * P.z, t_max, tri, uv);
+    float t = trace_ray(O, Rw, 0.002 * P.z * scale, t_max, tri, uv);
     int k = cell(p);
     if (t < 0.0) {
         // Nothing in the way: the sky, where its vanishing point is on the
         // screen and the screen shows sky there.
         if (R.z > 1e-4) {
             vec2 s1 = to_pixel(R);
-            if (all(greaterThanEqual(s1, vec2(0.5))) && all(lessThan(s1, vec2(pc.size) - 0.5)) && depth_at(ivec2(s1)) <= 0.0) {
-                return vec4(reflected_color(s1, length(s1 - vec2(p)), k) * w, w);
+            if (opaque && all(greaterThanEqual(s1, vec2(0.5))) && all(lessThan(s1, vec2(pc.size) - 0.5)) && depth_at(ivec2(s1)) <= 0.0) {
+                return vec4(opaque_color(s1, length(s1 - vec2(p)), k) * w, w);
             }
         }
         return vec4(0.0);
     }
-    vec3 H = O + R * t;
+    vec3 H = to_view_space(O + Rw * t);
     vec3 c;
     bool on_screen = false;
-    if (H.z > 1e-3) {
+    if (opaque && H.z > 1e-3) {
         vec2 at = to_pixel(H);
         if (all(greaterThanEqual(at, vec2(0.5))) && all(lessThan(at, vec2(pc.size) - 0.5))) {
             float ds = depth_at(ivec2(at));
             float zs = ds > 0.0 ? 1.0 / ds : 3.0e38;
             if (abs(H.z - zs) < 0.02 * H.z) {
-                c = reflected_color(at, length(at - vec2(p)), k);
+                c = opaque_color(at, length(at - vec2(p)), k);
                 on_screen = true;
             }
         }

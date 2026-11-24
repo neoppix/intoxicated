@@ -105,7 +105,6 @@ const USAGE_TRANSFER_SRC: u32 = 0x1;
 const USAGE_TRANSFER_DST: u32 = 0x2;
 const USAGE_STORAGE: u32 = 0x20;
 const USAGE_XFB: u32 = 0x800;
-const USAGE_XFB_COUNTER: u32 = 0x1000;
 
 const MEMORY_DEVICE_LOCAL: u32 = 0x1;
 
@@ -116,7 +115,7 @@ const BIND_POINT_GRAPHICS: u32 = 0;
 pub(crate) const TRIANGLE_BYTES: u64 = 3 * spirv::STRIDE as u64;
 
 /// The triangles our buffer holds, unless `INTOXICATED_RT_TRIANGLES` says
-/// (72 MiB; Timebomb Duels draws 60000 to 180000 a frame in its lobby).
+/// (96 MiB; Timebomb Duels draws 60000 to 180000 a frame in its lobby).
 const DEFAULT_TRIANGLES: u64 = 1 << 19;
 
 pub const DUMP_ENV: &str = "INTOXICATED_RT_DUMP";
@@ -185,6 +184,8 @@ struct Cmd {
     scene: bool,
     /// And capturing it is possible.
     capturing: bool,
+    /// The colour of the frame's first scene pass, to copy when it ends.
+    opaque: Option<super::super::ssr::Att>,
     /// The pass's extent, and the scissor last set (x, y, width, height).
     extent: [u32; 2],
     scissor: Option<[i32; 4]>,
@@ -202,8 +203,7 @@ struct Gpu {
     device: usize,
     fns: Fns,
     xfb: Owned,
-    counter: Owned,
-    /// Host-visible: the counter at 0, then (for dumps) the whole buffer.
+    /// Host-visible: for dumps, the whole buffer from byte 256.
     readback: Owned,
     readback_ptr: usize,
     readback_size: u64,
@@ -214,6 +214,8 @@ struct Gpu {
     frame: u64,
     /// The bytes this frame's draws write, as counted when recorded.
     bytes: u64,
+    /// A draw to capture found no room this frame.
+    overflowed: bool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -593,11 +595,15 @@ pub(crate) fn cmd_begun(cmd: *mut c_void) {
 /// Before every scene pass, outside it: the barrier that keeps this frame's
 /// capture from overwriting what the last one's readers still use.
 pub(crate) fn pass_beginning(pass: &Pass) {
-    let (depth, full, to_swapchain, colours) = {
+    let (depth, full, to_swapchain, colours, colour) = {
         let reg = super::super::vk_layer::passes::registry();
         let d = super::super::ssr::describe(pass, &reg);
         let to_swapchain = d.colors.iter().chain(&d.resolves).any(|a| a.swapchain);
-        (d.depth, reg.swapchain_extents(), to_swapchain, d.colors.len())
+        // The scene colour as it stands at the end of the pass: the
+        // single-sample resolve target when the pass has one, else the
+        // colour attachment itself.
+        let colour = d.resolves.first().or(d.colors.first()).cloned();
+        (d.depth, reg.swapchain_extents(), to_swapchain, d.colors.len(), colour)
     };
     let mut st = state();
     let cmd = pass.cmd;
@@ -633,6 +639,9 @@ pub(crate) fn pass_beginning(pass: &Pass) {
     c.device = device;
     c.scene = true;
     c.extent = z.extent;
+    // The frame's first scene pass, the opaque world: its colour is copied
+    // when it ends (see `pass_ended`).
+    c.opaque = if starts { colour } else { None };
     c.capturing = false;
     c.active = false;
     if !xfb {
@@ -649,6 +658,7 @@ pub(crate) fn pass_beginning(pass: &Pass) {
     let g = st.gpus.iter_mut().find(|g| g.device == device).expect("made above");
     if starts {
         g.bytes = 0;
+        g.overflowed = false;
         g.frame = presents;
         st.stats.frames += 1;
         st.frame_log.clear();
@@ -756,7 +766,7 @@ pub(crate) fn pass_ended(cmd: *mut c_void) {
     if !capturing {
         return;
     }
-    let (device, dumping) = (c.device, c.dumping);
+    let (device, dumping, opaque) = (c.device, c.dumping, c.opaque.take());
     let presents = PRESENTS.load(Relaxed);
     let Some(g) = st.gpus.iter().find(|g| g.device == device) else { return };
     g.barrier(
@@ -776,6 +786,17 @@ pub(crate) fn pass_ended(cmd: *mut c_void) {
     }
     if let Some(last) = st.frame_log.last_mut() {
         last.push_str(&format!("..{}", bytes / TRIANGLE_BYTES));
+    }
+    drop(st);
+    // The opaque world's colour, for the trace (outside our lock: the
+    // reflections' state is taken while it is held elsewhere).
+    if let Some(a) = opaque {
+        if super::trace::is_on() {
+            let copied = super::super::ssr::copy_opaque(cmd, &a);
+            if let Some(last) = state().frame_log.last_mut() {
+                last.push_str(if copied { ",opaque copied" } else { ",opaque not copied" });
+            }
+        }
     }
 }
 
@@ -831,6 +852,9 @@ pub(crate) fn drew(cmd: *mut c_void, kind: &'static str, count: u32, instances: 
             (Some(_), Some(_)) => {
                 // No room left this frame.
                 end_if_active(&mut st, cmd);
+                if let Some(g) = st.gpus.iter_mut().find(|g| g.device == device) {
+                    g.overflowed = true;
+                }
                 st.stats.draws_skipped += 1;
                 st.stats.draws_overflowed += 1;
             }
@@ -913,9 +937,25 @@ pub(crate) fn device_destroying(device: *mut c_void) {
 /// buffer was made: the buffer of triangles, the buffer whose first word
 /// the trace sets to the bytes written, the capacity in bytes, and the
 /// bytes this frame wrote so far.
-pub(crate) fn frame_captured(device: usize) -> Option<(u64, u64, u64, u64)> {
+pub(crate) fn frame_captured(device: usize) -> Option<Captured> {
     let st = state();
-    st.gpus.iter().find(|g| g.device == device && g.started).map(|g| (g.xfb.buffer, g.counter.buffer, g.capacity, g.bytes))
+    st.gpus.iter().find(|g| g.device == device && g.started).map(|g| Captured {
+        xfb: g.xfb.buffer,
+        capacity: g.capacity,
+        bytes: g.bytes,
+        whole: !g.overflowed,
+    })
+}
+
+/// This frame's capture on one device.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Captured {
+    pub xfb: u64,
+    /// Bytes our buffer holds, and this frame wrote so far.
+    pub capacity: u64,
+    pub bytes: u64,
+    /// No draw to capture was left out for want of room.
+    pub whole: bool,
 }
 
 /// The trace was recorded, for the frame's report.
@@ -1147,7 +1187,6 @@ fn make_gpu(device: usize) -> Result<Gpu, String> {
         device,
         fns,
         xfb: Owned::default(),
-        counter: Owned::default(),
         readback: Owned::default(),
         readback_ptr: 0,
         readback_size,
@@ -1155,10 +1194,10 @@ fn make_gpu(device: usize) -> Result<Gpu, String> {
         started: false,
         frame: u64::MAX,
         bytes: 0,
+        overflowed: false,
     };
     let made = (|| {
         g.xfb = make_buffer(&g.fns, d, &types, capacity, USAGE_XFB | USAGE_STORAGE | USAGE_TRANSFER_SRC | USAGE_TRANSFER_DST, false)?;
-        g.counter = make_buffer(&g.fns, d, &types, 256, USAGE_XFB_COUNTER | USAGE_STORAGE | USAGE_TRANSFER_SRC | USAGE_TRANSFER_DST, false)?;
         g.readback = make_buffer(&g.fns, d, &types, readback_size, USAGE_TRANSFER_DST, true)?;
         let mut p = std::ptr::null_mut();
         check((g.fns.map_memory)(d, g.readback.memory, 0, readback_size, 0, &mut p), "vkMapMemory")?;
@@ -1182,7 +1221,7 @@ impl Gpu {
 
     fn destroy(self) {
         let (d, none) = (self.device as Dev, std::ptr::null());
-        for o in [self.xfb, self.counter, self.readback] {
+        for o in [self.xfb, self.readback] {
             if o.buffer != 0 {
                 (self.fns.destroy_buffer)(d, o.buffer, none);
             }
@@ -1214,7 +1253,8 @@ mod tests {
         assert!(covers([-10, 0, 4000, 4000], [1667, 1349]));
         assert!(!covers([100, 0, 1567, 1349], [1667, 1349]));
         assert!(!covers([0, 0, 1667, 1000], [1667, 1349]));
-        // A vertex is a position, a colour and a camera vector.
-        assert_eq!(TRIANGLE_BYTES, 144);
+        // A vertex is a position, a colour, a camera vector and a world
+        // position.
+        assert_eq!(TRIANGLE_BYTES, 192);
     }
 }

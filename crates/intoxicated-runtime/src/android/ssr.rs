@@ -1256,8 +1256,10 @@ pub(crate) fn changes_nothing(values: &[[f32; 3]]) -> bool {
     p.intensity <= 0.0 && p.darken <= 0.0 && p.tint[..3] == [1.0; 3]
 }
 
-/// `Params::flags` bit 1: the trace image holds ray-traced reflections.
+/// `Params::flags` bit 1: the trace image holds ray-traced reflections;
+/// bit 2: the opaque world's colour was copied this frame.
 const FLAG_TRACED: u32 = 2;
+const FLAG_OPAQUE: u32 = 4;
 
 /// `ssr/depth.comp` for a multisampled scene depth, as build.rs made it.
 const SPIRV_DEPTH_MS: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_depth_ms.spv.rs"));
@@ -1317,6 +1319,8 @@ struct Fns {
     cmd_push_constants: extern "C" fn(*mut c_void, u64, u32, u32, u32, *const c_void),
     cmd_dispatch: extern "C" fn(*mut c_void, u32, u32, u32),
     cmd_copy_image: extern "C" fn(*mut c_void, u64, i32, u64, i32, u32, *const ImageCopy),
+    /// `VkImageResolve` has `VkImageCopy`'s layout.
+    cmd_resolve_image: extern "C" fn(*mut c_void, u64, i32, u64, i32, u32, *const ImageCopy),
     cmd_reset_query_pool: extern "C" fn(*mut c_void, u64, u32, u32),
     cmd_write_timestamp: extern "C" fn(*mut c_void, u32, u64, u32),
 }
@@ -1356,6 +1360,7 @@ impl Fns {
             cmd_push_constants: device_fn(device, c"vkCmdPushConstants")?,
             cmd_dispatch: device_fn(device, c"vkCmdDispatch")?,
             cmd_copy_image: device_fn(device, c"vkCmdCopyImage")?,
+            cmd_resolve_image: device_fn(device, c"vkCmdResolveImage")?,
             cmd_reset_query_pool: device_fn(device, c"vkCmdResetQueryPool")?,
             cmd_write_timestamp: device_fn(device, c"vkCmdWriteTimestamp")?,
         })
@@ -1468,6 +1473,11 @@ struct Output {
     depth: Owned,
     trace: Owned,
     result: Owned,
+    /// The opaque world's colour, copied after the scene's first pass for
+    /// the ray-traced reflections (see `copy_opaque`), in the scene
+    /// colour's format.
+    opaque: Owned,
+    colour_format: u32,
     post: Option<post::PostImages>,
     extent: [u32; 2],
 }
@@ -1512,6 +1522,8 @@ struct Gpu {
     pending: [Option<[bool; 3]>; RING],
     next_slot: usize,
     output: Option<Output>,
+    /// The present count when the opaque world's colour was last copied.
+    opaque_at: u64,
     /// The engine's image to our view of it.
     views: HashMap<u64, u64>,
     sets: HashMap<SetKey, u64>,
@@ -1536,6 +1548,7 @@ impl Gpu {
         self.destroy_owned(&o.depth);
         self.destroy_owned(&o.trace);
         self.destroy_owned(&o.result);
+        self.destroy_owned(&o.opaque);
         if let Some(p) = &o.post {
             self.destroy_post_images(p);
         }
@@ -1611,9 +1624,9 @@ impl Gpu {
     /// when `post` asks for them, made again when the size changed or they
     /// are newly asked for. The view of the result, which names them in a
     /// [`SetKey`].
-    fn output_for(&mut self, extent: [u32; 2], post: bool, presents: u64) -> Result<u64, String> {
+    fn output_for(&mut self, extent: [u32; 2], colour_format: u32, post: bool, presents: u64) -> Result<u64, String> {
         if let Some(o) = &self.output {
-            if o.extent == extent && (o.post.is_some() || !post) {
+            if o.extent == extent && o.colour_format == colour_format && (o.post.is_some() || !post) {
                 return Ok(o.result.view);
             }
         }
@@ -1623,12 +1636,20 @@ impl Gpu {
             self.sets.retain(|k, _| k.output != view);
             self.retired.push(Retired { at: presents, output: Some(old), sets });
         }
-        let mut o =
-            Output { depth: Owned::default(), trace: Owned::default(), result: Owned::default(), post: None, extent };
+        let mut o = Output {
+            depth: Owned::default(),
+            trace: Owned::default(),
+            result: Owned::default(),
+            opaque: Owned::default(),
+            colour_format,
+            post: None,
+            extent,
+        };
         let made = self
             .make_image(&mut o.depth, extent, FORMAT_R32_SFLOAT, USAGE_STORAGE)
             .and_then(|()| self.make_image(&mut o.trace, extent, FORMAT_R16G16B16A16_SFLOAT, USAGE_STORAGE | USAGE_SAMPLED))
             .and_then(|()| self.make_image(&mut o.result, extent, FORMAT_R32_UINT, USAGE_STORAGE | USAGE_TRANSFER_SRC))
+            .and_then(|()| self.make_image(&mut o.opaque, extent, colour_format, USAGE_SAMPLED | USAGE_TRANSFER_DST))
             .and_then(|()| {
                 if post {
                     o.post = Some(self.make_post_images(extent)?);
@@ -1698,8 +1719,8 @@ impl Gpu {
         if let Some(&s) = self.sets.get(&key) {
             return Ok(s);
         }
-        let (depth_copy, trace) = match &self.output {
-            Some(o) if o.result.view == key.output => (o.depth.view, o.trace.view),
+        let (depth_copy, trace, opaque) = match &self.output {
+            Some(o) if o.result.view == key.output => (o.depth.view, o.trace.view, o.opaque.view),
             _ => return Err("the descriptor set names images of ours that are gone".into()),
         };
         let none = std::ptr::null();
@@ -1716,7 +1737,8 @@ impl Gpu {
             return Err(format!("vkAllocateDescriptorSets failed ({rc}); {} sets are in use", self.sets.len()));
         }
         // 0 the engine's colour, 1 its depth, 2 our depth copy, 3 our result,
-        // 4 the trace written and 5 the same read filtered.
+        // 4 the trace written, 5 the same read filtered and 6 the opaque
+        // world's colour.
         let images = [
             DescriptorImageInfo { sampler: self.sampler_linear, view: self.views[&key.color], layout: key.color_layout as i32 },
             DescriptorImageInfo { sampler: self.sampler_nearest, view: self.views[&key.depth], layout: key.depth_layout as i32 },
@@ -1724,6 +1746,7 @@ impl Gpu {
             DescriptorImageInfo { sampler: 0, view: key.output, layout: LAYOUT_GENERAL as i32 },
             DescriptorImageInfo { sampler: 0, view: trace, layout: LAYOUT_GENERAL as i32 },
             DescriptorImageInfo { sampler: self.sampler_linear, view: trace, layout: LAYOUT_GENERAL as i32 },
+            DescriptorImageInfo { sampler: self.sampler_linear, view: opaque, layout: LAYOUT_SHADER_READ_ONLY as i32 },
         ];
         let write = |binding: u32, kind: u32| WriteDescriptorSet {
             s_type: ST_WRITE_DESCRIPTOR_SET,
@@ -1744,6 +1767,7 @@ impl Gpu {
             write(3, DESCRIPTOR_STORAGE_IMAGE),
             write(4, DESCRIPTOR_STORAGE_IMAGE),
             write(5, DESCRIPTOR_COMBINED_IMAGE_SAMPLER),
+            write(6, DESCRIPTOR_COMBINED_IMAGE_SAMPLER),
         ];
         (self.fns.update_descriptor_sets)(self.dev(), writes.len() as u32, writes.as_ptr(), 0, none);
         self.sets.insert(key, set);
@@ -1871,6 +1895,7 @@ fn create_gpu(device: usize) -> Result<Gpu, String> {
         pending: [None; RING],
         next_slot: 0,
         output: None,
+        opaque_at: u64::MAX,
         views: HashMap::new(),
         sets: HashMap::new(),
         retired: Vec::new(),
@@ -1926,6 +1951,7 @@ fn build(g: &mut Gpu) -> Result<(), String> {
         binding(3, DESCRIPTOR_STORAGE_IMAGE),
         binding(4, DESCRIPTOR_STORAGE_IMAGE),
         binding(5, DESCRIPTOR_COMBINED_IMAGE_SAMPLER),
+        binding(6, DESCRIPTOR_COMBINED_IMAGE_SAMPLER),
     ];
     let layout = DescriptorSetLayoutCreateInfo {
         s_type: ST_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -1975,7 +2001,7 @@ fn build(g: &mut Gpu) -> Result<(), String> {
         check((f.create_compute_pipelines)(d, 0, 1, &pipeline, none, &mut g.pipelines[i]), "vkCreateComputePipelines")?;
     }
     let sizes = [
-        DescriptorPoolSize { kind: DESCRIPTOR_COMBINED_IMAGE_SAMPLER, count: 3 * MAX_SETS },
+        DescriptorPoolSize { kind: DESCRIPTOR_COMBINED_IMAGE_SAMPLER, count: 4 * MAX_SETS },
         DescriptorPoolSize { kind: DESCRIPTOR_STORAGE_IMAGE, count: 3 * MAX_SETS },
     ];
     let pool = DescriptorPoolCreateInfo {
@@ -2080,7 +2106,7 @@ fn record(
     let (color, depth) = (&f.color, &f.depth);
     let color_read = color_read_layout(color.layout).ok_or("unusable colour layout")?;
     let depth_read = depth_read_layout(depth.layout).ok_or("unusable depth layout")?;
-    let output = g.output_for(color.att.extent, dof || bloom, presents)?;
+    let output = g.output_for(color.att.extent, color.att.format, dof || bloom, presents)?;
     g.view_of(color.att.image, color.att.format, ASPECT_COLOR)?;
     g.view_of(depth.att.image, depth.att.format, ASPECT_DEPTH)?;
     let set = g.set_for(SetKey {
@@ -2176,8 +2202,9 @@ fn record(
         // reflection at all, the march's pass run with no strength so that
         // it writes nothing but zeros. See `rt::trace`.
         let rt_only = super::rt::requested() && super::rt::trace::is_on();
+        let rt_params = Params { flags: p.flags | if g.opaque_at == presents { FLAG_OPAQUE } else { 0 }, ..*p };
         let traced = rt_only
-            && super::rt::trace::record(cmd, g.device, g.set_layout, set, p, [w, h], g.period_ns, g.timestamp_mask)
+            && super::rt::trace::record(cmd, g.device, g.set_layout, set, &rt_params, [w, h], g.period_ns, g.timestamp_mask)
                 .unwrap_or_else(|why| {
                     super::rt::trace::failed(&why);
                     false
@@ -2196,7 +2223,8 @@ fn record(
             compute_barrier(fns, cmd);
             bind_ssr(g.pipelines[3]);
             // The compose told the trace measured the camera (see ssr.comp).
-            push(&Params { flags: p.flags | FLAG_TRACED, ..*p });
+            let opaque = if g.opaque_at == presents { FLAG_OPAQUE } else { 0 };
+            push(&Params { flags: p.flags | FLAG_TRACED | opaque, ..*p });
         } else {
             bind_ssr(g.pipelines[2]);
             if rt_only {
@@ -2619,6 +2647,58 @@ pub(crate) fn missing_usage(image_type: u32, format: u32, extent: [u32; 3], mips
     } else {
         0
     }
+}
+
+/// After the frame's first scene pass (the opaque world), outside it: its
+/// colour `src` (its resolve target, or the multisampled attachment, in the
+/// layout the pass left it in) copied or resolved into our image of it, for
+/// the ray-traced reflections to take hit colours from before anything
+/// transparent, the interface drawn in the world or a billboard is drawn
+/// over it. False when there is nothing to copy into yet (our images are
+/// made at the first frame the reflections run) or the image does not
+/// allow it.
+pub(crate) fn copy_opaque(cmd: *mut c_void, src: &Att) -> bool {
+    let mut st = state();
+    let presents = st.presents;
+    let Some(g) = st.gpus.iter_mut().find(|g| g.device == src.device) else { return false };
+    let Some(o) = &g.output else { return false };
+    if o.extent != src.extent || o.colour_format != src.format || src.usage & USAGE_TRANSFER_SRC == 0 || src.layout == LAYOUT_UNDEFINED {
+        return false;
+    }
+    let (fns, none) = (&g.fns, std::ptr::null());
+    let barrier = |image: u64, old: u32, new: u32, src_access: u32, dst_access: u32| ImageMemoryBarrier {
+        s_type: ST_IMAGE_MEMORY_BARRIER,
+        p_next: none,
+        src_access_mask: src_access,
+        dst_access_mask: dst_access,
+        old_layout: old as i32,
+        new_layout: new as i32,
+        src_queue_family_index: QUEUE_FAMILY_IGNORED,
+        dst_queue_family_index: QUEUE_FAMILY_IGNORED,
+        image,
+        subresource_range: range(ASPECT_COLOR),
+    };
+    let before = [
+        barrier(src.image, src.layout, LAYOUT_TRANSFER_SRC, ACCESS_MEMORY_WRITE, ACCESS_TRANSFER_READ),
+        barrier(o.opaque.image, LAYOUT_UNDEFINED, LAYOUT_TRANSFER_DST, 0, ACCESS_TRANSFER_WRITE),
+    ];
+    (fns.cmd_pipeline_barrier)(cmd, STAGE_ALL_COMMANDS, STAGE_TRANSFER, 0, 0, none.cast(), 0, none, 2, before.as_ptr());
+    let region = ImageCopy {
+        src_subresource: layers(ASPECT_COLOR),
+        src_offset: [0; 3],
+        dst_subresource: layers(ASPECT_COLOR),
+        dst_offset: [0; 3],
+        extent: [src.extent[0], src.extent[1], 1],
+    };
+    let copy = if src.samples > 1 { fns.cmd_resolve_image } else { fns.cmd_copy_image };
+    copy(cmd, src.image, LAYOUT_TRANSFER_SRC as i32, o.opaque.image, LAYOUT_TRANSFER_DST as i32, 1, &region);
+    let after = [
+        barrier(src.image, LAYOUT_TRANSFER_SRC, src.layout, 0, ACCESS_MEMORY_READ | ACCESS_MEMORY_WRITE),
+        barrier(o.opaque.image, LAYOUT_TRANSFER_DST, LAYOUT_SHADER_READ_ONLY, ACCESS_TRANSFER_WRITE, ACCESS_SHADER_READ),
+    ];
+    (fns.cmd_pipeline_barrier)(cmd, STAGE_TRANSFER, STAGE_ALL_COMMANDS, 0, 0, none.cast(), 0, none, 2, after.as_ptr());
+    g.opaque_at = presents;
+    true
 }
 
 /// From `vkCreateImage`, with SSR on: the engine's create info with
@@ -3344,7 +3424,7 @@ mod tests {
                 .collect()
         };
         // The same list as build.rs's `SHADERS`.
-        let shaders: [(&str, &str, &[&str]); 22] = [
+        let shaders: [(&str, &str, &[&str]); 24] = [
             ("depth_capture/resolve.comp", "depth_capture/resolve_ms", &[]),
             ("depth_capture/resolve.comp", "depth_capture/resolve_1x", &["-DSINGLE_SAMPLE"]),
             ("ssr/depth.comp", "ssr/depth_ms", &[]),
@@ -3362,6 +3442,8 @@ mod tests {
             ("ssr/ssr.comp", "ssr/rt_trace", &["-DRT"]),
             ("ssr/ssr.comp", "ssr/rt_upsample", &["-DRT", "-DUPSAMPLE"]),
             ("rt/build.comp", "rt/build_fit", &["-DFIT"]),
+            ("rt/build.comp", "rt/build_insert", &["-DINSERT"]),
+            ("rt/build.comp", "rt/build_gather", &["-DGATHER"]),
             ("rt/build.comp", "rt/build_prep", &["-DPREP"]),
             ("rt/build.comp", "rt/build_sort_local", &["-DSORT_LOCAL"]),
             ("rt/build.comp", "rt/build_sort_global", &["-DSORT_GLOBAL"]),

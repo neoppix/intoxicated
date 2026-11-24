@@ -1,13 +1,19 @@
 // The acceleration structure of the ray-traced reflections (see `trace.rs`),
-// built on the GPU every frame from the triangles transform feedback
-// captured (`capture.rs`): a bounding volume hierarchy over them, sorted
-// along a Morton curve (a linear BVH). The driver offers no hardware
+// built on the GPU every frame, in world space, from the triangles transform
+// feedback captured this frame (`capture.rs`) and from a cache of the static
+// triangles of earlier frames: a bounding volume hierarchy over them,
+// sorted along a Morton curve (a linear BVH). The driver offers no hardware
 // acceleration structures on this GPU, so this is the software stand-in.
-// One source, six stages:
+// One source, eight stages, run in this order:
 //
-//     -DFIT           the camera's real projection, from the capture
-//     -DPREP          a key per triangle: the Morton code of its centre,
-//                     or ~0 for one that is not real geometry
+//     -DFIT           the camera, from this frame's capture
+//     -DINSERT        this frame's triangles into the list to trace, and
+//                     the static ones into the cache
+//     -DGATHER        the cache's other triangles into the list, and
+//                     those the view shows but the frame did not draw out
+//                     of the cache
+//     -DPREP          a key per listed triangle: the Morton code of its
+//                     centre, or ~0 for one that is not real geometry
 //     -DSORT_LOCAL    bitonic sort, the steps that stay within 1024 keys
 //     -DSORT_GLOBAL   bitonic sort, one step across blocks
 //     -DBUILD         the hierarchy from the sorted keys (Karras 2012)
@@ -19,19 +25,23 @@
 //     glslc -O --target-env=vulkan1.0 -mfmt=num -D<STAGE> build.comp -o -
 //         -> build_<stage>.spv.rs
 //
-// Positions are clip-space as captured. They are turned into view space (x
-// right, y up, z away from the camera, in units of the near plane), the
-// space `ssr/ssr.comp` with RT turns the depth buffer into: with reversed-Z
-// and the far plane at infinity, clip z is the near plane and clip w the
-// distance, so (x tan_x, -y tan_y, w) / near. tan_x, tan_y and the near
-// plane are not guessed (the reflections' fov knob) but measured every
-// frame by FIT: each captured vertex also carries the vector from it to the
-// camera in the world, in studs and with true angles, and clip x, y and w
-// are linear in it (clip = M (vertex - camera) for the rows x, y and w), so
-// M is a least-squares fit over a few thousand vertices; its rows are the
-// camera's right, up and forward axes scaled by 1 / tan_x, 1 / tan_y and 1.
-// The fit also gives which way is up in the world, in view space. FIT also
-// turns the trace's last sums into the exposure (see Globals).
+// Each captured vertex carries its clip-space position, its colour, the
+// vector from it to the camera and its position in the world (with w 1 for
+// a static part: one whose vertex shader places it by its own matrices
+// alone, not by bones). FIT measures the camera: its position (a vertex's
+// world position plus its camera vector, averaged) and its projection,
+// since clip x, y and w are linear in the camera vector (clip = M (vertex -
+// camera) for the rows x, y and w): M from a least-squares fit over a few
+// thousand vertices; its rows are the camera's right, up and forward axes
+// scaled by 1 / tan_x, 1 / tan_y and 1. A jump of the camera (a teleport, a
+// new place) empties the cache.
+//
+// The cache is a hash table of static triangles keyed by their exact world
+// positions: a part that does not move is drawn with the same bits every
+// frame. A cached triangle is listed while the frame did not draw it, and
+// dropped when the view shows where it was and the frame did not draw it
+// (it moved or is gone), when it was not seen for a long while, or to make
+// room, the least recently seen first.
 
 #version 450
 
@@ -44,60 +54,81 @@ layout(local_size_x = 256) in;
 #endif
 
 // Per captured vertex: the clip-space position, the colour, the vector to
-// the camera (xyz).
+// the camera (xyz) and the world position (xyz, w 1 when static).
 layout(std430, binding = 0) readonly buffer Xfb { vec4 xfb[]; };
-layout(std430, binding = 1) readonly buffer Counter { uint counter_bytes; };
 layout(std430, binding = 2) buffer Sorted { uvec2 sorted[]; };
 layout(std430, binding = 3) coherent buffer Nodes { vec4 nodes[]; };
 layout(std430, binding = 4) buffer Parents { int parents[]; };
 layout(std430, binding = 5) buffer Flags { uint flags[]; };
+// `trace::GLOBALS_*` names the offsets; the first 16 bytes and `dropped`
+// and `full` are cleared every frame, the rest is kept.
 layout(std430, binding = 6) buffer Globals {
-    // Triangles that are leaves (real geometry), and those captured.
+    // Listed triangles that are leaves (real geometry); FIT's vertices and
+    // whether it found the camera; cached triangles listed this frame.
     uint leaves;
-    uint captured;
-    // FIT: 1 when it found the projection, and the vertices it used.
-    uint fit_ok;
     uint fit_samples;
+    uint fit_ok;
+    uint cached;
     // tan_x, tan_y, the near plane, |forward| (1 for a true projection).
     vec4 camera;
     // The world's up in view space.
     vec4 world_up;
-    // The trace's sums, over a sample of its hits that the screen shows, of
-    // the brightness of the screen there and of the hit triangle's own
-    // colour (both times 256), and from them, frame by frame, how much
-    // brighter the screen is than the bare colour: the light the engine
-    // gives an off-screen hit, on average. Kept from frame to frame.
+    // The trace's sums for the exposure (see ssr.comp), the exposure, and
+    // the frame number.
     uint lit_screen;
     uint lit_colour;
     float exposure;
-    uint unused;
+    uint frame;
+    // The camera's position and axes in the world.
+    vec4 cam_pos;
+    vec4 right;
+    vec4 up;
+    vec4 forward;
+    // The cache's generation (its low 8 bits tag live entries), entries
+    // dropped this frame because the view showed them gone, triangles
+    // that found no room, and the camera's last position (w 1 once set).
+    uint gen;
+    uint dropped;
+    uint full;
+    uint spare;
+    vec4 last_cam;
 };
+// Triangles to trace: three vertices, world xyz and the colour packed in w.
+layout(std430, binding = 8) buffer Tris { vec4 tris[]; };
+// The cache: 16 words a slot: tag, second key, frame last seen, colour A;
+// A xyz, colour B; B xyz, colour C; C xyz, spare.
+layout(std430, binding = 9) buffer Slots { uint slots[]; };
 
 // std430; `trace::BuildParams` mirrors it.
 layout(push_constant) uniform Params {
-    // Keys sorted: a power of two at least the triangles used.
+    // Keys sorted: a power of two at least the triangles listed.
     uint n;
-    // Triangles our capture buffer holds.
+    // Triangles listed at most (the list's size).
     uint cap;
     // The bitonic stage and step.
     uint k;
     uint j;
-    vec2 tan_half;
+    // This frame's captured triangles, and bit 0: the capture is whole (no
+    // triangle was left out for want of room).
+    uint current;
+    uint flags_;
+    // Slots in the cache, a power of two.
+    uint slot_count;
+    uint pad;
 } pc;
 
-vec3 to_view(vec4 c) {
-    if (fit_ok != 0u) {
-        return vec3(c.x * camera.x, -c.y * camera.y, c.w) / camera.z;
-    }
-    return vec3(c.x * pc.tan_half.x, -c.y * pc.tan_half.y, c.w) / c.z;
-}
-
-vec4 position(uint v) {
-    return xfb[3u * v];
-}
+const float JUMP = 64.0;
+const uint MIN_AGE = 240u;
+const uint MAX_AGE = 240u * 120u;
+const uint PROBES = 16u;
+const uint SLOT_WORDS = 16u;
 
 bool usable(vec4 c) {
     return c.z > 0.0 && c.w > 0.0 && !any(isnan(c)) && !any(isinf(c));
+}
+
+uint pack_colour(vec4 c) {
+    return packUnorm4x8(clamp(c, 0.0, 1.0));
 }
 
 #ifdef FIT
@@ -106,23 +137,25 @@ const uint FIT_THREADS = 128u;
 const uint FIT_SAMPLES = 4096u;
 
 // Per thread: the normal matrix (6), the three right-hand sides (9), the
-// sum of clip z and the count.
-shared float red[17][FIT_THREADS];
+// sum of clip z, the count and the camera's position (3).
+shared float red[20][FIT_THREADS];
 
 void main() {
     uint t = gl_LocalInvocationID.x;
-    uint vertices = 3u * min(counter_bytes / 144u, pc.cap);
+    uint vertices = 3u * pc.current;
     uint step_ = max(1u, vertices / FIT_SAMPLES);
-    float a[17];
-    for (int i = 0; i < 17; ++i) {
+    float a[20];
+    for (int i = 0; i < 20; ++i) {
         a[i] = 0.0;
     }
     for (uint k = t; k < FIT_SAMPLES && k * step_ < vertices; k += FIT_THREADS) {
         uint v = k * step_;
-        vec4 c = xfb[3u * v];
-        vec3 p = -xfb[3u * v + 2u].xyz;
+        vec4 c = xfb[4u * v];
+        vec3 V = xfb[4u * v + 2u].xyz;
+        vec3 W = xfb[4u * v + 3u].xyz;
+        vec3 p = -V;
         float l = length(p);
-        if (!usable(c) || !(l > 1e-3) || isinf(l)) {
+        if (!usable(c) || !(l > 1e-3) || isinf(l) || any(isnan(W)) || any(isinf(W))) {
             continue;
         }
         // Each vertex scaled to unit distance, so near and far weigh alike.
@@ -135,14 +168,16 @@ void main() {
         a[12] += u.x * q.w; a[13] += u.y * q.w; a[14] += u.z * q.w;
         a[15] += c.z;
         a[16] += 1.0;
+        vec3 cam = W + V;
+        a[17] += cam.x; a[18] += cam.y; a[19] += cam.z;
     }
-    for (int i = 0; i < 17; ++i) {
+    for (int i = 0; i < 20; ++i) {
         red[i][t] = a[i];
     }
     barrier();
     for (uint s = FIT_THREADS / 2u; s > 0u; s >>= 1) {
         if (t < s) {
-            for (int i = 0; i < 17; ++i) {
+            for (int i = 0; i < 20; ++i) {
                 red[i][t] += red[i][t + s];
             }
         }
@@ -150,6 +185,10 @@ void main() {
     }
     if (t != 0u) {
         return;
+    }
+    frame += 1u;
+    if ((gen & 0xffu) == 0u) {
+        gen += 1u;
     }
     if (lit_colour > 256u * 64u) {
         float ratio = clamp(float(lit_screen) / float(lit_colour), 0.1, 2.0);
@@ -176,15 +215,162 @@ void main() {
     float lw = length(mw);
     vec2 tan_xy = vec2(lw / length(mx), lw / length(my));
     float near = red[15][0] / n;
+    vec3 cam = vec3(red[17][0], red[18][0], red[19][0]) / n;
     if (any(isnan(vec4(tan_xy, near, lw))) || any(lessThan(tan_xy, vec2(0.02))) || any(greaterThan(tan_xy, vec2(50.0)))
-        || !(near > 0.0) || abs(lw - 1.0) > 0.05) {
+        || !(near > 0.0) || abs(lw - 1.0) > 0.05 || any(isnan(cam)) || any(isinf(cam))) {
         return;
     }
     // The camera's axes in the world: right, up (clip y is flipped), forward.
-    vec3 right = mx / length(mx), up = -my / length(my), forward = mw / lw;
+    vec3 r = mx / length(mx), u = -my / length(my), f = mw / lw;
     camera = vec4(tan_xy, near, lw);
-    world_up = vec4(normalize(vec3(right.y, up.y, forward.y)), 0.0);
+    world_up = vec4(normalize(vec3(r.y, u.y, f.y)), 0.0);
+    cam_pos = vec4(cam, 1.0);
+    right = vec4(r, 0.0);
+    up = vec4(u, 0.0);
+    forward = vec4(f, 0.0);
+    if (last_cam.w > 0.0 && distance(last_cam.xyz, cam) > JUMP) {
+        gen += 1u;
+        if ((gen & 0xffu) == 0u) {
+            gen += 1u;
+        }
+    }
+    last_cam = vec4(cam, 1.0);
     fit_ok = 1u;
+}
+
+#endif
+
+#ifdef INSERT
+
+uint mix_bits(uint h, uint v) {
+    h ^= v * 0xcc9e2d51u;
+    h = (h << 13) | (h >> 19);
+    return h * 5u + 0xe6546b64u;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.current || i >= pc.cap) {
+        return;
+    }
+    vec4 W[3];
+    uint col[3];
+    bool fixed_ = true;
+    for (uint k = 0u; k < 3u; ++k) {
+        uint v = 4u * (3u * i + k);
+        W[k] = xfb[v + 3u];
+        col[k] = pack_colour(xfb[v + 1u]);
+        fixed_ = fixed_ && W[k].w > 0.5 && usable(xfb[v]);
+        tris[3u * i + k] = vec4(W[k].xyz, uintBitsToFloat(col[k]));
+    }
+    if (!fixed_ || fit_ok == 0u) {
+        return;
+    }
+    // Two hashes of the nine coordinates' bits.
+    uint h1 = 0x9747b28cu, h2 = 0x85ebca6bu;
+    for (uint k = 0u; k < 3u; ++k) {
+        uvec3 b = floatBitsToUint(W[k].xyz);
+        h1 = mix_bits(mix_bits(mix_bits(h1, b.x), b.y), b.z);
+        h2 = mix_bits(mix_bits(mix_bits(h2, b.z), b.x), b.y);
+    }
+    h1 ^= h1 >> 16;
+    h1 *= 0x85ebca6bu;
+    h1 ^= h1 >> 13;
+    uint tag = ((gen & 0xffu) << 24) | max(h1 & 0xffffffu, 1u);
+    uint mask = pc.slot_count - 1u;
+    uint best = 0xffffffffu, best_seen = 0xffffffffu;
+    for (uint p = 0u; p < PROBES; ++p) {
+        uint base = ((h2 + p) & mask) * SLOT_WORDS;
+        uint t = slots[base];
+        if (t == tag && slots[base + 1u] == h2) {
+            slots[base + 2u] = frame;
+            for (uint k = 0u; k < 3u; ++k) {
+                slots[base + 3u + 4u * k] = col[k];
+            }
+            return;
+        }
+        bool free_ = t == 0u || (t >> 24) != (gen & 0xffu);
+        if (free_) {
+            if (atomicCompSwap(slots[base], t, tag) == t) {
+                best = base;
+                break;
+            }
+            continue;
+        }
+        uint seen = slots[base + 2u];
+        if (frame - seen > MIN_AGE && seen < best_seen) {
+            best_seen = seen;
+            best = 0x80000000u | base;
+        }
+    }
+    if (best != 0xffffffffu && (best & 0x80000000u) != 0u) {
+        // The least recently seen of those probed, taken over.
+        uint base = best & 0x7fffffffu;
+        uint t = slots[base];
+        best = atomicCompSwap(slots[base], t, tag) == t ? base : 0xffffffffu;
+    }
+    if (best == 0xffffffffu) {
+        atomicAdd(full, 1u);
+        return;
+    }
+    slots[best + 1u] = h2;
+    slots[best + 2u] = frame;
+    for (uint k = 0u; k < 3u; ++k) {
+        slots[best + 3u + 4u * k] = col[k];
+        uvec3 b = floatBitsToUint(W[k].xyz);
+        slots[best + 4u + 4u * k] = b.x;
+        slots[best + 5u + 4u * k] = b.y;
+        slots[best + 6u + 4u * k] = b.z;
+    }
+}
+
+#endif
+
+#ifdef GATHER
+
+// Whether the view shows `w` (inside the frustum, a little in from its
+// edges, past the near plane).
+bool in_view(vec3 w) {
+    vec3 r = w - cam_pos.xyz;
+    vec3 v = vec3(dot(r, right.xyz), dot(r, up.xyz), dot(r, forward.xyz));
+    float near = camera.z;
+    return v.z > 2.0 * near && abs(v.x) < 0.97 * v.z * camera.x && abs(v.y) < 0.97 * v.z * camera.y;
+}
+
+void main() {
+    uint s = gl_GlobalInvocationID.x;
+    if (s >= pc.slot_count || fit_ok == 0u) {
+        return;
+    }
+    uint base = s * SLOT_WORDS;
+    uint t = slots[base];
+    if (t == 0u || (t >> 24) != (gen & 0xffu)) {
+        return;
+    }
+    uint seen = slots[base + 2u];
+    if (seen == frame) {
+        return;
+    }
+    vec3 W[3];
+    for (uint k = 0u; k < 3u; ++k) {
+        W[k] = uintBitsToFloat(uvec3(slots[base + 4u + 4u * k], slots[base + 5u + 4u * k], slots[base + 6u + 4u * k]));
+    }
+    bool shown = in_view(W[0]) && in_view(W[1]) && in_view(W[2]);
+    if ((shown && (pc.flags_ & 1u) != 0u) || frame - seen > MAX_AGE) {
+        slots[base] = 0u;
+        if (shown) {
+            atomicAdd(dropped, 1u);
+        }
+        return;
+    }
+    uint k = atomicAdd(cached, 1u);
+    uint at = pc.current + k;
+    if (at >= pc.cap) {
+        return;
+    }
+    for (uint q = 0u; q < 3u; ++q) {
+        tris[3u * at + q] = vec4(W[q], uintBitsToFloat(slots[base + 3u + 4u * q]));
+    }
 }
 
 #endif
@@ -212,24 +398,18 @@ void main() {
     if (i >= pc.n) {
         return;
     }
-    uint total = min(counter_bytes / 144u, min(pc.cap, pc.n));
+    uint total = min(pc.current + cached, min(pc.cap, pc.n));
     uint key = 0xffffffffu;
-    if (i < total) {
-        vec4 a = position(3u * i), b = position(3u * i + 1u), c = position(3u * i + 2u);
-        if (usable(a) && usable(b) && usable(c)) {
-            vec3 A = to_view(a), B = to_view(b), C = to_view(c);
-            vec3 n = cross(B - A, C - A);
-            if (dot(n, n) > 0.0 && !any(isinf(n))) {
-                vec3 m = (A + B + C) / 3.0;
-                key = (spread(cell(m.x)) << 2) | (spread(cell(m.y)) << 1) | spread(cell(m.z));
-                atomicAdd(leaves, 1u);
-            }
+    if (i < total && fit_ok != 0u) {
+        vec3 A = tris[3u * i].xyz, B = tris[3u * i + 1u].xyz, C = tris[3u * i + 2u].xyz;
+        vec3 n = cross(B - A, C - A);
+        if (dot(n, n) > 0.0 && !any(isinf(n)) && !any(isnan(n))) {
+            vec3 m = (A + B + C) / 3.0 - cam_pos.xyz;
+            key = (spread(cell(m.x)) << 2) | (spread(cell(m.y)) << 1) | spread(cell(m.z));
+            atomicAdd(leaves, 1u);
         }
     }
     sorted[i] = uvec2(key, i);
-    if (i == 0u) {
-        captured = total;
-    }
 }
 
 #endif
@@ -380,7 +560,7 @@ void main() {
         return;
     }
     uint tri = sorted[leaf].y;
-    vec3 A = to_view(position(3u * tri)), B = to_view(position(3u * tri + 1u)), C = to_view(position(3u * tri + 2u));
+    vec3 A = tris[3u * tri].xyz, B = tris[3u * tri + 1u].xyz, C = tris[3u * tri + 2u].xyz;
     vec3 lo = min(A, min(B, C)), hi = max(A, max(B, C));
     int child = ~leaf;
     int p = parents[int(pc.n) + leaf];

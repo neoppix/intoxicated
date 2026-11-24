@@ -297,12 +297,17 @@ per 2 by 2 pixels against it, spread back over the pixels of the same surface
 and steadied over frames while the view holds still. So a reflection can show
 what is off screen or hidden, such as players off screen seen in a wall, or the
 front of your own character in the wall ahead of it. Where the hit is what the
-screen shows, the reflection takes the screen's colour; elsewhere the colour
-the engine's vertex shader passed on, without textures, at the brightness the
-screen shows such colours at on average. Only what the engine itself drew that
-frame can be reflected: it culls what is outside the view (of 165000 captured
-triangles, 8 touched the space behind the camera), so an object leaves the
-reflections when it leaves the view. In the Timebomb Duels lobby (50000 to
+screen shows, the reflection takes its colour from a copy of the scene made
+after the opaque world is drawn and before anything transparent, the interface
+drawn in the world or a billboard; elsewhere the colour the engine's vertex
+shader passed on, without textures, at the brightness the screen shows such
+colours at on average. The engine culls what is outside the view (of 165000
+captured triangles, 8 touched the space behind the camera), so the static parts
+it drew are kept in a cache in world space and still reflected once they leave
+the view, until the view shows their place again without them, they go unseen
+for about two minutes, the cache needs their room, or the camera jumps (a
+teleport); moving players come only from the frame itself (the cache and the
+opaque copy are not yet tried in game). In the Timebomb Duels lobby (50000 to
 190000 triangles a frame, 1667x1349, RTX 4070 Ti) it costs 0.2 to 0.3 ms of GPU
 time for the hierarchy and 0.4 to 0.7 ms for the rays with the default and
 floor mirror looks, about 1.3 ms for the rays when every surface is a mirror

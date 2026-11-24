@@ -1,7 +1,7 @@
 //! The engine's SPIR-V, as it is handed to `vkCreateShaderModule`: read to
 //! tell vertex shaders from the rest, and changed in one way only, so that
-//! the scene's geometry and its base colour can be captured with transform
-//! feedback.
+//! the scene's geometry, its base colour and its place in the world can be
+//! captured with transform feedback.
 //!
 //! # The change
 //!
@@ -10,10 +10,16 @@
 //!
 //! * `OpCapability TransformFeedback`, when it lacks it;
 //! * `OpExecutionMode <entry> Xfb` on its vertex entry point;
-//! * `XfbBuffer 0` and `XfbStride 48` on the output variable that holds the
+//! * `XfbBuffer 0` and `XfbStride 64` on the output variable that holds the
 //!   position, and `Offset 0` on the position itself;
-//! * `XfbBuffer 0`, `XfbStride 48` and `Offset 16` on its colour output,
-//!   and `Offset 32` on its camera vector output.
+//! * `XfbBuffer 0`, `XfbStride 64` and `Offset 16` on its colour output,
+//!   and `Offset 32` on its camera vector output;
+//! * an output of ours, `Offset 48`, at a location the shader does not use,
+//!   holding the vertex's world position (w: 1 for a static vertex, 0 for
+//!   one placed by bones), stored right after the shader computes its
+//!   camera vector from it: one constant, one variable and one vector are
+//!   added, and the entry point's interface names the variable. The fragment
+//!   shader never reads it.
 //!
 //! The colour output is the `vec4` output, of the lowest location, whose
 //! value comes from the vertex input at location 2: that is where the
@@ -22,21 +28,20 @@
 //! that have one). The camera vector is the output that holds the camera's
 //! position (from a uniform block) minus the vertex's position in the world
 //! (from the position input): the engine's lit shaders pass it on for their
-//! lighting, and in the capture it ties the clip-space positions to a space
-//! with true angles, from which the real projection is worked out (see
-//! `build.comp`). A shader without both is taken not to be lit world
-//! geometry and is left as it came, so it is never captured: in Timebomb
-//! Duels' lobby those are the particle and billboard shaders (camera-facing
-//! quads), the sky and a shader that outputs only a position.
+//! lighting. With the world position it gives the camera's position, and it
+//! ties the clip-space positions to a space with true angles, from which the
+//! real projection is worked out (see `build.comp`). A shader without both
+//! is taken not to be lit world geometry and is left as it came, so it is
+//! never captured: in Timebomb Duels' lobby those are the particle and
+//! billboard shaders (camera-facing quads), the sky and a shader that
+//! outputs only a position.
 //!
-//! Nothing else: no instruction of the shader's own is changed or removed,
-//! no variable, type or function is added, and the ids are the shader's,
-//! so the bound in the header stays. While transform feedback is not
-//! active the decorations have no effect at all, and while it is, the
-//! outputs are written to our buffer as well as passed on; what is
-//! rasterised is the same. A module of any other shape (no vertex entry
-//! point, two of them, no position output, a position already captured, a
-//! module that is not SPIR-V) is left as it came too.
+//! No instruction of the shader's own is changed or removed. While transform
+//! feedback is not active the decorations have no effect at all, and while
+//! it is, the outputs are written to our buffer as well as passed on; what
+//! is rasterised is the same. A module of any other shape (no vertex entry
+//! point, two of them, no position output, a position already captured, no
+//! free location, a module that is not SPIR-V) is left as it came too.
 
 use std::collections::{HashMap, HashSet};
 
@@ -49,8 +54,11 @@ const OP_EXECUTION_MODE: u16 = 16;
 const OP_CAPABILITY: u16 = 17;
 const OP_TYPE_FLOAT: u16 = 22;
 const OP_TYPE_VECTOR: u16 = 23;
+const OP_TYPE_MATRIX: u16 = 24;
+const OP_TYPE_ARRAY: u16 = 28;
 const OP_TYPE_STRUCT: u16 = 30;
 const OP_TYPE_POINTER: u16 = 32;
+const OP_CONSTANT: u16 = 43;
 const OP_FUNCTION: u16 = 54;
 const OP_FUNCTION_END: u16 = 56;
 const OP_VARIABLE: u16 = 59;
@@ -81,11 +89,16 @@ const STORAGE_OUTPUT: u32 = 3;
 pub(crate) const MODEL_VERTEX: u32 = 0;
 
 /// Bytes per captured vertex: the clip-space position, the colour, the
-/// camera vector.
-pub(crate) const STRIDE: u32 = 48;
-/// Where the colour and the camera vector are in a captured vertex.
+/// camera vector, the world position.
+pub(crate) const STRIDE: u32 = 64;
+/// Where the colour, the camera vector and the world position are in a
+/// captured vertex.
 pub(crate) const COLOUR_OFFSET: u32 = 16;
 pub(crate) const CAMERA_OFFSET: u32 = 32;
+pub(crate) const WORLD_OFFSET: u32 = 48;
+/// Output locations a vertex shader can use on the GPUs this runs on
+/// (`maxVertexOutputComponents` 128 on NVIDIA).
+const OUTPUT_LOCATIONS: u32 = 32;
 /// The vertex input the engine's shaders take their vertex colour from.
 const COLOUR_INPUT_LOCATION: u32 = 2;
 
@@ -224,20 +237,68 @@ pub(crate) fn instrument_vertex(words: &[u32]) -> Result<Vec<u32>, &'static str>
         Position::Variable { var } => op(OP_DECORATE, &[var, DECORATION_OFFSET, 0]),
     });
 
-    // The colour and the camera vector, which lit world geometry has.
+    // The colour and the camera vector, which lit world geometry has, and
+    // an output of ours for the world position.
     let flow = Flow::new(words, &list);
     let colour = colour_output(words, &list, &flow).ok_or("no colour output")?;
     let camera = camera_vector_output(words, &list, &flow).ok_or("no camera vector output (not lit world geometry)")?;
-    for (v, offset) in [(colour, COLOUR_OFFSET), (camera, CAMERA_OFFSET)] {
+    let (float, _, vec4) = float_types(words, &list).ok_or("no float type")?;
+    let vec4 = vec4.ok_or("no vec4 type")?;
+    let location = free_output_location(words, &list, &flow).ok_or("no free output location for the world position")?;
+    let mut bound = words[3];
+    let mut new_id = || {
+        bound += 1;
+        bound - 1
+    };
+    let mut globals: Vec<Vec<u32>> = Vec::new();
+    let pointer = match list.iter().find(|i| i.op == OP_TYPE_POINTER && i.len >= 4 && w(i)[2] == STORAGE_OUTPUT && w(i)[3] == vec4) {
+        Some(i) => w(i)[1],
+        None => {
+            let id = new_id();
+            globals.push(op(OP_TYPE_POINTER, &[id, STORAGE_OUTPUT, vec4]));
+            id
+        }
+    };
+    let flag = new_id();
+    globals.push(op(OP_CONSTANT, &[float, flag, if camera.fixed { 1.0f32 } else { 0.0f32 }.to_bits()]));
+    let world_out = new_id();
+    globals.push(op(OP_VARIABLE, &[pointer, world_out, STORAGE_OUTPUT]));
+    let world4 = new_id();
+    decorations.push(op(OP_DECORATE, &[world_out, DECORATION_LOCATION, location]));
+    for (v, offset) in [(colour, COLOUR_OFFSET), (camera.output, CAMERA_OFFSET), (world_out, WORLD_OFFSET)] {
         decorations.push(op(OP_DECORATE, &[v, DECORATION_XFB_BUFFER, 0]));
         decorations.push(op(OP_DECORATE, &[v, DECORATION_XFB_STRIDE, STRIDE]));
         decorations.push(op(OP_DECORATE, &[v, DECORATION_OFFSET, offset]));
     }
+    let first_function = list.iter().position(|i| i.op == OP_FUNCTION).ok_or("no function")?;
+    if first_function <= after_decorations {
+        return Err("the module is not in the logical layout");
+    }
 
     let mut out = Vec::with_capacity(words.len() + 64);
     out.extend_from_slice(&words[..5]);
+    out[3] = bound;
     for (n, i) in list.iter().enumerate() {
-        out.extend_from_slice(w(i));
+        if n == first_function {
+            for g in &globals {
+                out.extend_from_slice(g);
+            }
+        }
+        if i.op == OP_ENTRY_POINT && w(i)[2] == entry {
+            // Our output joins the entry point's interface.
+            let mut e = w(i).to_vec();
+            e.push(world_out);
+            e[0] = ((e.len() as u32) << 16) | OP_ENTRY_POINT as u32;
+            out.extend(e);
+        } else {
+            out.extend_from_slice(w(i));
+        }
+        if i.op == OP_F_SUB && w(i)[2] == camera.difference {
+            // Right after the camera vector is computed, in the same block:
+            // the world position it was computed from, and whether static.
+            out.extend(op(OP_COMPOSITE_CONSTRUCT, &[vec4, world4, camera.world, flag]));
+            out.extend(op(OP_STORE, &[world_out, world4]));
+        }
         if n == last_capability && !has_capability {
             out.extend(op(OP_CAPABILITY, &[CAPABILITY_TRANSFORM_FEEDBACK]));
         }
@@ -430,7 +491,7 @@ fn colour_output(words: &[u32], list: &[Inst], flow: &Flow) -> Option<u32> {
 /// position input at location 0 (the vertex in the world). The engine's
 /// lit shaders pass it on for their lighting; particles, billboards, the
 /// sky and the interface have none. Of the lowest location.
-fn camera_vector_output(words: &[u32], list: &[Inst], flow: &Flow) -> Option<u32> {
+fn camera_vector_output(words: &[u32], list: &[Inst], flow: &Flow) -> Option<CameraVector> {
     let (_, vec3, vec4) = float_types(words, list)?;
     let vec3 = vec3?;
     let position = flow.inputs_at(0);
@@ -447,30 +508,75 @@ fn camera_vector_output(words: &[u32], list: &[Inst], flow: &Flow) -> Option<u32
             && flow.memories(x[0]).is_disjoint(&any_input)
             && !flow.memories(x[1]).is_disjoint(&position)
     };
-    let is_vector = |stored: u32, four: bool| {
+    // The difference a stored value is, or is made of.
+    let difference_of = |stored: u32, four: bool| -> Option<u32> {
         if !four {
-            return is_difference(stored);
+            return is_difference(stored).then_some(stored);
         }
-        let Some((OP_COMPOSITE_CONSTRUCT, parts)) = flow.defs.get(&stored) else { return false };
+        let Some((OP_COMPOSITE_CONSTRUCT, parts)) = flow.defs.get(&stored) else { return None };
         if parts.len() == 2 {
-            return is_difference(parts[0]);
+            return is_difference(parts[0]).then_some(parts[0]);
         }
         // Its first three parts the components 0, 1 and 2 of one difference.
-        parts.len() == 4 && {
-            let of = |k: usize| match flow.defs.get(&parts[k]) {
-                Some((OP_COMPOSITE_EXTRACT, e)) if e.len() == 2 && e[1] == k as u32 => Some(e[0]),
-                _ => None,
-            };
-            matches!((of(0), of(1), of(2)), (Some(a), Some(b), Some(c)) if a == b && b == c && is_difference(a))
+        if parts.len() != 4 {
+            return None;
+        }
+        let of = |k: usize| match flow.defs.get(&parts[k]) {
+            Some((OP_COMPOSITE_EXTRACT, e)) if e.len() == 2 && e[1] == k as u32 => Some(e[0]),
+            _ => None,
+        };
+        match (of(0), of(1), of(2)) {
+            (Some(a), Some(b), Some(c)) if a == b && b == c && is_difference(a) => Some(a),
+            _ => None,
         }
     };
     let mut candidates: Vec<(u32, u32, bool)> = flow.outputs_of(Some(vec3)).into_iter().map(|(l, v)| (l, v, false)).collect();
     candidates.extend(flow.outputs_of(vec4).into_iter().map(|(l, v)| (l, v, true)));
     candidates.sort_unstable();
-    candidates
-        .into_iter()
-        .find(|&(_, v, four)| flow.stores.get(&v).is_some_and(|s| !s.is_empty() && s.iter().all(|&x| is_vector(x, four))))
-        .map(|(_, v, _)| v)
+    candidates.into_iter().find_map(|(_, v, four)| {
+        let stored = flow.stores.get(&v)?;
+        let diffs: Vec<u32> = stored.iter().map(|&x| difference_of(x, four)).collect::<Option<Vec<u32>>>()?;
+        let &first = diffs.first()?;
+        if diffs.iter().any(|&d| d != first) {
+            return None;
+        }
+        let world = flow.defs.get(&first)?.1[1];
+        // Static: the world position depends on no vertex input but the
+        // position (so not on bone indices or weights).
+        let fixed = flow.memories(world).iter().all(|m| !any_input.contains(m) || position.contains(m));
+        Some(CameraVector { output: v, difference: first, world, fixed })
+    })
+}
+
+/// The camera vector output and what it is made of.
+struct CameraVector {
+    output: u32,
+    /// The `OpFSub` (camera minus world) and its second operand.
+    difference: u32,
+    world: u32,
+    /// The world position depends on the position input alone.
+    fixed: bool,
+}
+
+/// A location after every one the shader's outputs use.
+fn free_output_location(words: &[u32], list: &[Inst], flow: &Flow) -> Option<u32> {
+    let slots = |ty: u32| -> u32 {
+        let Some(i) = list.iter().find(|i| matches!(i.op, OP_TYPE_ARRAY | OP_TYPE_MATRIX) && words[i.at + 1] == ty) else { return 1 };
+        if i.op == OP_TYPE_MATRIX {
+            return words[i.at + 3];
+        }
+        // The array's length, a constant; an unknown one counts as many.
+        let len = words[i.at + 3];
+        list.iter().find(|c| c.op == OP_CONSTANT && c.len >= 4 && words[c.at + 2] == len).map_or(OUTPUT_LOCATIONS, |c| words[c.at + 3])
+    };
+    let end = flow
+        .vars
+        .iter()
+        .filter(|v| v.2 == STORAGE_OUTPUT)
+        .filter_map(|&(v, ty, _)| Some(flow.loc.get(&v)? + slots(ty)))
+        .max()
+        .unwrap_or(0);
+    (end < OUTPUT_LOCATIONS).then_some(end)
 }
 
 fn op(code: u16, operands: &[u32]) -> Vec<u32> {
@@ -529,28 +635,34 @@ mod tests {
     }
 
     #[test]
-    fn a_vertex_shader_gets_its_position_captured_and_nothing_else() {
+    fn a_vertex_shader_gets_its_outputs_captured_and_nothing_else_changes() {
         let s = summary(VS);
         assert_eq!(s.models, vec![MODEL_VERTEX]);
         assert!(s.position);
         let out = instrument_vertex(VS).expect("instrumented");
-        assert_eq!(&out[..5], &VS[..5], "the header, its id bound included, is kept");
+        assert_eq!(&out[..3], &VS[..3]);
+        assert_eq!(out[3], VS[3] + 3, "three ids added: a constant, a variable, a vector");
         let before = ops(VS);
         let after = ops(&out);
-        // Every instruction of the shader is there, in its order.
+        // Every instruction of the shader but its entry point (whose
+        // interface gains our output) is there, in its order.
         let mut it = after.iter();
-        for b in &before {
+        for b in before.iter().filter(|(o, _)| *o != OP_ENTRY_POINT) {
             assert!(it.any(|a| a == b), "{b:?} kept in order");
         }
         let added: Vec<_> = after.iter().filter(|a| !before.contains(a)).collect();
-        assert_eq!(added.len(), 11, "{added:?}");
         // The colour is `color`, at offset 16; the camera vector
-        // `to_camera`, at 32.
+        // `to_camera`, at 32; ours, the world position, at 48 and location 3.
         let color = output_at(&out, 1);
         assert!(added.contains(&&(OP_DECORATE, vec![color, DECORATION_OFFSET, COLOUR_OFFSET])));
         let to_camera = output_at(&out, 2);
         assert!(added.contains(&&(OP_DECORATE, vec![to_camera, DECORATION_OFFSET, CAMERA_OFFSET])));
-        assert_eq!(out[3], VS[3], "no id is added");
+        let world = output_at(&out, 3);
+        assert!(added.contains(&&(OP_DECORATE, vec![world, DECORATION_OFFSET, WORLD_OFFSET])));
+        assert!(after.iter().any(|(o, a)| *o == OP_ENTRY_POINT && a.last() == Some(&world)));
+        assert!(after.iter().any(|(o, a)| *o == OP_STORE && a[0] == world));
+        // The test shader places its vertex by its own matrices: static.
+        assert!(after.iter().any(|(o, a)| *o == OP_CONSTANT && a[2] == 1.0f32.to_bits()));
         assert!(added.contains(&&(OP_CAPABILITY, vec![CAPABILITY_TRANSFORM_FEEDBACK])));
         assert!(added.iter().any(|(o, a)| *o == OP_EXECUTION_MODE && a[1] == EXECUTION_MODE_XFB));
         assert!(added.iter().any(|(o, a)| *o == OP_MEMBER_DECORATE && a[1] == 0 && a[2] == DECORATION_OFFSET && a[3] == 0));

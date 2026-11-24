@@ -65,6 +65,8 @@ const QUERY_RESULT_64: u32 = 0x1;
 const QUERY_RESULT_WITH_AVAILABILITY: u32 = 0x4;
 
 const SPIRV_FIT: &[u32] = include!(concat!(env!("OUT_DIR"), "/rt_build_fit.spv.rs"));
+const SPIRV_INSERT: &[u32] = include!(concat!(env!("OUT_DIR"), "/rt_build_insert.spv.rs"));
+const SPIRV_GATHER: &[u32] = include!(concat!(env!("OUT_DIR"), "/rt_build_gather.spv.rs"));
 const SPIRV_PREP: &[u32] = include!(concat!(env!("OUT_DIR"), "/rt_build_prep.spv.rs"));
 const SPIRV_SORT_LOCAL: &[u32] = include!(concat!(env!("OUT_DIR"), "/rt_build_sort_local.spv.rs"));
 const SPIRV_SORT_GLOBAL: &[u32] = include!(concat!(env!("OUT_DIR"), "/rt_build_sort_global.spv.rs"));
@@ -82,10 +84,21 @@ const BOUNDS: usize = 4;
 const TRACE: usize = 5;
 const UPSAMPLE: usize = 6;
 const FIT: usize = 7;
-const PIPELINES: usize = 8;
-/// The bindings of our set: the capture, its counter, the sorted keys, the
-/// nodes, the parents, the flags, the globals and the traced blocks.
-const BINDINGS: u32 = 8;
+const INSERT: usize = 8;
+const GATHER: usize = 9;
+const PIPELINES: usize = 10;
+/// The bindings of our set: 0 the capture, 2 the sorted keys, 3 the nodes,
+/// 4 the parents, 5 the flags, 6 the globals, 7 the traced blocks, 8 the
+/// triangles to trace, 9 the cache.
+const BINDINGS: [u32; 9] = [0, 2, 3, 4, 5, 6, 7, 8, 9];
+/// Slots in the cache of static triangles (64 bytes each).
+const SLOTS: u32 = 1 << 19;
+/// Triangles the list to trace holds: this frame's and the cache's.
+const LISTED: u64 = 1 << 20;
+/// Bytes of the globals (`build.comp`'s `Globals`) and of what `rt stats`
+/// reads back of them.
+const GLOBALS_BYTES: u64 = 256;
+const GLOBALS_READ: usize = 40;
 /// Bytes per traced 2 by 2 block.
 const BLOCK_BYTES: u64 = 16;
 /// The blocks buffer has room for at least this extent's.
@@ -107,7 +120,10 @@ pub(crate) struct BuildParams {
     pub cap: u32,
     pub k: u32,
     pub j: u32,
-    pub tan_half: [f32; 2],
+    pub current: u32,
+    pub flags: u32,
+    pub slot_count: u32,
+    pub pad: u32,
 }
 
 /// Whether the trace replaces the march, while the reflections are on.
@@ -218,10 +234,8 @@ pub(crate) struct Stats {
     pub build_ms: std::collections::VecDeque<f64>,
     pub trace_ms: std::collections::VecDeque<f64>,
     pub keys: u32,
-    /// The globals as last read back: leaves, captured, fit_ok,
-    /// fit_samples, tan_x, tan_y, near, |forward|, the world's up (4),
-    /// the trace's two sums, the exposure and a spare word.
-    pub fit: Option<[u32; 16]>,
+    /// The globals as last read back (`build.comp`'s `Globals`).
+    pub fit: Option<[u32; GLOBALS_READ]>,
 }
 
 struct Gpu {
@@ -243,6 +257,8 @@ struct Gpu {
     flags: Owned,
     globals: Owned,
     blocks: Owned,
+    tris: Owned,
+    slots: Owned,
     /// The blocks were cleared once (they carry the last frame's results).
     blocks_cleared: bool,
     /// Host-visible: a copy of the globals (the camera FIT measured).
@@ -293,7 +309,7 @@ impl Gpu {
         if self.query_pool != 0 {
             (f.destroy_query_pool)(d, self.query_pool, none);
         }
-        for o in [self.sorted, self.nodes, self.parents, self.flags, self.globals, self.blocks, self.readback] {
+        for o in [self.sorted, self.nodes, self.parents, self.flags, self.globals, self.blocks, self.tris, self.slots, self.readback] {
             if o.buffer != 0 {
                 (self.buffers.destroy_buffer)(d, o.buffer, none);
             }
@@ -353,8 +369,9 @@ fn shader(f: &Fns, d: Dev, code: &[u32]) -> Result<u64, String> {
 
 fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool, extent: [u32; 2]) -> Result<Gpu, String> {
     let d = device as Dev;
-    let (xfb, counter, capacity, _) = capture::frame_captured(device).ok_or("the scene was not captured")?;
-    let keys = sort_size(capacity / capture::TRIANGLE_BYTES, capacity / capture::TRIANGLE_BYTES);
+    let c = capture::frame_captured(device).ok_or("the scene was not captured")?;
+    let (xfb, capacity) = (c.xfb, c.capacity);
+    let keys = sort_size(LISTED, LISTED);
     let mut g = Gpu {
         device,
         fns: Fns::resolve(d)?,
@@ -373,6 +390,8 @@ fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool, extent: [u32; 2]) -
         flags: Owned::default(),
         globals: Owned::default(),
         blocks: Owned::default(),
+        tris: Owned::default(),
+        slots: Owned::default(),
         blocks_cleared: false,
         readback: Owned::default(),
         readback_ptr: 0,
@@ -382,7 +401,7 @@ fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool, extent: [u32; 2]) -
         pending: [false; RING],
         next_slot: 0,
     };
-    match fill_gpu(&mut g, ssr_set_layout, counter, capacity, timed) {
+    match fill_gpu(&mut g, ssr_set_layout, capacity, timed) {
         Ok(()) => Ok(g),
         Err(e) => {
             g.destroy();
@@ -391,7 +410,7 @@ fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool, extent: [u32; 2]) -
     }
 }
 
-fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, counter: u64, capacity: u64, timed: bool) -> Result<(), String> {
+fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Result<(), String> {
     let d = g.device as Dev;
     let none: *const c_void = std::ptr::null();
     let types = memory_types()?;
@@ -401,14 +420,17 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, counter: u64, capacity: u64, timed
     g.nodes = make_buffer(&g.buffers, d, &types, 64 * n, usage, false)?;
     g.parents = make_buffer(&g.buffers, d, &types, 4 * 2 * n, usage, false)?;
     g.flags = make_buffer(&g.buffers, d, &types, 4 * n, usage, false)?;
-    g.globals = make_buffer(&g.buffers, d, &types, 256, usage, false)?;
+    g.globals = make_buffer(&g.buffers, d, &types, GLOBALS_BYTES, usage, false)?;
     g.blocks = make_buffer(&g.buffers, d, &types, BLOCK_BYTES * g.block_room, usage, false)?;
+    g.tris = make_buffer(&g.buffers, d, &types, 48 * LISTED, usage, false)?;
+    g.slots = make_buffer(&g.buffers, d, &types, 64 * SLOTS as u64, usage, false)?;
     g.readback = make_buffer(&g.buffers, d, &types, 256, USAGE_TRANSFER_DST, true)?;
     let mut mapped = std::ptr::null_mut();
     check((g.buffers.map_memory)(d, g.readback.memory, 0, 256, 0, &mut mapped), "vkMapMemory")?;
     g.readback_ptr = mapped as usize;
     let f = &g.fns;
-    let bindings: Vec<DescriptorSetLayoutBinding> = (0..BINDINGS)
+    let bindings: Vec<DescriptorSetLayoutBinding> = BINDINGS
+        .into_iter()
         .map(|b| DescriptorSetLayoutBinding {
             binding: b,
             kind: DESCRIPTOR_STORAGE_BUFFER,
@@ -453,8 +475,18 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, counter: u64, capacity: u64, timed
         push_constants: &trace_push,
     };
     check((f.create_pipeline_layout)(d, &info, none, &mut g.trace_layout), "vkCreatePipelineLayout")?;
-    let codes: [&[u32]; PIPELINES] =
-        [SPIRV_PREP, SPIRV_SORT_LOCAL, SPIRV_SORT_GLOBAL, SPIRV_BUILD, SPIRV_BOUNDS, SPIRV_TRACE, SPIRV_UPSAMPLE, SPIRV_FIT];
+    let codes: [&[u32]; PIPELINES] = [
+        SPIRV_PREP,
+        SPIRV_SORT_LOCAL,
+        SPIRV_SORT_GLOBAL,
+        SPIRV_BUILD,
+        SPIRV_BOUNDS,
+        SPIRV_TRACE,
+        SPIRV_UPSAMPLE,
+        SPIRV_FIT,
+        SPIRV_INSERT,
+        SPIRV_GATHER,
+    ];
     for (i, code) in codes.into_iter().enumerate() {
         g.shaders[i] = shader(f, d, code)?;
         let pipeline = ComputePipelineCreateInfo {
@@ -476,7 +508,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, counter: u64, capacity: u64, timed
         };
         check((f.create_compute_pipelines)(d, 0, 1, &pipeline, none, &mut g.pipelines[i]), "vkCreateComputePipelines")?;
     }
-    let size = DescriptorPoolSize { kind: DESCRIPTOR_STORAGE_BUFFER, count: BINDINGS };
+    let size = DescriptorPoolSize { kind: DESCRIPTOR_STORAGE_BUFFER, count: BINDINGS.len() as u32 };
     let pool = DescriptorPoolCreateInfo { s_type: ST_DESCRIPTOR_POOL_CREATE_INFO, p_next: none, flags: 0, max_sets: 1, count: 1, sizes: &size };
     check((f.create_descriptor_pool)(d, &pool, none, &mut g.pool), "vkCreateDescriptorPool")?;
     let alloc = DescriptorSetAllocateInfo {
@@ -489,22 +521,23 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, counter: u64, capacity: u64, timed
     check((f.allocate_descriptor_sets)(d, &alloc, &mut g.set), "vkAllocateDescriptorSets")?;
     let infos = [
         DescriptorBufferInfo { buffer: g.xfb, offset: 0, range: capacity },
-        DescriptorBufferInfo { buffer: counter, offset: 0, range: 16 },
         DescriptorBufferInfo { buffer: g.sorted.buffer, offset: 0, range: 8 * n },
         DescriptorBufferInfo { buffer: g.nodes.buffer, offset: 0, range: 64 * n },
         DescriptorBufferInfo { buffer: g.parents.buffer, offset: 0, range: 8 * n },
         DescriptorBufferInfo { buffer: g.flags.buffer, offset: 0, range: 4 * n },
-        DescriptorBufferInfo { buffer: g.globals.buffer, offset: 0, range: 256 },
+        DescriptorBufferInfo { buffer: g.globals.buffer, offset: 0, range: GLOBALS_BYTES },
         DescriptorBufferInfo { buffer: g.blocks.buffer, offset: 0, range: BLOCK_BYTES * g.block_room },
+        DescriptorBufferInfo { buffer: g.tris.buffer, offset: 0, range: 48 * LISTED },
+        DescriptorBufferInfo { buffer: g.slots.buffer, offset: 0, range: 64 * SLOTS as u64 },
     ];
     let writes: Vec<WriteDescriptorSet> = infos
         .iter()
-        .enumerate()
-        .map(|(i, info)| WriteDescriptorSet {
+        .zip(BINDINGS)
+        .map(|(info, binding)| WriteDescriptorSet {
             s_type: ST_WRITE_DESCRIPTOR_SET,
             p_next: none,
             set: g.set,
-            binding: i as u32,
+            binding,
             element: 0,
             count: 1,
             kind: DESCRIPTOR_STORAGE_BUFFER,
@@ -544,7 +577,7 @@ pub(crate) fn record(
     if !is_on() {
         return Ok(false);
     }
-    let Some((xfb, counter, capacity, bytes)) = capture::frame_captured(device) else {
+    let Some(cap) = capture::frame_captured(device) else {
         let mut st = state();
         st.stats.skipped += 1;
         st.stats.last_skip = Some("the scene was not captured this frame".into());
@@ -569,6 +602,7 @@ pub(crate) fn record(
             }
         }
     }
+    let (xfb, capacity, bytes) = (cap.xfb, cap.capacity, cap.bytes);
     let triangles = bytes / capture::TRIANGLE_BYTES;
     let st = &mut *st;
     let g = st.gpus.iter_mut().find(|g| g.device == device).expect("made above");
@@ -578,7 +612,10 @@ pub(crate) fn record(
     if blocks_of(extent) > g.block_room {
         return Err(format!("the scene ({}x{}) is larger than the trace has room for", extent[0], extent[1]));
     }
-    let n = sort_size(triangles, g.keys as u64);
+    // This frame's triangles and the cache's from the last report (the
+    // list is cut at `n` when the cache grew since).
+    let cached_last = st.stats.fit.map_or(0, |w| w[3] as u64);
+    let n = sort_size(triangles + cached_last, g.keys as u64);
     let slot = g.next_slot;
     g.next_slot = (slot + 1) % RING;
     if let Some((b, t)) = g.collect(slot, period_ns, mask) {
@@ -596,7 +633,7 @@ pub(crate) fn record(
     if g.readback_ptr != 0 {
         // SAFETY: our mapping of 256 bytes, written by an earlier frame's
         // copy; a torn or old value only skews the report.
-        let words: [u32; 16] = unsafe { std::ptr::read_volatile(g.readback_ptr as *const [u32; 16]) };
+        let words: [u32; GLOBALS_READ] = unsafe { std::ptr::read_volatile(g.readback_ptr as *const [u32; GLOBALS_READ]) };
         st.stats.fit = Some(words);
     }
     let f = &g.fns;
@@ -612,23 +649,28 @@ pub(crate) fn record(
     stamp(0);
     // The last frame's trace has read our buffers before they are cleared.
     (g.buffers.pipeline_barrier)(cmd, STAGE_COMPUTE, STAGE_TRANSFER | STAGE_COMPUTE, 0, 0, std::ptr::null(), 0, std::ptr::null(), 0, std::ptr::null());
-    // The globals' counts each frame; the exposure and the trace's sums
-    // after them are kept (cleared once, below).
+    // The globals' counts each frame (the first four words, and the
+    // cache's drops and misses); the rest is kept, cleared once with the
+    // cache and the blocks.
     (f.cmd_fill_buffer)(cmd, g.globals.buffer, 0, 16, 0);
+    (f.cmd_fill_buffer)(cmd, g.globals.buffer, 132, 8, 0);
     (f.cmd_fill_buffer)(cmd, g.flags.buffer, 0, 4 * n as u64, 0);
-    // What this frame's draws wrote, as counted when they were recorded.
-    (f.cmd_fill_buffer)(cmd, counter, 0, 4, bytes as u32);
     if clear_blocks {
         (f.cmd_fill_buffer)(cmd, g.blocks.buffer, 0, BLOCK_BYTES * g.block_room, 0);
-        (f.cmd_fill_buffer)(cmd, g.globals.buffer, 16, 240, 0);
+        (f.cmd_fill_buffer)(cmd, g.globals.buffer, 16, GLOBALS_BYTES - 16, 0);
+        (f.cmd_fill_buffer)(cmd, g.slots.buffer, 0, 64 * SLOTS as u64, 0);
     }
     g.barrier(cmd, STAGE_TRANSFER | STAGE_COMPUTE, ACCESS_TRANSFER_WRITE | ACCESS_SHADER_WRITE);
+    let current = (triangles.min(capacity / capture::TRIANGLE_BYTES)) as u32;
     let mut bp = BuildParams {
         n,
-        cap: (capacity / capture::TRIANGLE_BYTES) as u32,
+        cap: LISTED as u32,
         k: 0,
         j: 0,
-        tan_half: params.tan_half,
+        current,
+        flags: u32::from(cap.whole),
+        slot_count: SLOTS,
+        pad: 0,
     };
     let dispatch = |pipeline: usize, bp: &BuildParams, groups: u32| {
         (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[pipeline]);
@@ -645,6 +687,8 @@ pub(crate) fn record(
     };
     (f.cmd_bind_descriptor_sets)(cmd, BIND_POINT_COMPUTE, g.build_layout, 0, 1, &g.set, 0, std::ptr::null());
     dispatch(FIT, &bp, 1);
+    dispatch(INSERT, &bp, current.div_ceil(256));
+    dispatch(GATHER, &bp, SLOTS.div_ceil(256));
     dispatch(PREP, &bp, n.div_ceil(256));
     for (pipeline, k, j, groups) in sort_plan(n) {
         bp.k = k;
@@ -658,7 +702,7 @@ pub(crate) fn record(
     // The camera FIT measured, for `rt stats`.
     let to_host = MemoryBarrier { s_type: ST_MEMORY_BARRIER, p_next: std::ptr::null(), src_access_mask: ACCESS_SHADER_WRITE, dst_access_mask: ACCESS_TRANSFER_READ };
     (g.buffers.pipeline_barrier)(cmd, STAGE_COMPUTE, STAGE_TRANSFER, 0, 1, &to_host, 0, std::ptr::null(), 0, std::ptr::null());
-    let region = [0u64, 0, 64];
+    let region = [0u64, 0, 4 * GLOBALS_READ as u64];
     (g.buffers.copy_buffer)(cmd, g.globals.buffer, g.readback.buffer, 1, region.as_ptr());
     stamp(1);
     (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[TRACE]);
@@ -713,16 +757,17 @@ fn p95(q: &std::collections::VecDeque<f64>) -> f64 {
     v[(v.len() * 95 / 100).min(v.len() - 1)]
 }
 
-/// The camera FIT measured, as `rt stats` reports it.
-fn fit_text(fit: Option<[u32; 16]>) -> String {
+/// The camera FIT measured and the cache, as `rt stats` reports them.
+fn fit_text(fit: Option<[u32; GLOBALS_READ]>) -> String {
     let Some(w) = fit else { return "fit=none".into() };
     let f = |i: usize| f32::from_bits(w[i]);
     if w[2] == 0 {
-        return format!("fit=failed fit_samples={}", w[3]);
+        return format!("fit=failed fit_samples={}", w[1]);
     }
     format!(
-        "fit=ok fit_samples={} fov_x={:.2} fov_y={:.2} near={:.4} forward_len={:.4} world_up={:.3},{:.3},{:.3} exposure={:.3}",
-        w[3],
+        "fit=ok fit_samples={} fov_x={:.2} fov_y={:.2} near={:.4} forward_len={:.4} world_up={:.3},{:.3},{:.3} exposure={:.3} \
+         camera={:.1},{:.1},{:.1} cache_listed={} cache_dropped={} cache_full={} cache_generation={}",
+        w[1],
         2.0 * f(4).atan().to_degrees(),
         2.0 * f(5).atan().to_degrees(),
         f(6),
@@ -730,7 +775,14 @@ fn fit_text(fit: Option<[u32; 16]>) -> String {
         f(8),
         f(9),
         f(10),
-        f(14)
+        f(14),
+        f(16),
+        f(17),
+        f(18),
+        w[3],
+        w[33],
+        w[34],
+        w[32] & 0xff
     )
 }
 
@@ -794,6 +846,6 @@ mod tests {
 
     #[test]
     fn the_build_parameters_have_the_shader_layout() {
-        assert_eq!(std::mem::size_of::<BuildParams>(), 24);
+        assert_eq!(std::mem::size_of::<BuildParams>(), 32);
     }
 }
