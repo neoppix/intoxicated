@@ -30,6 +30,7 @@ pub mod flag_file;
 pub mod flag_layers;
 pub mod graphics;
 pub mod linking;
+pub mod macros;
 pub mod net;
 pub mod power;
 pub mod profile;

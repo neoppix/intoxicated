@@ -117,8 +117,8 @@ QString NameDialog::text() const { return m_edit->text(); }
 
 QStringList MainWindow::pageNames() {
     return {QStringLiteral("Play"),     QStringLiteral("FastFlags"), QStringLiteral("Client"),
-            QStringLiteral("Shaders"),  QStringLiteral("Profiles"),  QStringLiteral("Mods"),
-            QStringLiteral("About")};
+            QStringLiteral("Shaders"),  QStringLiteral("Macros"),    QStringLiteral("Profiles"),
+            QStringLiteral("Mods"),     QStringLiteral("About")};
 }
 
 MainWindow::MainWindow(AppState *state, int startPage) : m_state(state) {
@@ -141,6 +141,7 @@ MainWindow::MainWindow(AppState *state, int startPage) : m_state(state) {
     m_stack->addWidget(new FlagsPage(state));
     m_stack->addWidget(new ClientPage(state));
     m_stack->addWidget(new ShadersPage(state));
+    m_stack->addWidget(new MacrosPage(state));
     m_stack->addWidget(new ProfilesPage(state));
     m_stack->addWidget(new ModsPage);
     m_stack->addWidget(new AboutPage);

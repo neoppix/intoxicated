@@ -3,7 +3,7 @@
 //
 //   intoxicated-settings                 the window
 //   intoxicated-settings --page <name>   open on a page (play, fastflags,
-//                                        client, shaders, profiles, mods,
+//                                        client, shaders, macros, profiles, mods,
 //                                        about)
 //   intoxicated-settings --size WxH      open at that size
 //                                        (--page and --size are for tests
@@ -26,7 +26,7 @@
 
 namespace {
 
-const char *kUsage = "usage: intoxicated-settings [--page play|fastflags|client|shaders|profiles|mods|about] [--size WxH]\n"
+const char *kUsage = "usage: intoxicated-settings [--page play|fastflags|client|shaders|macros|profiles|mods|about] [--size WxH]\n"
                      "       intoxicated-settings --askpass PROMPT\n"
                      "       intoxicated-settings --self-test\n";
 

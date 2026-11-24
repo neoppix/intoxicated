@@ -19,6 +19,7 @@ class QPlainTextEdit;
 class QProcess;
 class QPushButton;
 class QSlider;
+class QSpinBox;
 class QStackedWidget;
 class QTableWidget;
 class QTemporaryDir;
@@ -270,6 +271,72 @@ private:
     QString m_default;
 };
 
+// In-game macros: a key press plays a recorded sequence of input back through
+// the client's own input path, so a macro only fires while the Roblox window
+// is focused. The page edits <profile>/macros.json, which the client reads at
+// launch; the list on the left is the profile's macros, the editor on the
+// right the selected one, and a master switch writes INTOXICATED_MACROS. Every
+// change saves the file at once.
+class MacrosPage : public QWidget {
+    Q_OBJECT
+public:
+    explicit MacrosPage(AppState *state);
+    void reload();
+
+protected:
+    void showEvent(QShowEvent *event) override;
+
+private:
+    void save();
+    void fillList();
+    void showEditor();
+    int selectedRow() const;
+    MacroDef *current();
+    void addMacro();
+    void duplicateMacro();
+    void deleteMacro();
+    void nameEdited();
+    void triggerChanged();
+    void switchesChanged();
+    void addStep();
+    void editStep();
+    void moveStep(int delta);
+    void removeStep();
+    void fillSteps();
+    void setMaster(bool on);
+    void updateButtons();
+    void setStatus(const QString &text, bool error);
+
+    AppState *m_state;
+    QList<MacroDef> m_macros;
+    // The file could not be read: it is left untouched rather than written over.
+    bool m_broken = false;
+
+    Switch *m_master;
+    QListWidget *m_list;
+    QPushButton *m_add;
+    QPushButton *m_dup;
+    QPushButton *m_del;
+
+    QWidget *m_editor;
+    QLineEdit *m_name;
+    Switch *m_enabled;
+    Combo *m_triggerKey;
+    Switch *m_tCtrl;
+    Switch *m_tShift;
+    Switch *m_tAlt;
+    Switch *m_swallow;
+    Switch *m_repeat;
+    QListWidget *m_steps;
+    QPushButton *m_stepAdd;
+    QPushButton *m_stepEdit;
+    QPushButton *m_stepUp;
+    QPushButton *m_stepDown;
+    QPushButton *m_stepDel;
+    QLabel *m_status;
+    bool m_filling = false;
+};
+
 class ModsPage : public QWidget {
     Q_OBJECT
 public:
@@ -319,6 +386,36 @@ private:
     QLabel *m_problem;
     QPushButton *m_ok;
     QString m_normalised;
+};
+
+// Add or edit one macro step. The type picker chooses which fields show: a key
+// and its modifiers, a point, a mouse button, a scroll amount, text, or a wait.
+class StepDialog : public QDialog {
+    Q_OBJECT
+public:
+    StepDialog(QWidget *parent, const MacroStep &step);
+    MacroStep step() const;
+
+private:
+    void typeChanged();
+
+    Combo *m_type;
+    QWidget *m_keyRow;
+    Combo *m_key;
+    Switch *m_ctrl;
+    Switch *m_shift;
+    Switch *m_alt;
+    QWidget *m_pointRow;
+    QSpinBox *m_x;
+    QSpinBox *m_y;
+    QWidget *m_buttonRow;
+    Combo *m_button;
+    QWidget *m_scrollRow;
+    QSpinBox *m_detents;
+    QWidget *m_textRow;
+    QLineEdit *m_text;
+    QWidget *m_waitRow;
+    QSpinBox *m_wait;
 };
 
 class ImportDialog : public QDialog {

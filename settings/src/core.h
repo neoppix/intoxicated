@@ -396,6 +396,96 @@ bool applySsrLook(const SsrTable &table, SettingsConf &conf, const QString &look
 bool setSsrKnob(SettingsConf &conf, const SsrKnob &knob, const SsrValue &value);
 void resetSsrKnob(SettingsConf &conf, const SsrKnob &knob);
 
+// --- Macros ----------------------------------------------------------------
+
+// In-game macros: a key press, seen on the client's own input path while the
+// Roblox window is focused, plays a recorded sequence of input back through
+// that same path. They live in <profile>/macros.json, which the client reads
+// once at launch (crate::macros). INTOXICATED_MACROS=0 turns the feature off;
+// anything else, or no line, leaves it on.
+inline const QString kMacrosSetting = QStringLiteral("INTOXICATED_MACROS");
+
+// <profile>/macros.json.
+QString macrosPath(const QString &profile);
+
+// What one step of a macro does. The names match the "type" the file stores
+// and the client reads: tap, keydown, keyup, move, click, buttondown,
+// buttonup, scroll, text, wait.
+enum class StepKind { Tap, KeyDown, KeyUp, Move, Click, ButtonDown, ButtonUp, Scroll, Text, Wait };
+
+struct MacroStep {
+    StepKind kind = StepKind::Tap;
+    // Tap, KeyDown, KeyUp: a physical key as a Linux evdev code, and the
+    // modifiers held with it.
+    int evdev = 0;
+    bool ctrl = false;
+    bool shift = false;
+    bool alt = false;
+    // Move, Click, ButtonDown, ButtonUp, Scroll: window coordinates.
+    double x = 0;
+    double y = 0;
+    // Click, ButtonDown, ButtonUp: 1 left, 2 right, 3 middle.
+    int button = 1;
+    // Scroll: wheel detents, away from the user positive.
+    double detents = 0;
+    // Text: what is typed.
+    QString text;
+    // Wait: the pause in milliseconds.
+    quint64 ms = 0;
+};
+
+struct MacroDef {
+    QString name;
+    bool enabled = true;
+    // The trigger: a physical key and the modifiers that must be held with it.
+    int triggerEvdev = 0;
+    bool triggerCtrl = false;
+    bool triggerShift = false;
+    bool triggerAlt = false;
+    // Keep the trigger key from the game while the macro runs.
+    bool swallow = false;
+    // Repeat the steps while the trigger key is held.
+    bool repeat = false;
+    QList<MacroStep> steps;
+};
+
+struct MacrosFile {
+    bool exists = false;
+    // Non-empty when the file cannot be used (not JSON, not an object, or
+    // "macros" is not an array); it is then never written over.
+    QString error;
+    QList<MacroDef> macros;
+    // Macros left out because they could not be read, each with its reason.
+    QStringList skipped;
+};
+
+// Parse a macros document. Blank text is no macros, not an error. A macro that
+// cannot be read is listed in SKIPPED rather than failing the whole document.
+bool parseMacros(const QByteArray &data, QList<MacroDef> *out, QString *error, QStringList *skipped = nullptr);
+MacrosFile loadMacros(const QString &path);
+bool saveMacros(const QString &path, const QList<MacroDef> &macros, QString *error);
+
+// Empty when NAME is a usable macro name (non-blank once trimmed), else why.
+QString checkMacroName(const QString &name);
+// Empty when the macro is complete enough to save (a name, a trigger key and
+// at least one step), else the first reason it is not.
+QString checkMacro(const MacroDef &m);
+
+// The keys the editor offers and the file stores, as (evdev code, label). One
+// fixed table, shared so the label a code shows and the code a label saves
+// always agree.
+struct KeyName {
+    int evdev;
+    QString label;
+};
+const QList<KeyName> &keyNames();
+// A code's label, or "Key <n>" for one not in the table.
+QString keyLabel(int evdev);
+// A label's code, or -1 for one not in the table.
+int keyEvdev(const QString &label);
+// A step as one line for the editor's list, e.g. "Tap  Space" or "Wait  40 ms".
+QString describeStep(const MacroStep &step);
+
 // --- Self-test -------------------------------------------------------------
 
 int runSelfTest();

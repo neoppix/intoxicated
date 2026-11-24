@@ -329,6 +329,27 @@ set about 1.5 ms, everything included (at 1667x1349 about 0.6 and 0.7
 ms); frame times did not change measurably (p50 4.2 ms either way, as with
 all off).
 
+## Macros
+
+A macro binds a key to a recorded sequence of input. When the key is pressed
+with the Roblox window focused, the client plays the sequence back through its
+own input path, the same path devctl's `move`, `click`, `key` and `text` use;
+nothing is sent to the X server, so a macro never lands on the desktop and only
+ever runs in game. The steps are taps and key holds, pointer moves, clicks,
+scrolls, typed text and waits. A macro can also keep its trigger key from the
+game, and repeat its steps while the key is held.
+
+Macros live in `<profile>/macros.json`, read once at launch. The
+[Macros page](#intoxicated-settings) of Intoxicated Settings writes the file;
+it can also be edited by hand, as a `{"intoxicated-macros": 1, "macros": [...]}`
+object whose macros carry a `name`, a `trigger` (a `key` evdev code and
+optional `ctrl`/`shift`/`alt`), optional `enabled`, `swallow` and `repeat`, and
+a `steps` array. A macro that cannot be read is skipped and the rest kept.
+`INTOXICATED_MACROS=0` turns the whole feature off; anything else, or no line,
+leaves it on. The in-game trigger and playback are not covered by the automated
+tests (they need a running client); the file's parsing, the step model and the
+settings app's editor are.
+
 When the disk holding the profile's Roblox data runs short, the client says so:
 below 2 GiB free as it hands Roblox its window, below 512 MiB again when the
 run ends. The engine itself never reports a full disk.
@@ -355,7 +376,10 @@ bloom; Subtle, Prism and Film for the lens; Light, Crisp and Crunchy for the
 sharpen) and a fine-tune row for each of their settings (the depth of
 field's focus as Fixed distance, Character or Past the character); picking a
 look clears that effect's fine tuning, after asking, and each row has its
-own reset. Like the client options they apply from the next launch. Profiles: create, delete and pick the default one. And Play, a place id or
+own reset. Like the client options they apply from the next launch. Macros:
+the profile's in-game macros, a list on the left and the selected one's trigger
+key, Ctrl/Shift/Alt, and steps on the right, with a master switch for the lot;
+see [Macros](#macros) below. Profiles: create, delete and pick the default one. And Play, a place id or
 link field, and the two update commands. It is a Qt 6 Widgets program in
 `settings/` that needs `qt6-base` and nothing else.
 
@@ -392,6 +416,14 @@ A profile shows as in use while a client holds it, and is not deleted then.
 installer asks for the password through the app's own dialog (`sudo -A` with
 `SUDO_ASKPASS`). `ctest --test-dir settings/build` runs the app's self-test
 of its file handling, against scratch directories.
+
+**Macros: use at your own risk.** The Macros page plays back recorded input.
+Roblox's Community Standards forbid gaining an unfair advantage and using
+automation for disruptive tasks, and many games ban macros in their own rules
+and moderate them themselves. Whether a macro is allowed depends on the game
+you use it in; check its rules first. A macro that breaks a game's rules can
+get you kicked or banned from that game, and that is on you, not on
+Intoxicated.
 
 ## Status: playable
 

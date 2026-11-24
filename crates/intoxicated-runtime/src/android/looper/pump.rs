@@ -216,6 +216,7 @@ impl Host for Live {
     fn input(&mut self, handle: i64) {
         crate::android::pump_input_events(handle);
         crate::devctl::apply_queued(handle);
+        crate::macros::apply_due(handle);
         if self.keepalive {
             crate::android::input::idle_keepalive();
         }

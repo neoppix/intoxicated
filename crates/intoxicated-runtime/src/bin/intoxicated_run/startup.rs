@@ -188,6 +188,8 @@ fn enter_run_dir(opt: &mut Options, data_root: &Path) {
 
     // Here: the profile has latched and is held, and the socket lives in it.
     intoxicated_runtime::devctl::start();
+    // The profile's macros load from the same directory, read once here.
+    intoxicated_runtime::macros::load();
 
     let run = intoxicated_runtime::profile::active().join("run");
     if let Err(e) = std::fs::create_dir_all(run.join("exe")) {

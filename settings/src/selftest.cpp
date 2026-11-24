@@ -1034,6 +1034,85 @@ void testShaderLauncher(const QString &scratch) {
     qputenv("PATH", savedPath);
 }
 
+void testMacros() {
+    same(macrosPath("alt"), profileDir("alt") + "/macros.json", "macros.json path");
+
+    // The key table names a code both ways, and an unknown code gets a label.
+    same(keyEvdev("W"), 17, "W is evdev 17");
+    same(keyLabel(17), QString("W"), "and back");
+    same(keyLabel(200), QString("Key 200"), "a code not in the table still has a label");
+    same(keyEvdev("Nope"), -1, "a label not in the table has no code");
+
+    const QString path = macrosPath("default");
+    MacrosFile missing = loadMacros(path);
+    check(!missing.exists && missing.error.isEmpty() && missing.macros.isEmpty(), "a missing macros.json is empty");
+
+    // A full document, and a bad macro that is skipped rather than fatal.
+    writeAll(path, R"({"intoxicated-macros":1,"macros":[
+        {"name":"Rapid fire","enabled":true,"swallow":true,"repeat":true,
+         "trigger":{"key":33,"ctrl":true},
+         "steps":[{"type":"tap","key":57},{"type":"wait","ms":40},
+                  {"type":"click","x":640,"y":360,"button":2},{"type":"text","text":"gg"}]},
+        {"name":"no steps","trigger":{"key":34},"steps":[]},
+        {"name":"Spin","trigger":{"key":35},"steps":[{"type":"move","x":10,"y":20},{"type":"scroll","x":1,"y":2,"detents":-1}]}
+    ]})");
+    MacrosFile file = loadMacros(path);
+    check(file.exists && file.error.isEmpty(), "macros.json loads: " + file.error);
+    same(file.macros.size(), 2, "the two usable macros are kept");
+    same(file.skipped.size(), 1, "the empty one is skipped, not fatal");
+    if (file.macros.size() == 2) {
+        const MacroDef &m = file.macros[0];
+        same(m.name, QString("Rapid fire"), "the name");
+        check(m.enabled && m.swallow && m.repeat, "its switches");
+        check(m.triggerEvdev == 33 && m.triggerCtrl && !m.triggerShift, "its trigger");
+        same(m.steps.size(), 4, "its steps");
+        check(m.steps[0].kind == StepKind::Tap && m.steps[0].evdev == 57, "a tap");
+        check(m.steps[1].kind == StepKind::Wait && m.steps[1].ms == 40, "a wait");
+        check(m.steps[2].kind == StepKind::Click && m.steps[2].button == 2 && m.steps[2].x == 640, "a right click");
+        check(m.steps[3].kind == StepKind::Text && m.steps[3].text == "gg", "typed text");
+    }
+
+    // Round trip: what loads saves and loads back the same.
+    QString error;
+    check(saveMacros(path, file.macros, &error), "macros.json saves: " + error);
+    MacrosFile back = loadMacros(path);
+    same(back.macros.size(), 2, "the same count comes back");
+    check(back.skipped.isEmpty(), "and nothing is skipped the second time");
+    same(strays(QFileInfo(path).absolutePath(), {"macros.json"}), QStringList(), "no temporary file is left");
+    if (back.macros.size() == 2 && file.macros.size() == 2) {
+        const MacroStep &a = file.macros[0].steps[2];
+        const MacroStep &b = back.macros[0].steps[2];
+        check(a.kind == b.kind && a.button == b.button && a.x == b.x && a.y == b.y, "a click round trips");
+    }
+
+    // checkMacro names what is missing.
+    MacroDef empty;
+    check(!checkMacro(empty).isEmpty(), "a blank macro is refused");
+    MacroDef named;
+    named.name = "x";
+    check(checkMacro(named).contains("trigger"), "a macro with no trigger key is refused");
+    named.triggerEvdev = 33;
+    check(checkMacro(named).contains("step"), "a macro with no steps is refused");
+    named.steps.append(MacroStep{});
+    named.steps[0].kind = StepKind::Tap;
+    check(checkMacro(named).contains("key"), "a key step with no key is refused");
+    named.steps[0].evdev = 57;
+    check(checkMacro(named).isEmpty(), "a complete macro passes");
+
+    // A file that is not a usable object is reported and never written over.
+    for (const QByteArray &broken : {QByteArray("not json"), QByteArray("[1, 2]"),
+                                     QByteArray("{\"macros\": 5}")}) {
+        writeAll(path, broken);
+        MacrosFile f = loadMacros(path);
+        check(!f.error.isEmpty() && f.macros.isEmpty(), "broken macros.json is reported: " + QString::fromUtf8(broken));
+    }
+
+    // Blank is empty, not broken.
+    writeAll(path, "  \n");
+    check(loadMacros(path).error.isEmpty(), "a blank macros.json is an empty one");
+    QDir(profileDir("default")).removeRecursively();
+}
+
 } // namespace
 
 int runSelfTest() {
@@ -1070,6 +1149,7 @@ int runSelfTest() {
     testShaderModes();
     testLensAndSharpen();
     testShaderLauncher(root);
+    testMacros();
 
     std::printf("self-test: %d checks, %d failed (scratch %s)\n", g_checks, g_failures, qPrintable(root));
     return g_failures == 0 ? 0 : 1;

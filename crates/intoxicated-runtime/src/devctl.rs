@@ -508,37 +508,45 @@ pub fn apply_queued(handle: i64) {
     }
     for (queued_at, cmd) in drain() {
         crate::android::input::note_devctl_command(queued_at);
-        match cmd {
-            Cmd::Move { x, y } => crate::android::input::script_move(handle, x, y, now_ms()),
-            Cmd::Button { x, y, down, button } => {
-                crate::android::input::script_button(handle, x, y, down, button, now_ms())
+        apply_cmd(handle, cmd);
+    }
+    crate::android::input::clear_input_origin();
+}
+
+/// Apply one command through the client's own input path, on the thread that
+/// owns it (the looper pump). Shared by [`apply_queued`] and the macro player
+/// in [`crate::macros`], so both reach the engine the one way, as if the
+/// events had come from the window.
+pub fn apply_cmd(handle: i64, cmd: Cmd) {
+    match cmd {
+        Cmd::Move { x, y } => crate::android::input::script_move(handle, x, y, now_ms()),
+        Cmd::Button { x, y, down, button } => {
+            crate::android::input::script_button(handle, x, y, down, button, now_ms())
+        }
+        Cmd::Key { down, evdev, modifiers } => crate::android::input::pass_key_event(down, evdev, modifiers),
+        Cmd::Text(text) => {
+            // Typed per character through the path a keystroke takes, so
+            // the client's own text buffer and the editor both see it.
+            // The handle is the GameActivity handle
+            // `script_type` wants -- the handle the pump was given and
+            // passes to `apply_queued`. Handing it the *focused textbox*
+            // handle instead crashed the client on the first keystroke
+            // (recorded in the inherited notes, not re-run).
+            crate::android::input::script_type(handle, &text, now_ms());
+        }
+        Cmd::Scroll { x, y, detents } => crate::android::input::wheel(handle, x, y, 0.0, detents, now_ms()),
+        Cmd::Fullscreen(on) => crate::android::backend_set_fullscreen(on),
+        Cmd::Focus(focus_in) => {
+            if let Some(w) = crate::android::x11_window::current() {
+                w.devctl_focus(handle, focus_in);
             }
-            Cmd::Key { down, evdev, modifiers } => crate::android::input::pass_key_event(down, evdev, modifiers),
-            Cmd::Text(text) => {
-                // Typed per character through the path a keystroke takes, so
-                // the client's own text buffer and the editor both see it.
-                // The handle is the GameActivity handle
-                // `script_type` wants -- the handle the pump was given and
-                // passes to `apply_queued`. Handing it the *focused textbox*
-                // handle instead crashed the client on the first keystroke
-                // (recorded in the inherited notes, not re-run).
-                crate::android::input::script_type(handle, &text, now_ms());
-            }
-            Cmd::Scroll { x, y, detents } => crate::android::input::wheel(handle, x, y, 0.0, detents, now_ms()),
-            Cmd::Fullscreen(on) => crate::android::backend_set_fullscreen(on),
-            Cmd::Focus(focus_in) => {
-                if let Some(w) = crate::android::x11_window::current() {
-                    w.devctl_focus(handle, focus_in);
-                }
-            }
-            Cmd::XKey { down, keycode, state } => {
-                if let Some(w) = crate::android::x11_window::current() {
-                    w.devctl_xkey(handle, down, keycode, state);
-                }
+        }
+        Cmd::XKey { down, keycode, state } => {
+            if let Some(w) = crate::android::x11_window::current() {
+                w.devctl_xkey(handle, down, keycode, state);
             }
         }
     }
-    crate::android::input::clear_input_origin();
 }
 
 #[cfg(test)]

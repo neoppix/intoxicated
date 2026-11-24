@@ -1327,4 +1327,365 @@ bool setSsrKnob(SettingsConf &conf, const SsrKnob &knob, const SsrValue &value) 
 
 void resetSsrKnob(SettingsConf &conf, const SsrKnob &knob) { conf.remove(knob.env); }
 
+// --- Macros ----------------------------------------------------------------
+
+QString macrosPath(const QString &profile) { return profileDir(profile) + QStringLiteral("/macros.json"); }
+
+namespace {
+
+// The step kinds as the file names them, and the client reads them.
+struct KindName {
+    StepKind kind;
+    const char *name;
+};
+const KindName kKindNames[] = {
+    {StepKind::Tap, "tap"},         {StepKind::KeyDown, "keydown"},       {StepKind::KeyUp, "keyup"},
+    {StepKind::Move, "move"},       {StepKind::Click, "click"},           {StepKind::ButtonDown, "buttondown"},
+    {StepKind::ButtonUp, "buttonup"}, {StepKind::Scroll, "scroll"},       {StepKind::Text, "text"},
+    {StepKind::Wait, "wait"},
+};
+
+QString kindName(StepKind kind) {
+    for (const KindName &k : kKindNames)
+        if (k.kind == kind)
+            return QString::fromLatin1(k.name);
+    return QStringLiteral("tap");
+}
+
+std::optional<StepKind> kindFromName(const QString &name) {
+    for (const KindName &k : kKindNames)
+        if (name == QLatin1String(k.name))
+            return k.kind;
+    return std::nullopt;
+}
+
+bool isKeyStep(StepKind k) { return k == StepKind::Tap || k == StepKind::KeyDown || k == StepKind::KeyUp; }
+bool isButtonStep(StepKind k) {
+    return k == StepKind::Click || k == StepKind::ButtonDown || k == StepKind::ButtonUp;
+}
+bool isPointStep(StepKind k) { return isButtonStep(k) || k == StepKind::Move || k == StepKind::Scroll; }
+
+} // namespace
+
+const QList<KeyName> &keyNames() {
+    // A fixed, curated set: the keys a game macro usually wants, each with its
+    // Linux evdev code. The file stores the code; this names it both ways.
+    static const QList<KeyName> table = [] {
+        QList<KeyName> t;
+        const auto add = [&](int evdev, const char *label) { t.append({evdev, QString::fromLatin1(label)}); };
+        add(30, "A"); add(48, "B"); add(46, "C"); add(32, "D"); add(18, "E"); add(33, "F");
+        add(34, "G"); add(35, "H"); add(23, "I"); add(36, "J"); add(37, "K"); add(38, "L");
+        add(50, "M"); add(49, "N"); add(24, "O"); add(25, "P"); add(16, "Q"); add(19, "R");
+        add(31, "S"); add(20, "T"); add(22, "U"); add(47, "V"); add(17, "W"); add(45, "X");
+        add(21, "Y"); add(44, "Z");
+        add(2, "1"); add(3, "2"); add(4, "3"); add(5, "4"); add(6, "5"); add(7, "6");
+        add(8, "7"); add(9, "8"); add(10, "9"); add(11, "0");
+        add(57, "Space"); add(28, "Enter"); add(15, "Tab"); add(1, "Escape"); add(14, "Backspace");
+        add(58, "Caps Lock"); add(29, "Left Ctrl"); add(97, "Right Ctrl"); add(42, "Left Shift");
+        add(54, "Right Shift"); add(56, "Left Alt"); add(100, "Right Alt");
+        add(103, "Up"); add(108, "Down"); add(105, "Left"); add(106, "Right");
+        add(110, "Insert"); add(111, "Delete"); add(102, "Home"); add(107, "End");
+        add(104, "Page Up"); add(109, "Page Down");
+        add(12, "Minus"); add(13, "Equals"); add(26, "Left Bracket"); add(27, "Right Bracket");
+        add(39, "Semicolon"); add(40, "Quote"); add(41, "Backtick"); add(43, "Backslash");
+        add(51, "Comma"); add(52, "Period"); add(53, "Slash");
+        add(59, "F1"); add(60, "F2"); add(61, "F3"); add(62, "F4"); add(63, "F5"); add(64, "F6");
+        add(65, "F7"); add(66, "F8"); add(67, "F9"); add(68, "F10"); add(87, "F11"); add(88, "F12");
+        return t;
+    }();
+    return table;
+}
+
+QString keyLabel(int evdev) {
+    for (const KeyName &k : keyNames())
+        if (k.evdev == evdev)
+            return k.label;
+    return QStringLiteral("Key %1").arg(evdev);
+}
+
+int keyEvdev(const QString &label) {
+    for (const KeyName &k : keyNames())
+        if (k.label == label)
+            return k.evdev;
+    return -1;
+}
+
+QString checkMacroName(const QString &name) {
+    if (name.trimmed().isEmpty())
+        return QStringLiteral("A macro needs a name.");
+    return QString();
+}
+
+QString checkMacro(const MacroDef &m) {
+    if (const QString why = checkMacroName(m.name); !why.isEmpty())
+        return why;
+    if (m.triggerEvdev < 1 || m.triggerEvdev > 255)
+        return QStringLiteral("Pick a trigger key.");
+    if (m.steps.isEmpty())
+        return QStringLiteral("A macro needs at least one step.");
+    for (int i = 0; i < m.steps.size(); ++i) {
+        const MacroStep &s = m.steps[i];
+        if (isKeyStep(s.kind) && (s.evdev < 1 || s.evdev > 255))
+            return QStringLiteral("Step %1 has no key.").arg(i + 1);
+        if (s.kind == StepKind::Text && s.text.isEmpty())
+            return QStringLiteral("Step %1 has no text.").arg(i + 1);
+    }
+    return QString();
+}
+
+QString describeStep(const MacroStep &step) {
+    const auto mods = [&] {
+        QStringList m;
+        if (step.ctrl)
+            m << QStringLiteral("Ctrl");
+        if (step.shift)
+            m << QStringLiteral("Shift");
+        if (step.alt)
+            m << QStringLiteral("Alt");
+        m << keyLabel(step.evdev);
+        return m.join(QStringLiteral(" + "));
+    };
+    const auto button = [&] {
+        switch (step.button) {
+        case 2:
+            return QStringLiteral("right");
+        case 3:
+            return QStringLiteral("middle");
+        default:
+            return QStringLiteral("left");
+        }
+    };
+    const QString xy = QStringLiteral("%1, %2").arg(step.x).arg(step.y);
+    switch (step.kind) {
+    case StepKind::Tap:
+        return QStringLiteral("Tap  %1").arg(mods());
+    case StepKind::KeyDown:
+        return QStringLiteral("Hold  %1").arg(mods());
+    case StepKind::KeyUp:
+        return QStringLiteral("Release  %1").arg(mods());
+    case StepKind::Move:
+        return QStringLiteral("Move  %1").arg(xy);
+    case StepKind::Click:
+        return QStringLiteral("Click %1  at %2").arg(button(), xy);
+    case StepKind::ButtonDown:
+        return QStringLiteral("Press %1  at %2").arg(button(), xy);
+    case StepKind::ButtonUp:
+        return QStringLiteral("Let go %1  at %2").arg(button(), xy);
+    case StepKind::Scroll:
+        return QStringLiteral("Scroll  %1 at %2").arg(step.detents).arg(xy);
+    case StepKind::Text:
+        return QStringLiteral("Type  \"%1\"").arg(step.text);
+    case StepKind::Wait:
+        return QStringLiteral("Wait  %1 ms").arg(step.ms);
+    }
+    return QString();
+}
+
+namespace {
+
+std::optional<MacroStep> parseStep(const QJsonObject &o, QString *why) {
+    const auto fail = [&](const QString &m) -> std::optional<MacroStep> {
+        if (why)
+            *why = m;
+        return std::nullopt;
+    };
+    const std::optional<StepKind> kind = kindFromName(o.value(QStringLiteral("type")).toString());
+    if (!kind)
+        return fail(QStringLiteral("unknown step type %1").arg(o.value(QStringLiteral("type")).toString()));
+    MacroStep s;
+    s.kind = *kind;
+    if (isKeyStep(s.kind)) {
+        if (!o.value(QStringLiteral("key")).isDouble())
+            return fail(QStringLiteral("a key step needs a \"key\" code"));
+        s.evdev = o.value(QStringLiteral("key")).toInt();
+        if (s.evdev < 1 || s.evdev > 255)
+            return fail(QStringLiteral("key %1 is not an evdev code 1..255").arg(s.evdev));
+        s.ctrl = o.value(QStringLiteral("ctrl")).toBool();
+        s.shift = o.value(QStringLiteral("shift")).toBool();
+        s.alt = o.value(QStringLiteral("alt")).toBool();
+    }
+    if (isPointStep(s.kind)) {
+        if (!o.value(QStringLiteral("x")).isDouble() || !o.value(QStringLiteral("y")).isDouble())
+            return fail(QStringLiteral("this step needs \"x\" and \"y\""));
+        s.x = o.value(QStringLiteral("x")).toDouble();
+        s.y = o.value(QStringLiteral("y")).toDouble();
+    }
+    if (isButtonStep(s.kind))
+        s.button = o.contains(QStringLiteral("button")) ? o.value(QStringLiteral("button")).toInt() : 1;
+    if (s.kind == StepKind::Scroll) {
+        if (!o.value(QStringLiteral("detents")).isDouble())
+            return fail(QStringLiteral("a scroll needs \"detents\""));
+        s.detents = o.value(QStringLiteral("detents")).toDouble();
+    }
+    if (s.kind == StepKind::Text) {
+        s.text = o.value(QStringLiteral("text")).toString();
+        if (s.text.isEmpty())
+            return fail(QStringLiteral("empty text"));
+    }
+    if (s.kind == StepKind::Wait) {
+        if (!o.value(QStringLiteral("ms")).isDouble())
+            return fail(QStringLiteral("a wait needs \"ms\""));
+        const double ms = o.value(QStringLiteral("ms")).toDouble();
+        s.ms = quint64(qBound(0.0, ms, 3600000.0));
+    }
+    return s;
+}
+
+std::optional<MacroDef> parseMacro(const QJsonValue &value, QString *why) {
+    const auto fail = [&](const QString &m) -> std::optional<MacroDef> {
+        if (why)
+            *why = m;
+        return std::nullopt;
+    };
+    if (!value.isObject())
+        return fail(QStringLiteral("each macro must be a JSON object"));
+    const QJsonObject o = value.toObject();
+    MacroDef m;
+    m.name = o.value(QStringLiteral("name")).toString().trimmed();
+    if (m.name.isEmpty())
+        return fail(QStringLiteral("a macro needs a name"));
+    const QJsonValue trig = o.value(QStringLiteral("trigger"));
+    if (!trig.isObject())
+        return fail(QStringLiteral("the trigger must be a JSON object"));
+    const QJsonObject to = trig.toObject();
+    if (!to.value(QStringLiteral("key")).isDouble())
+        return fail(QStringLiteral("the trigger needs a \"key\" code"));
+    m.triggerEvdev = to.value(QStringLiteral("key")).toInt();
+    if (m.triggerEvdev < 1 || m.triggerEvdev > 255)
+        return fail(QStringLiteral("trigger key %1 is not an evdev code 1..255").arg(m.triggerEvdev));
+    m.triggerCtrl = to.value(QStringLiteral("ctrl")).toBool();
+    m.triggerShift = to.value(QStringLiteral("shift")).toBool();
+    m.triggerAlt = to.value(QStringLiteral("alt")).toBool();
+    m.enabled = o.contains(QStringLiteral("enabled")) ? o.value(QStringLiteral("enabled")).toBool() : true;
+    m.swallow = o.value(QStringLiteral("swallow")).toBool();
+    m.repeat = o.value(QStringLiteral("repeat")).toBool();
+    const QJsonValue steps = o.value(QStringLiteral("steps"));
+    if (!steps.isArray())
+        return fail(QStringLiteral("a macro needs a \"steps\" array"));
+    const QJsonArray arr = steps.toArray();
+    for (int i = 0; i < arr.size(); ++i) {
+        QString stepWhy;
+        const auto step = parseStep(arr[i].toObject(), &stepWhy);
+        if (!step)
+            return fail(QStringLiteral("step %1: %2").arg(i + 1).arg(stepWhy));
+        m.steps.append(*step);
+    }
+    if (m.steps.isEmpty())
+        return fail(QStringLiteral("a macro needs at least one step"));
+    return m;
+}
+
+QJsonObject stepToJson(const MacroStep &s) {
+    QJsonObject o;
+    o.insert(QStringLiteral("type"), kindName(s.kind));
+    if (isKeyStep(s.kind)) {
+        o.insert(QStringLiteral("key"), s.evdev);
+        if (s.ctrl)
+            o.insert(QStringLiteral("ctrl"), true);
+        if (s.shift)
+            o.insert(QStringLiteral("shift"), true);
+        if (s.alt)
+            o.insert(QStringLiteral("alt"), true);
+    }
+    if (isPointStep(s.kind)) {
+        o.insert(QStringLiteral("x"), s.x);
+        o.insert(QStringLiteral("y"), s.y);
+    }
+    if (isButtonStep(s.kind) && s.button != 1)
+        o.insert(QStringLiteral("button"), s.button);
+    if (s.kind == StepKind::Scroll)
+        o.insert(QStringLiteral("detents"), s.detents);
+    if (s.kind == StepKind::Text)
+        o.insert(QStringLiteral("text"), s.text);
+    if (s.kind == StepKind::Wait)
+        o.insert(QStringLiteral("ms"), double(s.ms));
+    return o;
+}
+
+} // namespace
+
+bool parseMacros(const QByteArray &data, QList<MacroDef> *out, QString *error, QStringList *skipped) {
+    out->clear();
+    if (skipped)
+        skipped->clear();
+    if (data.trimmed().isEmpty())
+        return true;
+    QJsonParseError perr{};
+    const QJsonDocument doc = QJsonDocument::fromJson(data, &perr);
+    if (perr.error != QJsonParseError::NoError) {
+        if (error)
+            *error = QStringLiteral("not valid JSON: %1").arg(perr.errorString());
+        return false;
+    }
+    if (!doc.isObject()) {
+        if (error)
+            *error = QStringLiteral("the document must be a JSON object");
+        return false;
+    }
+    const QJsonValue list = doc.object().value(QStringLiteral("macros"));
+    if (list.isUndefined() || list.isNull())
+        return true;
+    if (!list.isArray()) {
+        if (error)
+            *error = QStringLiteral("\"macros\" must be an array");
+        return false;
+    }
+    const QJsonArray arr = list.toArray();
+    for (int i = 0; i < arr.size(); ++i) {
+        QString why;
+        const auto m = parseMacro(arr[i], &why);
+        if (m)
+            out->append(*m);
+        else if (skipped)
+            skipped->append(QStringLiteral("macro %1: %2").arg(i + 1).arg(why));
+    }
+    return true;
+}
+
+MacrosFile loadMacros(const QString &path) {
+    MacrosFile file;
+    QFile f(path);
+    if (!f.exists())
+        return file;
+    file.exists = true;
+    if (!f.open(QIODevice::ReadOnly)) {
+        file.error = QStringLiteral("%1: %2").arg(path, f.errorString());
+        return file;
+    }
+    if (!parseMacros(f.readAll(), &file.macros, &file.error, &file.skipped))
+        file.macros.clear();
+    return file;
+}
+
+bool saveMacros(const QString &path, const QList<MacroDef> &macros, QString *error) {
+    QJsonArray arr;
+    for (const MacroDef &m : macros) {
+        QJsonObject o;
+        o.insert(QStringLiteral("name"), m.name);
+        o.insert(QStringLiteral("enabled"), m.enabled);
+        QJsonObject trig;
+        trig.insert(QStringLiteral("key"), m.triggerEvdev);
+        if (m.triggerCtrl)
+            trig.insert(QStringLiteral("ctrl"), true);
+        if (m.triggerShift)
+            trig.insert(QStringLiteral("shift"), true);
+        if (m.triggerAlt)
+            trig.insert(QStringLiteral("alt"), true);
+        o.insert(QStringLiteral("trigger"), trig);
+        if (m.swallow)
+            o.insert(QStringLiteral("swallow"), true);
+        if (m.repeat)
+            o.insert(QStringLiteral("repeat"), true);
+        QJsonArray steps;
+        for (const MacroStep &s : m.steps)
+            steps.append(stepToJson(s));
+        o.insert(QStringLiteral("steps"), steps);
+        arr.append(o);
+    }
+    QJsonObject root;
+    root.insert(QStringLiteral("intoxicated-macros"), 1);
+    root.insert(QStringLiteral("macros"), arr);
+    return writeAtomically(path, QJsonDocument(root).toJson(QJsonDocument::Indented), error);
+}
+
 } // namespace intox

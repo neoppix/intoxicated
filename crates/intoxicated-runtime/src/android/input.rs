@@ -1691,6 +1691,13 @@ pub fn engine_wants_pointer_lock() -> Option<bool> {
 /// One X key event from the window.
 pub fn host_key(handle: i64, key: &HostKey) {
     let focused = ga::focused_textbox().is_some();
+    // A macro trigger is matched here, on the real key the window delivered, so
+    // it only ever fires with the Roblox window focused. A swallowing macro's
+    // trigger (its press, its auto-repeat and its release) is kept from the
+    // engine; every other key goes on as before.
+    if crate::macros::intercept(key.down, key.x_keycode, key.state, focused) {
+        return;
+    }
     with_core(Some(handle), |c| c.host_key(key, focused));
 }
 
