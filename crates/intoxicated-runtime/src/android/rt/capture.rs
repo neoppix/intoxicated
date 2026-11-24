@@ -176,6 +176,9 @@ pub(crate) fn capacity_triangles() -> u64 {
     })
 }
 
+/// The most a dump copies to the host (the first triangles of the frame).
+const DUMP_BYTES: u64 = 128 << 20;
+
 /// Bytes a triangle of room takes over every buffer sized by it.
 pub(crate) const BYTES_PER_TRIANGLE: u64 = 600;
 
@@ -1196,7 +1199,8 @@ pub(crate) fn pass_ended(cmd: *mut c_void) {
         ACCESS_TRANSFER_READ | ACCESS_SHADER_READ,
     );
     let bytes = g.bytes;
-    if dumping && g.readback_size >= 256 + g.capacity && bytes > 0 {
+    if dumping && g.readback_size > 256 && bytes > 0 {
+        let bytes = bytes.min(g.readback_size - 256) / TRIANGLE_BYTES * TRIANGLE_BYTES;
         let region = [0u64, 256, bytes];
         (g.fns.copy_buffer)(cmd, g.xfb.buffer, g.readback.buffer, 1, region.as_ptr());
         g.barrier(cmd, PIPELINE_STAGE_TRANSFER, PIPELINE_STAGE_HOST, ACCESS_TRANSFER_WRITE, ACCESS_HOST_READ);
@@ -1440,11 +1444,12 @@ pub(crate) fn stats_line() -> String {
     let st = state();
     let s = &st.stats;
     let bytes = LAST_BYTES.load(Relaxed);
+    let failed = st.failed.last().map_or(String::new(), |(_, why)| format!(" capture_failed={why:?}"));
     format!(
         "triangles={} capacity={} frames={} begins={} binds_captured={} binds_skipped={} draws_captured={} draws_skipped={} \
-         draws_overflowed={} draws_clipped={} draws_textured={} textures={} vs_instrumented={} vs_left={} pipelines_captured={} pipelines_skipped={} frame={}",
+         draws_overflowed={} draws_clipped={} draws_textured={} textures={} vs_instrumented={} vs_left={} pipelines_captured={} pipelines_skipped={} frame={}{}",
         bytes / TRIANGLE_BYTES,
-        capacity_triangles(),
+        st.gpus.first().map_or(capacity_triangles(), |g| g.capacity / TRIANGLE_BYTES),
         s.frames,
         s.begins,
         s.binds_captured,
@@ -1460,6 +1465,7 @@ pub(crate) fn stats_line() -> String {
         s.pipelines_captured,
         s.pipelines_skipped,
         st.last_log,
+        failed,
     )
 }
 
@@ -1494,7 +1500,7 @@ pub(crate) fn dump(path: &str) -> Result<String, String> {
     }
     let st = state();
     let g = st.gpus.first().ok_or("no capture on any device")?;
-    let bytes = DUMPED_BYTES.load(Relaxed).min(g.capacity);
+    let bytes = DUMPED_BYTES.load(Relaxed).min(g.readback_size - 256);
     // SAFETY: our mapping of `readback_size` bytes; the copy into it is done
     // (six presents later).
     let data = unsafe { std::slice::from_raw_parts((g.readback_ptr + 256) as *const u8, bytes as usize).to_vec() };
@@ -1629,7 +1635,20 @@ fn ensure_gpu(st: &mut State, device: usize) -> Result<(), String> {
     if let Some((_, why)) = st.failed.iter().find(|(d, _)| *d == device) {
         return Err(why.clone());
     }
-    match make_gpu(device) {
+    // The room the budget asks for, else half as much and so on, down to the
+    // least: a failed allocation must not leave nothing captured.
+    let mut triangles = capacity_triangles();
+    let made = loop {
+        match make_gpu(device, triangles) {
+            Ok(g) => break Ok(g),
+            Err(why) if triangles > 1 << 17 => {
+                st.once(format!("room for {triangles} triangles could not be made ({why}); trying half"));
+                triangles /= 2;
+            }
+            Err(why) => break Err(why),
+        }
+    };
+    match made {
         Ok(g) => {
             st.once(format!(
                 "capturing the scene on device 0x{device:x}: room for {} triangles ({} MiB)",
@@ -1646,7 +1665,7 @@ fn ensure_gpu(st: &mut State, device: usize) -> Result<(), String> {
     }
 }
 
-fn make_gpu(device: usize) -> Result<Gpu, String> {
+fn make_gpu(device: usize, triangles: u64) -> Result<Gpu, String> {
     let (current, _) = frame_capture::current_device().ok_or("no Vulkan device is known")?;
     if current != device {
         return Err("the scene is on another device than the one the client follows".into());
@@ -1654,8 +1673,11 @@ fn make_gpu(device: usize) -> Result<Gpu, String> {
     let d = device as Dev;
     let fns = Fns::resolve(d)?;
     let types = memory_types()?;
-    let capacity = capacity_triangles() * TRIANGLE_BYTES;
-    let readback_size = if dump_dir().is_some() { 256 + capacity } else { 256 };
+    let capacity = triangles * TRIANGLE_BYTES;
+    // A dump's host copy is held to DUMP_BYTES: host-visible memory is
+    // scarcer than the device's, and the whole capture (hundreds of MiB once
+    // sized from the video memory) found none, so nothing was captured.
+    let readback_size = if dump_dir().is_some() { 256 + capacity.min(DUMP_BYTES) } else { 256 };
     let mut g = Gpu {
         device,
         fns,
