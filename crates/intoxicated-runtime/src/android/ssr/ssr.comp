@@ -544,8 +544,10 @@ uint env_texel(vec3 d) {
     return t.y * ENV_SIZE + t.x;
 }
 
-// The sky in world direction `d`: as the screen last showed it there, else
-// the sky's average, else nothing (alpha 0).
+// The sky in world direction `d`, as the screen showed it there (at least
+// four times), else nothing (alpha 0): a direction the screen never showed
+// sky in may well have a ceiling the game never drew, and the sky's average
+// there lit whole floors pale.
 vec4 environment(vec3 d) {
     // Flags bit 5: the environment is off.
     if ((pc.flags & 32u) != 0u) {
@@ -553,10 +555,10 @@ vec4 environment(vec3 d) {
     }
     uvec4 e = env[env_texel(d)];
     vec2 bw = unpackHalf2x16(e.y);
-    if (e.z == gen && bw.y > 0.0) {
+    if (e.z == gen && bw.y >= 4.0) {
         return vec4(unpackHalf2x16(e.x), bw.x, 1.0);
     }
-    return sky.w > 0.0 ? vec4(sky.rgb, 1.0) : vec4(0.0);
+    return vec4(0.0);
 }
 // Six vec4 a triangle (see `rt/build.comp`).
 layout(std430, set = 1, binding = 8) readonly buffer Tris { vec4 tris[]; };
