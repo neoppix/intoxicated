@@ -25,13 +25,21 @@ const GLSLC: &str = "/usr/local/bin/glslc";
 /// module includes. The flags are the ones each source's header names; a
 /// test (`ssr::tests`) compiles every entry again and compares it with the
 /// committed file.
-const SHADERS: [(&str, &str, &[&str]); 6] = [
+const SHADERS: [(&str, &str, &[&str]); 14] = [
     ("depth_capture/resolve.comp", "depth_capture/resolve_ms", &[]),
     ("depth_capture/resolve.comp", "depth_capture/resolve_1x", &["-DSINGLE_SAMPLE"]),
     ("ssr/depth.comp", "ssr/depth_ms", &[]),
     ("ssr/depth.comp", "ssr/depth_1x", &["-DSINGLE_SAMPLE"]),
     ("ssr/ssr.comp", "ssr/ssr", &[]),
     ("ssr/ssr.comp", "ssr/compose", &["-DCOMPOSE"]),
+    ("ssr/post.comp", "ssr/post_focus", &["-DFOCUS"]),
+    ("ssr/post.comp", "ssr/post_dof_prep", &["-DDOF_PREP"]),
+    ("ssr/post.comp", "ssr/post_dof_gather", &["-DDOF_GATHER"]),
+    ("ssr/post.comp", "ssr/post_dof_compose", &["-DDOF_COMPOSE"]),
+    ("ssr/post.comp", "ssr/post_bloom_prefilter", &["-DBLOOM_PREFILTER"]),
+    ("ssr/post.comp", "ssr/post_bloom_down", &["-DBLOOM_DOWN"]),
+    ("ssr/post.comp", "ssr/post_bloom_up", &["-DBLOOM_UP"]),
+    ("ssr/post.comp", "ssr/post_bloom_compose", &["-DBLOOM_COMPOSE"]),
 ];
 
 /// Each shader compiled by glslc when it is installed, so an edited source is

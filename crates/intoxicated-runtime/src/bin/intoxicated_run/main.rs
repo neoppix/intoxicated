@@ -4,8 +4,8 @@
 //!
 //! This file only sequences the steps; each lives in its module.
 //!
-//! 1. `--check-join-url`, `--print-default-flags` or `--print-ssr-looks`
-//!    alone, if it is the first argument ([`cli`]).
+//! 1. `--check-join-url`, `--print-default-flags`, `--print-ssr-looks` or
+//!    `--print-shader-looks` alone, if it is the first argument ([`cli`]).
 //! 2. The banner and the descriptor limit ([`startup`]).
 //! 3. The command line ([`cli`]): `--profile` is latched while it is read,
 //!    before anything can ask for the profile.
@@ -40,6 +40,7 @@ fn main() -> ExitCode {
         Some("--check-join-url") => return cli::check_join_url(),
         Some("--print-default-flags") => return cli::print_default_flags(),
         Some("--print-ssr-looks") => return cli::print_ssr_looks(),
+        Some("--print-shader-looks") => return cli::print_shader_looks(),
         _ => {}
     }
     // First line of every run: which build this is, and its licence. The full

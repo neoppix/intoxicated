@@ -15,6 +15,9 @@
 #   intoxicated --default-flags      # print the client's built-in flags as JSON
 #   intoxicated --ssr-looks          # print the reflections' knobs and looks
 #                                    # as JSON
+#   intoxicated --shader-looks       # the same for every effect drawn before
+#                                    # the HUD: reflections, depth of field,
+#                                    # bloom
 #   intoxicated --version            # print the client's version line
 #
 # INTOXICATED_PROFILE=<name> picks the profile (default: default).
@@ -187,6 +190,7 @@ case "${1:-}" in
   --default-flags) need_bin; "$BIN" --print-default-flags; exit $? ;;
   # The reflections' knobs and named looks, for the Shaders page, likewise.
   --ssr-looks) need_bin; "$BIN" --print-ssr-looks; exit $? ;;
+  --shader-looks) need_bin; "$BIN" --print-shader-looks; exit $? ;;
   # The first line of --help is the client's banner: name, version, licence.
   --version) need_bin; "$BIN" --help 2>/dev/null | head -n 1; exit 0 ;;
 esac

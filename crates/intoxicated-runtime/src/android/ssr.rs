@@ -1,6 +1,11 @@
 //! Screen-space reflections: `INTOXICATED_SSR=1`, and devctl `ssr` to turn
 //! them on and off, change how they look and read their GPU cost while the
-//! game runs.
+//! game runs. The same point of the frame also takes the depth of field
+//! (`INTOXICATED_DOF=1`, devctl `dof`) and the bloom (`INTOXICATED_BLOOM=1`,
+//! devctl `bloom`) of [`post`], each switched on its own, recorded in the
+//! order of [`EFFECTS`]: reflections, depth of field, bloom. Everything
+//! below about the frame, the match, what is put back and our objects holds
+//! for all three; a frame that does not match gets none of them.
 //!
 //! The engine's frame is not changed in any other way than this: a few
 //! commands of ours are recorded into its own command buffer, through the
@@ -50,12 +55,18 @@
 //! with `COMPOSE`) that blurs that over the pixel's own surface, blends it
 //! into the scene colour and writes every pixel, with a reflection blended in
 //! or unchanged, packed in the engine's colour format into a 32-bit image of
-//! ours; a copy of that image over the engine's; and a barrier that puts the
-//! engine's image back in the layout it was in. Reading needs `SAMPLED` and the copy
+//! ours; then the depth of field's and the bloom's dispatches when they are
+//! on ([`post`]), each reading the scene from that image (or from the
+//! engine's when nothing ran before it) and writing it back there; one copy
+//! of that image over the engine's; and a barrier that puts the engine's
+//! image back in the layout it was in. The depth copy is made when the
+//! reflections or the depth of field need it. Reading needs `SAMPLED` and the copy
 //! `TRANSFER_DST` on the engine's image; a resolve target has both (it was
 //! seen with `0x17`), and with SSR on, a candidate image created without them
 //! gets them added at `vkCreateImage` when its format supports them
-//! ([`widen_usage`]). Two timestamps around it feed `ssr stats`.
+//! ([`widen_usage`]). Six timestamps (before, after the depth copy and
+//! after each effect, after the copy back) feed each effect's `stats`, and
+//! the whole for all of them.
 //!
 //! # What is put back
 //!
@@ -122,7 +133,9 @@ use super::frame_capture::{
     self, device_fn, Dev, ImageMemoryBarrier, ImageSubresourceRange, MemoryAllocateInfo, MemoryBarrier,
     MemoryRequirements, PhysicalDeviceMemoryProperties,
 };
-use super::vk_layer::passes::{self, Pass, Target, WATCH, WATCH_SSR};
+use super::vk_layer::passes::{self, Pass, Target, WATCH, WATCH_POST};
+
+pub(crate) mod post;
 use super::vk_layer::registry::{self, Registry, UNUSED};
 
 // ------------------------------------------------------------- switches
@@ -140,19 +153,20 @@ pub(crate) enum Kind {
     Rgb { min: f32, max: f32 },
 }
 
-/// One look of the reflections, changed at run time.
+/// One look of an effect, changed at run time.
 pub(crate) struct Knob {
-    /// Its name in devctl `ssr set`.
+    /// Its name in devctl `<effect> set`.
     pub name: &'static str,
     pub env: &'static str,
     pub kind: Kind,
     /// Only the first value counts but for [`Kind::Rgb`].
     pub default: [f32; 3],
-    /// Where its value is kept in [`VALUES`]: one slot, three for a colour.
+    /// Where its value is kept in its effect's values: one slot, three for a
+    /// colour.
     pub slot: usize,
 }
 
-const fn knob(name: &'static str, env: &'static str, kind: Kind, default: [f32; 3], slot: usize) -> Knob {
+pub(crate) const fn knob(name: &'static str, env: &'static str, kind: Kind, default: [f32; 3], slot: usize) -> Knob {
     Knob { name, env, kind, default, slot }
 }
 
@@ -214,18 +228,20 @@ static ON: AtomicBool = AtomicBool::new(false);
 /// The knobs' values as `f32` bits, by slot.
 static VALUES: [AtomicU32; SLOTS] = [const { AtomicU32::new(0) }; SLOTS];
 
+#[cfg(test)]
 pub(crate) fn find(name: &str) -> Option<&'static Knob> {
-    KNOBS.iter().find(|k| k.name == name)
+    SSR.find(name)
 }
 
 /// The variable that starts from a look; the knobs' own variables then
 /// change it.
 pub const LOOK_ENV: &str = "INTOXICATED_SSR_LOOK";
 
-/// A named set of knob values, for the settings app's Shaders page,
-/// [`LOOK_ENV`] and devctl `ssr look <name>`. A look sets every knob it
-/// names to its value here and every other one to its default, but for the
-/// knobs in [`NOT_A_LOOK`], which stay as they are.
+/// A named set of knob values, for the settings app's Shaders page, an
+/// effect's look variable and devctl `<effect> look <name>`. A look sets
+/// every knob it names to its value here and every other one to its
+/// default, but for the knobs in its effect's `not_a_look`, which stay as
+/// they are.
 pub(crate) struct Look {
     pub name: &'static str,
     /// One line for the Shaders page, under the look's button.
@@ -281,35 +297,315 @@ pub(crate) const LOOKS: [Look; 5] = [
     },
 ];
 
-/// What look `name` does to each knob, in [`KNOBS`] order: its new value, or
-/// `None` to leave it.
-pub(crate) fn look_values(name: &str) -> Option<Vec<Option<[f32; 3]>>> {
-    let look = LOOKS.iter().find(|l| l.name == name)?;
-    Some(
-        KNOBS
+pub(crate) const USAGE: &str = "ssr on|off|stats|get|reset|look <name>|intensity <0..1>|set <name> <value>; names: \
+     intensity roughness fresnel up_only up_threshold max_distance edge_fade darken tint steps thickness fov keep_colour; \
+     looks: competitive wet_road clean_mirror puddles glossy";
+
+/// One of the effects recorded before the swapchain pass: its switch, its
+/// knobs and looks and where their values live. [`SSR`] here,
+/// [`post::DOF`] and [`post::BLOOM`] beside it, in the order they are
+/// recorded ([`EFFECTS`]).
+pub(crate) struct Effect {
+    /// Its devctl verb and the name its log lines carry.
+    pub name: &'static str,
+    /// What the Shaders page calls it, and one line on what it does.
+    pub title: &'static str,
+    pub summary: &'static str,
+    /// Its place in [`EFFECTS`], the order of recording.
+    pub index: usize,
+    /// The switch and the look variable.
+    pub env: &'static str,
+    pub look_env: &'static str,
+    pub knobs: &'static [Knob],
+    /// The default first.
+    pub looks: &'static [Look],
+    /// Knobs a look leaves as they are.
+    pub not_a_look: &'static [&'static str],
+    /// The knobs' values as `f32` bits, by slot.
+    pub values: &'static [AtomicU32],
+    pub on: &'static AtomicBool,
+    pub usage: &'static str,
+}
+
+pub(crate) static SSR: Effect = Effect {
+    name: "ssr",
+    title: "Reflections (SSR)",
+    summary: "Real reflections from the game's own depth, for about 0.5 ms of GPU time a frame. Only what is on \
+              screen can be reflected.",
+    index: 0,
+    env: ENV,
+    look_env: LOOK_ENV,
+    knobs: &KNOBS,
+    looks: &LOOKS,
+    not_a_look: &NOT_A_LOOK,
+    values: &VALUES,
+    on: &ON,
+    usage: USAGE,
+};
+
+/// Every effect, in the order their work is recorded: the reflections
+/// change the scene first, the depth of field then blurs it, reflections
+/// included, and the bloom glows over the result, so a light blurred out of
+/// focus glows as the soft disc it has become, not as the sharp point it
+/// was.
+pub(crate) static EFFECTS: [&Effect; 3] = [&SSR, &post::DOF, &post::BLOOM];
+
+/// The effect a devctl verb names.
+pub(crate) fn effect(name: &str) -> Option<&'static Effect> {
+    EFFECTS.iter().copied().find(|fx| fx.name == name)
+}
+
+/// What the environment asks for: on or off, every knob's value, and a line
+/// for each value that was not understood (and left at its default).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Settings {
+    pub on: bool,
+    pub values: Vec<[f32; 3]>,
+    pub warnings: Vec<String>,
+}
+
+/// One devctl command for an effect.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Command {
+    On,
+    Off,
+    /// A knob and its new value.
+    Set(&'static str, [f32; 3]),
+    /// Every knob back to its built-in default.
+    Reset,
+    /// A look, by name.
+    Look(&'static str),
+    /// The knobs' values.
+    Get,
+    Stats,
+}
+
+impl Effect {
+    pub(crate) fn find(&self, name: &str) -> Option<&'static Knob> {
+        self.knobs.iter().find(|k| k.name == name)
+    }
+
+    pub(crate) fn is_on(&self) -> bool {
+        self.on.load(Relaxed)
+    }
+
+    pub(crate) fn get(&self, k: &Knob) -> [f32; 3] {
+        let mut v = [0.0; 3];
+        for (i, slot) in v.iter_mut().enumerate().take(k.width()) {
+            *slot = f32::from_bits(self.values[k.slot + i].load(Relaxed));
+        }
+        v
+    }
+
+    fn set(&self, k: &Knob, v: [f32; 3]) {
+        for (i, value) in v.iter().enumerate().take(k.width()) {
+            self.values[k.slot + i].store(value.to_bits(), Relaxed);
+        }
+    }
+
+    /// Every knob's value now, as [`Effect::knobs`] orders them.
+    pub(crate) fn current(&self) -> Vec<[f32; 3]> {
+        self.knobs.iter().map(|k| self.get(k)).collect()
+    }
+
+    /// What look `name` does to each knob, in knob order: its new value, or
+    /// `None` to leave it.
+    pub(crate) fn look_values(&self, name: &str) -> Option<Vec<Option<[f32; 3]>>> {
+        let look = self.looks.iter().find(|l| l.name == name)?;
+        Some(
+            self.knobs
+                .iter()
+                .map(|k| {
+                    let named = look.values.iter().find(|(n, _)| *n == k.name).map(|&(_, v)| v);
+                    if self.not_a_look.contains(&k.name) {
+                        named
+                    } else {
+                        Some(named.unwrap_or(k.default))
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// Every knob's value at start from look `name` (in knob order), before
+    /// the knobs' own variables: what the look sets, the default for the
+    /// rest.
+    fn start_values(&self, name: &str) -> Option<Vec<[f32; 3]>> {
+        let look = self.look_values(name)?;
+        Some(self.knobs.iter().zip(look).map(|(k, v)| v.unwrap_or(k.default)).collect())
+    }
+
+    fn look_names(&self) -> String {
+        self.looks.iter().map(|l| l.name).collect::<Vec<_>>().join(" ")
+    }
+
+    /// The effect as one JSON object: the switch and look variables, every
+    /// knob (its name, variable, kind, range and default) and every look
+    /// with the value it starts each knob at, the default look named.
+    pub(crate) fn json(&self) -> serde_json::Value {
+        use serde_json::{json, Value};
+        let knobs: Vec<Value> = self
+            .knobs
             .iter()
             .map(|k| {
-                let named = look.values.iter().find(|(n, _)| *n == k.name).map(|&(_, v)| v);
-                if NOT_A_LOOK.contains(&k.name) {
-                    named
-                } else {
-                    Some(named.unwrap_or(k.default))
-                }
+                let (kind, min, max) = match k.kind {
+                    Kind::Number { min, max } => ("number", json_number(min), json_number(max)),
+                    Kind::Whole { min, max } => ("whole", json!(min), json!(max)),
+                    Kind::Switch => ("switch", json!(0), json!(1)),
+                    Kind::Rgb { min, max } => ("rgb", json_number(min), json_number(max)),
+                };
+                json!({
+                    "name": k.name,
+                    "env": k.env,
+                    "kind": kind,
+                    "min": min,
+                    "max": max,
+                    "default": json_value(k, k.default),
+                })
             })
-            .collect(),
-    )
+            .collect();
+        let looks: Vec<Value> = self
+            .looks
+            .iter()
+            .map(|l| {
+                let start = self.start_values(l.name).expect("a look of the table");
+                let values: serde_json::Map<String, Value> =
+                    self.knobs.iter().zip(start).map(|(k, v)| (k.name.to_string(), json_value(k, v))).collect();
+                json!({ "name": l.name, "description": l.description, "values": values })
+            })
+            .collect();
+        json!({
+            "switch": self.env,
+            "look_env": self.look_env,
+            "default_look": self.looks[0].name,
+            "knobs": knobs,
+            "looks": looks,
+        })
+    }
+
+    pub(crate) fn parse_settings(&self, var: impl Fn(&str) -> Option<String>) -> Settings {
+        let (name, env, look_env) = (self.name, self.env, self.look_env);
+        let mut warnings = Vec::new();
+        let on = match var(env).as_deref().map(str::trim) {
+            None | Some("" | "0") => false,
+            Some("1") => true,
+            Some(v) => {
+                warnings.push(format!("[android] vulkan: {name}: {env}={v:?} is not understood; leaving it off"));
+                false
+            }
+        };
+        let defaults = || self.knobs.iter().map(|k| k.default).collect();
+        let start: Vec<[f32; 3]> = match var(look_env).as_deref().map(str::trim) {
+            None | Some("") => defaults(),
+            Some(look) => match self.start_values(look) {
+                Some(values) => values,
+                None => {
+                    warnings.push(format!(
+                        "[android] vulkan: {name}: {look_env}={look:?} is not a look ({}); using the defaults",
+                        self.look_names()
+                    ));
+                    defaults()
+                }
+            },
+        };
+        let values = self
+            .knobs
+            .iter()
+            .zip(start)
+            .map(|(k, start)| match var(k.env).filter(|v| !v.trim().is_empty()) {
+                None => start,
+                Some(v) => k.parse(&v).unwrap_or_else(|why| {
+                    warnings.push(format!("[android] vulkan: {name}: {}: {why}; using {}", k.env, k.show(start)));
+                    start
+                }),
+            })
+            .collect();
+        Settings { on, values, warnings }
+    }
+
+    /// Set the switch and the knobs from the environment and say what was
+    /// asked for; whether the effect is on.
+    fn start_from(&self, var: impl Fn(&str) -> Option<String>) -> bool {
+        let s = self.parse_settings(var);
+        for w in &s.warnings {
+            println!("{w}");
+        }
+        for (k, v) in self.knobs.iter().zip(&s.values) {
+            self.set(k, *v);
+        }
+        if s.on {
+            println!("[android] vulkan: {}: on ({}=1): {}", self.name, self.env, self.values_line());
+        }
+        self.on.store(s.on, Relaxed);
+        s.on
+    }
+
+    /// Every knob as `name=value`.
+    fn values_line(&self) -> String {
+        self.knobs.iter().map(|k| format!("{}={}", k.name, k.show(self.get(k)))).collect::<Vec<_>>().join(" ")
+    }
+
+    pub(crate) fn parse_command(&self, args: &[&str]) -> Result<Command, String> {
+        let set = |name: &str, v: &str| {
+            let k = self.find(name).ok_or_else(|| format!("no knob {name:?}; {}", self.usage))?;
+            Ok(Command::Set(k.name, k.parse(v)?))
+        };
+        match args {
+            ["on"] => Ok(Command::On),
+            ["off"] => Ok(Command::Off),
+            [] | ["stats"] => Ok(Command::Stats),
+            ["get"] => Ok(Command::Get),
+            ["reset"] => Ok(Command::Reset),
+            ["look", name] => match self.looks.iter().find(|l| l.name == *name) {
+                Some(l) => Ok(Command::Look(l.name)),
+                None => Err(format!("no look {name:?}; looks: {}", self.look_names())),
+            },
+            ["intensity", v] if self.find("intensity").is_some() => set("intensity", v),
+            ["set", name, v] => set(name, v),
+            _ => Err(self.usage.into()),
+        }
+    }
+
+    /// devctl `<effect> ...`: the answer is the state after the command.
+    pub(crate) fn control(&self, args: &[&str]) -> Result<String, String> {
+        requested_at_start();
+        match self.parse_command(args)? {
+            Command::On => {
+                if !passes::wanted() {
+                    return Err(format!("the pass hooks are not handed out in this run (set {}=1 or dev control)", self.env));
+                }
+                set_on(self, true);
+            }
+            Command::Off => set_on(self, false),
+            Command::Set(name, v) => self.set(self.find(name).expect("parsed from the table"), v),
+            Command::Reset => self.knobs.iter().for_each(|k| self.set(k, k.default)),
+            Command::Look(name) => {
+                let look = self.look_values(name).expect("parsed from the table");
+                for (k, v) in self.knobs.iter().zip(look) {
+                    if let Some(v) = v {
+                        self.set(k, v);
+                    }
+                }
+            }
+            Command::Get => return Ok(format!("on={} {}", u8::from(self.is_on()), self.values_line())),
+            Command::Stats => {}
+        }
+        let st = state();
+        Ok(format!(
+            "on={} {} {}; all effects: {}",
+            u8::from(self.is_on()),
+            self.values_line(),
+            st.stats[self.index].summary(),
+            st.chain.summary()
+        ))
+    }
 }
 
-/// Every knob's value at start from look `name` (as [`KNOBS`] orders them),
-/// before the knobs' own variables: what the look sets, the default for the
-/// rest.
-fn start_values(name: &str) -> Option<Vec<[f32; 3]>> {
-    let look = look_values(name)?;
-    Some(KNOBS.iter().zip(look).map(|(k, v)| v.unwrap_or(k.default)).collect())
-}
-
-fn look_names() -> String {
-    LOOKS.iter().map(|l| l.name).collect::<Vec<_>>().join(" ")
+/// What look `name` does to each reflection knob; see
+/// [`Effect::look_values`].
+#[cfg(test)]
+pub(crate) fn look_values(name: &str) -> Option<Vec<Option<[f32; 3]>>> {
+    SSR.look_values(name)
 }
 
 /// A knob's value as JSON: a number (whole for a whole number or a switch),
@@ -329,49 +625,30 @@ fn json_number(f: f32) -> serde_json::Value {
     serde_json::Number::from_f64(shortest).map_or(serde_json::Value::Null, serde_json::Value::Number)
 }
 
-/// What `intoxicated-run --print-ssr-looks` prints, for Intoxicated
-/// Settings' Shaders page: the switch and look variables, every knob (its
-/// name, variable, kind, range and default) and every look with the value it
-/// starts each knob at, the default look named. One JSON object, so the page
-/// keeps no copy of [`KNOBS`] or [`LOOKS`].
+/// What `intoxicated-run --print-ssr-looks` prints: the reflections alone,
+/// as [`Effect::json`] writes them. One JSON object, so nothing outside
+/// keeps a copy of [`KNOBS`] or [`LOOKS`].
 pub fn looks_json() -> String {
-    use serde_json::{json, Value};
-    let knobs: Vec<Value> = KNOBS
+    serde_json::to_string_pretty(&SSR.json()).expect("a JSON value always serialises")
+}
+
+/// What `intoxicated-run --print-shader-looks` prints, for Intoxicated
+/// Settings' Shaders page: `{"effects": [...]}`, every effect in the order
+/// it is recorded, each as [`Effect::json`] writes it plus its devctl name,
+/// its title and a one-line summary.
+pub fn shader_looks_json() -> String {
+    let effects: Vec<serde_json::Value> = EFFECTS
         .iter()
-        .map(|k| {
-            let (kind, min, max) = match k.kind {
-                Kind::Number { min, max } => ("number", json_number(min), json_number(max)),
-                Kind::Whole { min, max } => ("whole", json!(min), json!(max)),
-                Kind::Switch => ("switch", json!(0), json!(1)),
-                Kind::Rgb { min, max } => ("rgb", json_number(min), json_number(max)),
-            };
-            json!({
-                "name": k.name,
-                "env": k.env,
-                "kind": kind,
-                "min": min,
-                "max": max,
-                "default": json_value(k, k.default),
-            })
+        .map(|fx| {
+            let mut v = fx.json();
+            let o = v.as_object_mut().expect("an effect is an object");
+            o.insert("name".into(), fx.name.into());
+            o.insert("title".into(), fx.title.into());
+            o.insert("summary".into(), fx.summary.into());
+            v
         })
         .collect();
-    let looks: Vec<Value> = LOOKS
-        .iter()
-        .map(|l| {
-            let start = start_values(l.name).expect("a look of the table");
-            let values: serde_json::Map<String, Value> =
-                KNOBS.iter().zip(start).map(|(k, v)| (k.name.to_string(), json_value(k, v))).collect();
-            json!({ "name": l.name, "description": l.description, "values": values })
-        })
-        .collect();
-    let doc = json!({
-        "switch": ENV,
-        "look_env": LOOK_ENV,
-        "default_look": LOOKS[0].name,
-        "knobs": knobs,
-        "looks": looks,
-    });
-    serde_json::to_string_pretty(&doc).expect("a JSON value always serialises")
+    serde_json::to_string_pretty(&serde_json::json!({ "effects": effects })).expect("a JSON value always serialises")
 }
 
 impl Knob {
@@ -412,21 +689,7 @@ impl Knob {
         }
     }
 
-    pub(crate) fn get(&self) -> [f32; 3] {
-        let mut v = [0.0; 3];
-        for (i, slot) in v.iter_mut().enumerate().take(self.width()) {
-            *slot = f32::from_bits(VALUES[self.slot + i].load(Relaxed));
-        }
-        v
-    }
-
-    fn set(&self, v: [f32; 3]) {
-        for (i, value) in v.iter().enumerate().take(self.width()) {
-            VALUES[self.slot + i].store(value.to_bits(), Relaxed);
-        }
-    }
-
-    /// The value as `ssr get` and the variables write it.
+    /// The value as `<effect> get` and the variables write it.
     pub(crate) fn show(&self, v: [f32; 3]) -> String {
         match self.kind {
             Kind::Rgb { .. } => format!("{},{},{}", v[0], v[1], v[2]),
@@ -435,156 +698,52 @@ impl Knob {
     }
 }
 
-/// What the environment asks for: on or off, every knob's value, and a line
-/// for each value that was not understood (and left at its default).
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Settings {
-    pub on: bool,
-    pub values: Vec<[f32; 3]>,
-    pub warnings: Vec<String>,
-}
-
+/// The reflections' settings from the environment; see
+/// [`Effect::parse_settings`].
+#[cfg(test)]
 pub(crate) fn parse_settings(var: impl Fn(&str) -> Option<String>) -> Settings {
-    let mut warnings = Vec::new();
-    let on = match var(ENV).as_deref().map(str::trim) {
-        None | Some("" | "0") => false,
-        Some("1") => true,
-        Some(v) => {
-            warnings.push(format!("[android] vulkan: ssr: {ENV}={v:?} is not understood; leaving it off"));
-            false
-        }
-    };
-    let start: Vec<[f32; 3]> = match var(LOOK_ENV).as_deref().map(str::trim) {
-        None | Some("") => KNOBS.iter().map(|k| k.default).collect(),
-        Some(name) => match start_values(name) {
-            Some(values) => values,
-            None => {
-                warnings.push(format!(
-                    "[android] vulkan: ssr: {LOOK_ENV}={name:?} is not a look ({}); using the defaults",
-                    look_names()
-                ));
-                KNOBS.iter().map(|k| k.default).collect()
-            }
-        },
-    };
-    let values = KNOBS
-        .iter()
-        .zip(start)
-        .map(|(k, start)| match var(k.env).filter(|v| !v.trim().is_empty()) {
-            None => start,
-            Some(v) => k.parse(&v).unwrap_or_else(|why| {
-                warnings.push(format!("[android] vulkan: ssr: {}: {why}; using {}", k.env, k.show(start)));
-                start
-            }),
-        })
-        .collect();
-    Settings { on, values, warnings }
+    SSR.parse_settings(var)
 }
 
-/// Read the environment once, set the switch and the knobs and say what was
-/// asked for. Whether reflections are on from the start.
+/// Read the environment once, set every effect's switch and knobs and say
+/// what was asked for. Whether any effect is on from the start.
 pub(crate) fn requested_at_start() -> bool {
     static AT_START: OnceLock<bool> = OnceLock::new();
     *AT_START.get_or_init(|| {
-        let s = parse_settings(|name| std::env::var(name).ok());
-        for w in &s.warnings {
-            println!("{w}");
+        let mut any = false;
+        for fx in EFFECTS {
+            any |= fx.start_from(|name| std::env::var(name).ok());
         }
-        for (k, v) in KNOBS.iter().zip(&s.values) {
-            k.set(*v);
-        }
-        if s.on {
-            println!("[android] vulkan: ssr: on ({ENV}=1): {}", values_line());
-        }
-        ON.store(s.on, Relaxed);
-        s.on
+        any
     })
 }
 
-/// Every knob as `name=value`.
-fn values_line() -> String {
-    KNOBS.iter().map(|k| format!("{}={}", k.name, k.show(k.get()))).collect::<Vec<_>>().join(" ")
-}
-
-/// Turn the effect on or off for the frames recorded from now on.
-fn set_on(on: bool) {
-    ON.store(on, Relaxed);
-    if on {
-        WATCH.fetch_or(WATCH_SSR, Relaxed);
+/// Turn an effect on or off for the frames recorded from now on; the
+/// recording hooks watch while any is on.
+fn set_on(fx: &Effect, on: bool) {
+    fx.on.store(on, Relaxed);
+    if EFFECTS.iter().any(|e| e.is_on()) {
+        WATCH.fetch_or(WATCH_POST, Relaxed);
     } else {
-        WATCH.fetch_and(!WATCH_SSR, Relaxed);
+        WATCH.fetch_and(!WATCH_POST, Relaxed);
     }
 }
 
 // ------------------------------------------------------------- devctl
 
-/// One devctl `ssr` command.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Command {
-    On,
-    Off,
-    /// A knob and its new value.
-    Set(&'static str, [f32; 3]),
-    /// Every knob back to its built-in default.
-    Reset,
-    /// A look from [`LOOKS`], by name.
-    Look(&'static str),
-    /// The knobs' values.
-    Get,
-    Stats,
-}
-
-pub(crate) const USAGE: &str = "ssr on|off|stats|get|reset|look <name>|intensity <0..1>|set <name> <value>; names: \
-     intensity roughness fresnel up_only up_threshold max_distance edge_fade darken tint steps thickness fov keep_colour; \
-     looks: competitive wet_road clean_mirror puddles glossy";
-
+#[cfg(test)]
 pub(crate) fn parse_command(args: &[&str]) -> Result<Command, String> {
-    let set = |name: &str, v: &str| {
-        let k = find(name).ok_or_else(|| format!("no knob {name:?}; {USAGE}"))?;
-        Ok(Command::Set(k.name, k.parse(v)?))
-    };
-    match args {
-        ["on"] => Ok(Command::On),
-        ["off"] => Ok(Command::Off),
-        [] | ["stats"] => Ok(Command::Stats),
-        ["get"] => Ok(Command::Get),
-        ["reset"] => Ok(Command::Reset),
-        ["look", name] => match LOOKS.iter().find(|l| l.name == *name) {
-            Some(l) => Ok(Command::Look(l.name)),
-            None => Err(format!("no look {name:?}; looks: {}", look_names())),
-        },
-        ["intensity", v] => set("intensity", v),
-        ["set", name, v] => set(name, v),
-        _ => Err(USAGE.into()),
-    }
+    SSR.parse_command(args)
 }
 
 /// devctl `ssr ...`: the answer is the state after the command.
 pub fn control(args: &[&str]) -> Result<String, String> {
-    requested_at_start();
-    match parse_command(args)? {
-        Command::On => {
-            if !passes::wanted() {
-                return Err(format!("the pass hooks are not handed out in this run (set {ENV}=1 or dev control)"));
-            }
-            set_on(true);
-        }
-        Command::Off => set_on(false),
-        Command::Set(name, v) => find(name).expect("parsed from the table").set(v),
-        Command::Reset => KNOBS.iter().for_each(|k| k.set(k.default)),
-        Command::Look(name) => {
-            let look = look_values(name).expect("parsed from the table");
-            for (k, v) in KNOBS.iter().zip(look) {
-                if let Some(v) = v {
-                    k.set(v);
-                }
-            }
-        }
-        Command::Get => return Ok(format!("on={} {}", u8::from(ON.load(Relaxed)), values_line())),
-        Command::Stats => {}
-    }
-    let st = state();
-    Ok(format!("on={} {} {}", u8::from(ON.load(Relaxed)), values_line(), st.stats.summary()))
+    SSR.control(args)
+}
+
+/// devctl `ssr ...`, `dof ...` or `bloom ...`; `None` for another verb.
+pub fn control_verb(verb: &str, args: &[&str]) -> Option<Result<String, String>> {
+    effect(verb).map(|fx| fx.control(args))
 }
 
 // ------------------------------------------------------------- the matcher
@@ -949,6 +1108,7 @@ const USAGE_SAMPLED: u32 = 0x4;
 const USAGE_STORAGE: u32 = 0x8;
 const USAGE_COLOR_ATTACHMENT: u32 = 0x10;
 const FEATURE_SAMPLED_IMAGE: u32 = 0x1;
+const FEATURE_SAMPLED_LINEAR: u32 = 0x1000;
 const FEATURE_STORAGE_IMAGE: u32 = 0x2;
 const FEATURE_TRANSFER_SRC: u32 = 0x4000;
 const FEATURE_TRANSFER_DST: u32 = 0x8000;
@@ -1246,6 +1406,19 @@ pub(crate) fn ticks_to_ms(start: u64, end: u64, mask: u64, period_ns: f64) -> f6
 
 /// How many frames' timestamps can be in flight.
 const RING: usize = 16;
+/// Timestamps per frame: before everything, after the depth copy, after
+/// the reflections, after the depth of field, after the bloom, and after
+/// the copy back.
+const TIMESTAMPS: usize = 6;
+
+/// GPU milliseconds of one frame: the reflections, the depth of field and
+/// the bloom (0 for one that did not run), and everything, the depth copy
+/// and the copy back included.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Stages {
+    pub effects: [f64; 3],
+    pub total: f64,
+}
 /// Presents after which a replaced object can no longer be in use by any
 /// frame in flight.
 const RETIRE_AFTER: u64 = 16;
@@ -1261,14 +1434,16 @@ struct Owned {
     view: u64,
 }
 
-/// Our three images of the scene's size: the depth copy `depth.comp` writes
+/// Our images of the scene's size: the depth copy `depth.comp` writes
 /// (R32F), the trace (RGBA16F, written by the trace and sampled by the
-/// compose) and the result the compose writes (R32_UINT, copied to the
-/// engine's image).
+/// compose), the result the composes write (R32_UINT, copied to the
+/// engine's image), and the depth of field's and the bloom's when either is
+/// on.
 struct Output {
     depth: Owned,
     trace: Owned,
     result: Owned,
+    post: Option<post::PostImages>,
     extent: [u32; 2],
 }
 
@@ -1305,7 +1480,11 @@ struct Gpu {
     pipelines: [u64; 4],
     descriptor_pool: u64,
     query_pool: u64,
-    pending: [bool; RING],
+    /// The depth of field's and the bloom's.
+    post: post::PostGpu,
+    /// Which effects ran in the frame each timestamp slot holds, while its
+    /// timestamps are still to be read.
+    pending: [Option<[bool; 3]>; RING],
     next_slot: usize,
     output: Option<Output>,
     /// The engine's image to our view of it.
@@ -1332,6 +1511,9 @@ impl Gpu {
         self.destroy_owned(&o.depth);
         self.destroy_owned(&o.trace);
         self.destroy_owned(&o.result);
+        if let Some(p) = &o.post {
+            self.destroy_post_images(p);
+        }
     }
 
     fn free_sets(&self, sets: &[u64]) {
@@ -1362,6 +1544,7 @@ impl Gpu {
         };
         // Frees every set with it.
         destroy(f.destroy_descriptor_pool, self.descriptor_pool);
+        self.destroy_post();
         for p in self.pipelines {
             destroy(f.destroy_pipeline, p);
         }
@@ -1399,11 +1582,13 @@ impl Gpu {
         Ok(v)
     }
 
-    /// Our images for `extent`, made again when the size changed. The view
-    /// of the result, which names them in a [`SetKey`].
-    fn output_for(&mut self, extent: [u32; 2], presents: u64) -> Result<u64, String> {
+    /// Our images for `extent`, with the depth of field's and the bloom's
+    /// when `post` asks for them, made again when the size changed or they
+    /// are newly asked for. The view of the result, which names them in a
+    /// [`SetKey`].
+    fn output_for(&mut self, extent: [u32; 2], post: bool, presents: u64) -> Result<u64, String> {
         if let Some(o) = &self.output {
-            if o.extent == extent {
+            if o.extent == extent && (o.post.is_some() || !post) {
                 return Ok(o.result.view);
             }
         }
@@ -1413,11 +1598,18 @@ impl Gpu {
             self.sets.retain(|k, _| k.output != view);
             self.retired.push(Retired { at: presents, output: Some(old), sets });
         }
-        let mut o = Output { depth: Owned::default(), trace: Owned::default(), result: Owned::default(), extent };
+        let mut o =
+            Output { depth: Owned::default(), trace: Owned::default(), result: Owned::default(), post: None, extent };
         let made = self
             .make_image(&mut o.depth, extent, FORMAT_R32_SFLOAT, USAGE_STORAGE)
             .and_then(|()| self.make_image(&mut o.trace, extent, FORMAT_R16G16B16A16_SFLOAT, USAGE_STORAGE | USAGE_SAMPLED))
-            .and_then(|()| self.make_image(&mut o.result, extent, FORMAT_R32_UINT, USAGE_STORAGE | USAGE_TRANSFER_SRC));
+            .and_then(|()| self.make_image(&mut o.result, extent, FORMAT_R32_UINT, USAGE_STORAGE | USAGE_TRANSFER_SRC))
+            .and_then(|()| {
+                if post {
+                    o.post = Some(self.make_post_images(extent)?);
+                }
+                Ok(())
+            });
         if let Err(e) = made {
             self.destroy_output(&o);
             return Err(e);
@@ -1558,24 +1750,27 @@ impl Gpu {
         }
     }
 
-    /// The previous use of timestamp slot `slot`, if its frame has finished.
-    fn collect(&mut self, slot: usize) -> Option<f64> {
-        if !std::mem::take(&mut self.pending[slot]) {
-            return None;
-        }
+    /// The previous use of timestamp slot `slot`, if its frame has finished:
+    /// which effects ran in it and the GPU milliseconds of each stage.
+    fn collect(&mut self, slot: usize) -> Option<([bool; 3], Stages)> {
+        let ran = self.pending[slot].take()?;
         // Each query's value followed by its availability.
-        let mut t = [0u64; 4];
+        let mut t = [0u64; 2 * TIMESTAMPS];
         let rc = (self.fns.get_query_pool_results)(
             self.dev(),
             self.query_pool,
-            2 * slot as u32,
-            2,
-            32,
+            (TIMESTAMPS * slot) as u32,
+            TIMESTAMPS as u32,
+            std::mem::size_of_val(&t),
             t.as_mut_ptr() as *mut c_void,
             16,
             QUERY_RESULT_64 | QUERY_RESULT_WITH_AVAILABILITY,
         );
-        (rc == VK_SUCCESS && t[1] != 0 && t[3] != 0).then(|| ticks_to_ms(t[0], t[2], self.timestamp_mask, self.period_ns))
+        if rc != VK_SUCCESS || (0..TIMESTAMPS).any(|i| t[2 * i + 1] == 0) {
+            return None;
+        }
+        let ms = |a: usize, b: usize| ticks_to_ms(t[2 * a], t[2 * b], self.timestamp_mask, self.period_ns);
+        Some((ran, Stages { effects: [ms(1, 2), ms(2, 3), ms(3, 4)], total: ms(0, 5) }))
     }
 }
 
@@ -1615,8 +1810,8 @@ fn create_gpu(device: usize) -> Result<Gpu, String> {
         _ => return Err("R32_SFLOAT cannot be a storage image on this device".into()),
     }
     match optimal_features(physical, FORMAT_R16G16B16A16_SFLOAT) {
-        Some(f) if f & FEATURE_STORAGE_IMAGE != 0 && f & FEATURE_SAMPLED_IMAGE != 0 => {}
-        _ => return Err("R16G16B16A16_SFLOAT cannot be a storage and a sampled image on this device".into()),
+        Some(f) if f & FEATURE_STORAGE_IMAGE != 0 && f & FEATURE_SAMPLED_IMAGE != 0 && f & FEATURE_SAMPLED_LINEAR != 0 => {}
+        _ => return Err("R16G16B16A16_SFLOAT cannot be a storage and a linearly filtered image on this device".into()),
     }
     let fns = Fns::resolve(device as Dev)?;
     let mp = super::vk_layer::host_instance_proc(c"vkGetPhysicalDeviceMemoryProperties");
@@ -1647,14 +1842,15 @@ fn create_gpu(device: usize) -> Result<Gpu, String> {
         pipelines: [0; 4],
         descriptor_pool: 0,
         query_pool: 0,
-        pending: [false; RING],
+        post: post::PostGpu::default(),
+        pending: [None; RING],
         next_slot: 0,
         output: None,
         views: HashMap::new(),
         sets: HashMap::new(),
         retired: Vec::new(),
     };
-    match build(&mut g) {
+    match build(&mut g).and_then(|()| g.build_post()) {
         Ok(()) => Ok(g),
         Err(e) => {
             g.destroy();
@@ -1772,7 +1968,7 @@ fn build(g: &mut Gpu) -> Result<(), String> {
             p_next: none,
             flags: 0,
             query_type: QUERY_TYPE_TIMESTAMP,
-            query_count: 2 * RING as u32,
+            query_count: (TIMESTAMPS * RING) as u32,
             pipeline_statistics: 0,
         };
         check((f.create_query_pool)(d, &queries, none, &mut g.query_pool), "vkCreateQueryPool")?;
@@ -1824,14 +2020,42 @@ pub(crate) fn usable(f: &Found) -> Result<u32, String> {
     Ok(mode)
 }
 
+/// A compute-to-compute barrier: what one dispatch wrote, the next reads.
+fn compute_barrier(fns: &Fns, cmd: *mut c_void) {
+    let m = MemoryBarrier {
+        s_type: ST_MEMORY_BARRIER,
+        p_next: std::ptr::null(),
+        src_access_mask: ACCESS_SHADER_WRITE,
+        dst_access_mask: ACCESS_SHADER_READ | ACCESS_SHADER_WRITE,
+    };
+    (fns.cmd_pipeline_barrier)(cmd, STAGE_COMPUTE_SHADER, STAGE_COMPUTE_SHADER, 0, 1, &m, 0, std::ptr::null(), 0, std::ptr::null());
+}
+
+/// Which effects a frame gets, in the order of [`EFFECTS`].
+pub(crate) type Run = [bool; 3];
+
 /// Record the work into `cmd`, the engine's command buffer, outside any
-/// render pass (see the module doc), with timestamps in `slot`.
+/// render pass (see the module doc), with timestamps in `slot`: the depth
+/// copy when the reflections or the depth of field need it, then each
+/// effect of `run` in turn, each reading the scene as the one before left
+/// it, and one copy of the result over the engine's image.
 #[allow(clippy::too_many_arguments)]
-fn record(g: &mut Gpu, cmd: *mut c_void, slot: usize, f: &Found, compute: &Compute, p: &Params, presents: u64) -> Result<(), String> {
+fn record(
+    g: &mut Gpu,
+    cmd: *mut c_void,
+    slot: usize,
+    f: &Found,
+    compute: &Compute,
+    run: Run,
+    p: &Params,
+    post_p: &post::PostParams,
+    presents: u64,
+) -> Result<(), String> {
+    let [ssr, dof, bloom] = run;
     let (color, depth) = (&f.color, &f.depth);
     let color_read = color_read_layout(color.layout).ok_or("unusable colour layout")?;
     let depth_read = depth_read_layout(depth.layout).ok_or("unusable depth layout")?;
-    let output = g.output_for(color.att.extent, presents)?;
+    let output = g.output_for(color.att.extent, dof || bloom, presents)?;
     g.view_of(color.att.image, color.att.format, ASPECT_COLOR)?;
     g.view_of(depth.att.image, depth.att.format, ASPECT_DEPTH)?;
     let set = g.set_for(SetKey {
@@ -1841,8 +2065,10 @@ fn record(g: &mut Gpu, cmd: *mut c_void, slot: usize, f: &Found, compute: &Compu
         depth_layout: depth_read,
         output,
     })?;
-    let (out_image, copy_image, trace_image) =
-        g.output.as_ref().map(|o| (o.result.image, o.depth.image, o.trace.image)).ok_or("no output image")?;
+    let fresh_focus = if dof { post::focus_layout(g) } else { None };
+    let o = g.output.as_ref().ok_or("no output image")?;
+    let (out_image, copy_image, trace_image) = (o.result.image, o.depth.image, o.trace.image);
+    let post_images: Vec<u64> = o.post.iter().flat_map(|p| p.images()).collect();
     let fns = &g.fns;
     let none = std::ptr::null();
     let image_barrier = |image: u64, old: u32, new: u32, src: u32, dst: u32, aspect: u32| ImageMemoryBarrier {
@@ -1859,18 +2085,30 @@ fn record(g: &mut Gpu, cmd: *mut c_void, slot: usize, f: &Found, compute: &Compu
     };
     let depth_aspects = barrier_aspects(depth.att.format);
     let timed = g.query_pool != 0;
+    let stamp = |i: usize| {
+        if timed {
+            (fns.cmd_write_timestamp)(cmd, STAGE_BOTTOM_OF_PIPE, g.query_pool, (TIMESTAMPS * slot + i) as u32);
+        }
+    };
     if timed {
-        (fns.cmd_reset_query_pool)(cmd, g.query_pool, 2 * slot as u32, 2);
-        (fns.cmd_write_timestamp)(cmd, STAGE_BOTTOM_OF_PIPE, g.query_pool, 2 * slot as u32);
+        (fns.cmd_reset_query_pool)(cmd, g.query_pool, (TIMESTAMPS * slot) as u32, TIMESTAMPS as u32);
     }
+    stamp(0);
 
     // Everything recorded before (the scene, the resolve and the engine's
-    // own barriers) is done writing; our images may be discarded.
+    // own barriers) is done writing; our images may be discarded, but for
+    // the focus, which is kept from frame to frame.
     let mut before = vec![
         image_barrier(out_image, LAYOUT_UNDEFINED, LAYOUT_GENERAL, 0, ACCESS_SHADER_WRITE, ASPECT_COLOR),
         image_barrier(copy_image, LAYOUT_UNDEFINED, LAYOUT_GENERAL, 0, ACCESS_SHADER_WRITE, ASPECT_COLOR),
         image_barrier(trace_image, LAYOUT_UNDEFINED, LAYOUT_GENERAL, 0, ACCESS_SHADER_WRITE, ASPECT_COLOR),
     ];
+    for &image in &post_images {
+        before.push(image_barrier(image, LAYOUT_UNDEFINED, LAYOUT_GENERAL, 0, ACCESS_SHADER_WRITE, ASPECT_COLOR));
+    }
+    if let Some((focus, old)) = fresh_focus {
+        before.push(image_barrier(focus, old, LAYOUT_GENERAL, 0, ACCESS_SHADER_READ | ACCESS_SHADER_WRITE, ASPECT_COLOR));
+    }
     if color_read != color.layout {
         before.push(image_barrier(color.att.image, color.layout, color_read, ACCESS_MEMORY_WRITE, ACCESS_SHADER_READ, ASPECT_COLOR));
     }
@@ -1881,42 +2119,65 @@ fn record(g: &mut Gpu, cmd: *mut c_void, slot: usize, f: &Found, compute: &Compu
         s_type: ST_MEMORY_BARRIER,
         p_next: none,
         src_access_mask: ACCESS_MEMORY_WRITE,
-        dst_access_mask: ACCESS_SHADER_READ,
+        dst_access_mask: ACCESS_SHADER_READ | ACCESS_SHADER_WRITE,
     };
     (fns.cmd_pipeline_barrier)(cmd, STAGE_ALL_COMMANDS, STAGE_COMPUTE_SHADER, 0, 1, &memory, 0, none, before.len() as u32, before.as_ptr());
 
-    // The set and the push constants serve every pipeline, which all share
-    // the layout.
+    // The reflections' set and push constants serve their pipelines, which
+    // share the layout.
     let [w, h] = color.att.extent;
-    let copy = if depth.att.samples > 1 { g.pipelines[0] } else { g.pipelines[1] };
-    (fns.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, copy);
-    (fns.cmd_bind_descriptor_sets)(cmd, BIND_POINT_COMPUTE, g.pipeline_layout, 0, 1, &set, 0, none.cast());
-    (fns.cmd_push_constants)(
-        cmd,
-        g.pipeline_layout,
-        SHADER_STAGE_COMPUTE,
-        0,
-        std::mem::size_of::<Params>() as u32,
-        (p as *const Params).cast(),
-    );
-    (fns.cmd_dispatch)(cmd, w.div_ceil(8), h.div_ceil(8), 1);
-    let copied = MemoryBarrier {
-        s_type: ST_MEMORY_BARRIER,
-        p_next: none,
-        src_access_mask: ACCESS_SHADER_WRITE,
-        dst_access_mask: ACCESS_SHADER_READ,
+    let bind_ssr = |pipeline: u64| {
+        (fns.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, pipeline);
+        (fns.cmd_bind_descriptor_sets)(cmd, BIND_POINT_COMPUTE, g.pipeline_layout, 0, 1, &set, 0, none.cast());
+        (fns.cmd_push_constants)(
+            cmd,
+            g.pipeline_layout,
+            SHADER_STAGE_COMPUTE,
+            0,
+            std::mem::size_of::<Params>() as u32,
+            (p as *const Params).cast(),
+        );
     };
-    (fns.cmd_pipeline_barrier)(cmd, STAGE_COMPUTE_SHADER, STAGE_COMPUTE_SHADER, 0, 1, &copied, 0, none, 0, none.cast());
-    (fns.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[2]);
-    (fns.cmd_dispatch)(cmd, w.div_ceil(8), h.div_ceil(8), 1);
-    // The trace written, then read by the compose.
-    (fns.cmd_pipeline_barrier)(cmd, STAGE_COMPUTE_SHADER, STAGE_COMPUTE_SHADER, 0, 1, &copied, 0, none, 0, none.cast());
-    (fns.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[3]);
-    (fns.cmd_dispatch)(cmd, w.div_ceil(8), h.div_ceil(8), 1);
+    if ssr || dof {
+        bind_ssr(if depth.att.samples > 1 { g.pipelines[0] } else { g.pipelines[1] });
+        (fns.cmd_dispatch)(cmd, w.div_ceil(8), h.div_ceil(8), 1);
+        compute_barrier(fns, cmd);
+    }
+    stamp(1);
+    if ssr {
+        bind_ssr(g.pipelines[2]);
+        (fns.cmd_dispatch)(cmd, w.div_ceil(8), h.div_ceil(8), 1);
+        // The trace written, then read by the compose.
+        compute_barrier(fns, cmd);
+        (fns.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[3]);
+        (fns.cmd_dispatch)(cmd, w.div_ceil(8), h.div_ceil(8), 1);
+        compute_barrier(fns, cmd);
+    }
+    stamp(2);
+    let post_images = g.output.as_ref().and_then(|o| o.post.as_ref());
+    if dof {
+        let mut pp = *post_p;
+        if ssr {
+            pp.flags |= post::SRC_RESULT;
+        }
+        if fresh_focus.is_some() {
+            pp.flags |= post::FOCUS_RESET;
+        }
+        post::record_dof(g, cmd, set, post_images.ok_or("no depth of field images")?, &pp);
+    }
+    stamp(3);
+    if bloom {
+        let mut pp = *post_p;
+        if ssr || dof {
+            pp.flags |= post::SRC_RESULT;
+        }
+        post::record_bloom(g, cmd, set, post_images.ok_or("no bloom images")?, &pp);
+    }
+    stamp(4);
 
     // Our image to a copy source, the engine's to a copy destination, the
     // depth back; everything after (the copy, the swapchain pass, the next
-    // frame's clear of the depth) waits for the dispatch.
+    // frame's clear of the depth) waits for the dispatches.
     let mut middle = vec![
         image_barrier(out_image, LAYOUT_GENERAL, LAYOUT_TRANSFER_SRC, ACCESS_SHADER_WRITE, ACCESS_TRANSFER_READ, ASPECT_COLOR),
         image_barrier(color.att.image, color_read, LAYOUT_TRANSFER_DST, 0, ACCESS_TRANSFER_WRITE, ASPECT_COLOR),
@@ -1944,10 +2205,7 @@ fn record(g: &mut Gpu, cmd: *mut c_void, slot: usize, f: &Found, compute: &Compu
         ASPECT_COLOR,
     )];
     (fns.cmd_pipeline_barrier)(cmd, STAGE_TRANSFER, STAGE_ALL_COMMANDS, 0, 0, none.cast(), 0, none, 1, after.as_ptr());
-    if timed {
-        (fns.cmd_write_timestamp)(cmd, STAGE_BOTTOM_OF_PIPE, g.query_pool, 2 * slot as u32 + 1);
-        g.pending[slot] = true;
-    }
+    stamp(5);
 
     // The engine's compute state, as it was.
     if compute.pipeline != 0 {
@@ -1968,12 +2226,15 @@ fn record(g: &mut Gpu, cmd: *mut c_void, slot: usize, f: &Found, compute: &Compu
     for p in &compute.pushes {
         (fns.cmd_push_constants)(cmd, p.layout, p.stages, p.offset, p.bytes.len() as u32, p.bytes.as_ptr().cast());
     }
+    if timed {
+        g.pending[slot] = Some(run);
+    }
     Ok(())
 }
 
 // ------------------------------------------------------------- the numbers
 
-/// What `ssr stats` reports.
+/// What `<effect> stats` reports, for one effect or for all of them.
 #[derive(Default)]
 pub(crate) struct Stats {
     pub applied: u64,
@@ -2033,14 +2294,19 @@ struct State {
     failed: Vec<(usize, String)>,
     /// What has been printed once.
     reported: HashSet<String>,
-    stats: Stats,
+    /// Each effect's, in the order of [`EFFECTS`]; its GPU time is its own
+    /// dispatches'.
+    stats: [Stats; 3],
+    /// Every frame that got any effect; its GPU time is everything recorded,
+    /// the depth copy and the copy back included.
+    chain: Stats,
     presents: u64,
 }
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 
 /// Whether there is anything to look after at presents (retired objects,
-/// histories) even with the effect off.
+/// histories) even with every effect off.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn state() -> MutexGuard<'static, State> {
@@ -2051,14 +2317,19 @@ impl State {
     /// Print `line` the first time it comes.
     fn once(&mut self, line: String) {
         if self.reported.insert(line.clone()) {
-            println!("[android] vulkan: ssr: {line}");
+            println!("[android] vulkan: effects: {line}");
         }
     }
 
-    fn skipped(&mut self, why: String) {
-        self.stats.skipped += 1;
+    /// A frame the effects in `on` were asked for was left alone.
+    fn skipped(&mut self, on: Run, why: String) {
+        for (s, _) in self.stats.iter_mut().zip(on).filter(|(_, on)| *on) {
+            s.skipped += 1;
+            s.last_skip = Some(why.clone());
+        }
+        self.chain.skipped += 1;
         self.once(format!("a frame was left alone: {why} (said once)"));
-        self.stats.last_skip = Some(why);
+        self.chain.last_skip = Some(why);
     }
 }
 
@@ -2083,59 +2354,98 @@ pub(crate) fn pass_begun(pass: &Pass) {
     let Some(h) = st.cmds.get_mut(&pass.cmd) else { return };
     let Some(outcome) = h.pass(&desc, &full) else { return };
     let compute = h.compute.clone();
+    let on: Run = [SSR.is_on(), post::DOF.is_on(), post::BLOOM.is_on()];
     let found = match outcome {
         Ok(f) => f,
-        Err(why) => return st.skipped(why),
+        Err(why) => return st.skipped(on, why),
     };
-    let values: Vec<[f32; 3]> = KNOBS.iter().map(Knob::get).collect();
-    if changes_nothing(&values) {
-        return st.skipped("the intensity is 0 and wet surfaces are neither darkened nor tinted".into());
+    let values = SSR.current();
+    let dof_values = post::DOF.current();
+    let bloom_values = post::BLOOM.current();
+    let run: Run = [
+        on[0] && !changes_nothing(&values),
+        on[1] && !post::dof_changes_nothing(&dof_values),
+        on[2] && !post::bloom_changes_nothing(&bloom_values),
+    ];
+    if run == [false; 3] {
+        return st.skipped(
+            on,
+            "every effect that is on changes nothing (reflections: intensity 0 and wet surfaces neither darkened nor \
+             tinted; depth of field: strength 0; bloom: intensity 0 or a black tint)"
+                .into(),
+        );
     }
     let mode = match usable(&found) {
         Ok(m) => m,
-        Err(why) => return st.skipped(why),
+        Err(why) => return st.skipped(on, why),
     };
     let started = Instant::now();
     let device = found.color.att.device;
     let failed = st.failed.iter().find(|(d, _)| *d == device).map(|(_, why)| why.clone());
     if let Some(why) = failed {
-        return st.skipped(why);
+        return st.skipped(on, why);
     }
     if !st.gpus.iter().any(|g| g.device == device) {
         match create_gpu(device) {
             Ok(g) => {
                 st.once(format!(
                     "pipelines made on device 0x{device:x}{}",
-                    if g.timestamp_mask == 0 { "; the queue has no timestamps, so ssr stats has no GPU time" } else { "" }
+                    if g.timestamp_mask == 0 { "; the queue has no timestamps, so stats have no GPU time" } else { "" }
                 ));
                 st.gpus.push(g);
             }
             Err(why) => {
                 let why = format!("our Vulkan objects could not be made: {why}");
                 st.failed.push((device, why.clone()));
-                return st.skipped(why);
+                return st.skipped(on, why);
             }
         }
     }
     let presents = st.presents;
-    let p = params(found.color.att.extent, &values, mode);
+    let extent = found.color.att.extent;
+    let p = params(extent, &values, mode);
     let g = st.gpus.iter_mut().find(|g| g.device == device).expect("made above");
+    let dt = if run[1] {
+        let now = Instant::now();
+        let dt = g.post.focus_at.map_or(f32::INFINITY, |t| now.duration_since(t).as_secs_f32());
+        g.post.focus_at = Some(now);
+        dt
+    } else {
+        0.0
+    };
+    let post_p = post::post_params(extent, &dof_values, &bloom_values, mode, dt);
     // The timestamps this slot held last time round, then the slot again.
     let slot = g.next_slot;
     g.next_slot = (slot + 1) % RING;
     let sample = g.collect(slot);
-    let recorded = record(g, pass.cmd as *mut c_void, slot, &found, &compute, &p, presents);
-    if let Some(ms) = sample {
-        st.stats.gpu_sample(ms);
+    let recorded = record(g, pass.cmd as *mut c_void, slot, &found, &compute, run, &p, &post_p, presents);
+    if let Some((ran, ms)) = sample {
+        for ((s, ran), ms) in st.stats.iter_mut().zip(ran).zip(ms.effects) {
+            if ran {
+                s.gpu_sample(ms);
+            }
+        }
+        st.chain.gpu_sample(ms.total);
     }
     match recorded {
         Ok(()) => {
-            st.stats.applied += 1;
-            st.stats.cpu_us_total += started.elapsed().as_secs_f64() * 1e6;
+            let cpu = started.elapsed().as_secs_f64() * 1e6;
+            for (s, _) in st.stats.iter_mut().zip(run).filter(|(_, ran)| *ran) {
+                s.applied += 1;
+                s.cpu_us_total += cpu;
+            }
+            st.chain.applied += 1;
+            st.chain.cpu_us_total += cpu;
+            // An effect that is on but changes nothing was skipped.
+            for (s, _) in st.stats.iter_mut().zip(on.iter().zip(run)).filter(|(_, (on, ran))| **on && !ran) {
+                s.skipped += 1;
+                s.last_skip = Some("it is on but changes nothing".into());
+            }
             let (c, z) = (&found.color, &found.depth);
+            let names: Vec<&str> = EFFECTS.iter().zip(run).filter(|(_, ran)| *ran).map(|(fx, _)| fx.name).collect();
             st.once(format!(
-                "reflections recorded before the swapchain pass: scene depth {} x{} {}x{} in {}, colour {} {}x{} in {}{}, \
-                 {}x{} groups",
+                "{} recorded before the swapchain pass: scene depth {} x{} {}x{} in {}, colour {} {}x{} in {}{}",
+                names.join(" "),
                 registry::format_name(z.att.format),
                 z.att.samples,
                 z.att.extent[0],
@@ -2146,11 +2456,9 @@ pub(crate) fn pass_begun(pass: &Pass) {
                 c.att.extent[1],
                 registry::layout_name(c.layout),
                 if found.resolved { ", resolved from the multisampled scene" } else { ", the single-sample scene's own" },
-                c.att.extent[0].div_ceil(8),
-                c.att.extent[1].div_ceil(8),
             ));
         }
-        Err(why) => st.skipped(format!("recording failed: {why}")),
+        Err(why) => st.skipped(on, format!("recording failed: {why}")),
     }
 }
 
@@ -2260,7 +2568,7 @@ pub(crate) fn missing_usage(image_type: u32, format: u32, extent: [u32; 3], mips
 /// colour that lacks them and its format supports them, or `None` to pass
 /// the engine's own through unchanged.
 pub(crate) fn widen_usage(device: *mut c_void, info: *const c_void) -> Option<[u64; 11]> {
-    if !ON.load(Relaxed) || info.is_null() {
+    if !EFFECTS.iter().any(|fx| fx.is_on()) || info.is_null() {
         return None;
     }
     // SAFETY: the engine's 88-byte `VkImageCreateInfo`, read during its own
@@ -2767,6 +3075,105 @@ mod tests {
     }
 
     #[test]
+    fn every_effect_has_its_own_variables_slots_looks_and_verbs() {
+        let names: Vec<&str> = EFFECTS.iter().map(|fx| fx.name).collect();
+        assert_eq!(names, ["ssr", "dof", "bloom"], "recorded in this order");
+        for (i, fx) in EFFECTS.iter().enumerate() {
+            assert_eq!(fx.index, i, "{}", fx.name);
+            assert_eq!(fx.env, format!("INTOXICATED_{}", fx.name.to_uppercase()));
+            assert_eq!(fx.look_env, format!("{}_LOOK", fx.env));
+            assert!(fx.usage.starts_with(&format!("{} on|off|stats|get|reset|look <name>|", fx.name)), "{}", fx.usage);
+            assert!(fx.title.is_ascii() && fx.summary.is_ascii() && !fx.summary.is_empty(), "{}", fx.name);
+            assert!(std::ptr::eq(effect(fx.name).unwrap(), *fx));
+            let mut used = vec![false; fx.values.len()];
+            for k in fx.knobs {
+                for slot in &mut used[k.slot..k.slot + k.width()] {
+                    assert!(!*slot, "{} {} shares a slot", fx.name, k.name);
+                    *slot = true;
+                }
+                assert_eq!(k.env, format!("{}_{}", fx.env, k.name.to_uppercase()));
+                assert_eq!(k.parse(&k.show(k.default)), Ok(k.default), "{} {} reads its own default back", fx.name, k.name);
+                assert!(fx.usage.contains(k.name), "{} {}", fx.name, k.name);
+            }
+            assert!(used.iter().all(|&u| u), "{}: no slot left over", fx.name);
+            for name in fx.not_a_look {
+                assert!(fx.find(name).is_some(), "{} {name}", fx.name);
+            }
+            for look in fx.looks {
+                assert!(fx.usage.contains(look.name), "{} {}", fx.name, look.name);
+                assert!(look.description.is_ascii() && !look.description.is_empty());
+                for (name, v) in look.values {
+                    let k = fx.find(name).unwrap_or_else(|| panic!("{} names no knob {name}", look.name));
+                    assert!(!fx.not_a_look.contains(name), "{} sets {name}, which no look sets", look.name);
+                    assert_eq!(k.parse(&k.show(*v)), Ok(*v), "{} sets {name} out of range", look.name);
+                }
+            }
+            // The default look is the defaults.
+            let first = fx.look_values(fx.looks[0].name).unwrap();
+            for (k, v) in fx.knobs.iter().zip(first) {
+                assert_eq!(v, (!fx.not_a_look.contains(&k.name)).then_some(k.default), "{} {}", fx.name, k.name);
+            }
+            // The same commands for each.
+            assert_eq!(fx.parse_command(&["on"]), Ok(Command::On));
+            assert_eq!(fx.parse_command(&["stats"]), Ok(Command::Stats));
+            assert_eq!(fx.parse_command(&["look", fx.looks[1].name]), Ok(Command::Look(fx.looks[1].name)));
+            assert_eq!(fx.parse_command(&["bogus"]), Err(fx.usage.to_string()));
+            let k = &fx.knobs[0];
+            assert_eq!(fx.parse_command(&["set", k.name, &k.show(k.default)]), Ok(Command::Set(k.name, k.default)));
+        }
+        assert!(effect("fxaa").is_none());
+        assert!(control_verb("fxaa", &[]).is_none());
+
+        // The depth of field and the bloom from the environment.
+        let env = |name: &str| {
+            Some(match name {
+                "INTOXICATED_DOF" => "1",
+                "INTOXICATED_DOF_LOOK" => "portrait",
+                "INTOXICATED_DOF_STRENGTH" => "10",
+                "INTOXICATED_DOF_SAMPLES" => "500",
+                "INTOXICATED_BLOOM_TINT" => "1,0.9,0.8",
+                _ => return None,
+            }
+            .to_string())
+        };
+        let dof = post::DOF.parse_settings(env);
+        assert!(dof.on);
+        assert_eq!(dof.warnings.len(), 1, "{:?}", dof.warnings);
+        assert!(dof.warnings[0].starts_with("[android] vulkan: dof: INTOXICATED_DOF_SAMPLES:"), "{:?}", dof.warnings);
+        let at = |name: &str| post::DOF_KNOBS.iter().position(|k| k.name == name).unwrap();
+        assert_eq!((dof.values[at("strength")], dof.values[at("near_blur")]), ([10.0; 3], [1.0; 3]));
+        assert_eq!(dof.values[at("focus_range")], [0.15; 3], "from the look");
+        assert_eq!(dof.values[at("samples")], [48.0; 3], "the default for a value out of range");
+        let bloom = post::BLOOM.parse_settings(env);
+        assert!(!bloom.on && bloom.warnings.is_empty());
+        assert_eq!(bloom.values[post::BLOOM_KNOBS.iter().position(|k| k.name == "tint").unwrap()], [1.0, 0.9, 0.8]);
+        assert_eq!(post::BLOOM.parse_command(&["intensity", "0.5"]), Ok(Command::Set("intensity", [0.5; 3])));
+        assert_eq!(post::DOF.parse_command(&["intensity", "0.5"]), Err(post::DOF_USAGE.to_string()), "dof has no intensity");
+    }
+
+    #[test]
+    fn the_shader_looks_json_lists_every_effect_as_its_own_table() {
+        let text = shader_looks_json();
+        assert!(text.is_ascii());
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let effects = doc["effects"].as_array().unwrap();
+        assert_eq!(effects.len(), EFFECTS.len());
+        for (fx, j) in EFFECTS.iter().zip(effects) {
+            assert_eq!((j["name"].as_str(), j["title"].as_str(), j["summary"].as_str()), (Some(fx.name), Some(fx.title), Some(fx.summary)));
+            let mut table = j.clone();
+            for extra in ["name", "title", "summary"] {
+                table.as_object_mut().unwrap().remove(extra);
+            }
+            assert_eq!(table, fx.json(), "{}", fx.name);
+            assert_eq!(j["looks"].as_array().unwrap().len(), fx.looks.len());
+            assert_eq!(j["default_look"], fx.looks[0].name);
+        }
+        // The reflections' own table is what --print-ssr-looks prints.
+        let ssr: serde_json::Value = serde_json::from_str(&looks_json()).unwrap();
+        assert_eq!(ssr, SSR.json());
+    }
+
+    #[test]
     fn parameters_and_packing() {
         let mut values: Vec<[f32; 3]> = KNOBS.iter().map(|k| k.default).collect();
         let p = params(FULL, &values, 0);
@@ -2879,13 +3286,21 @@ mod tests {
                 .collect()
         };
         // The same list as build.rs's `SHADERS`.
-        let shaders: [(&str, &str, &[&str]); 6] = [
+        let shaders: [(&str, &str, &[&str]); 14] = [
             ("depth_capture/resolve.comp", "depth_capture/resolve_ms", &[]),
             ("depth_capture/resolve.comp", "depth_capture/resolve_1x", &["-DSINGLE_SAMPLE"]),
             ("ssr/depth.comp", "ssr/depth_ms", &[]),
             ("ssr/depth.comp", "ssr/depth_1x", &["-DSINGLE_SAMPLE"]),
             ("ssr/ssr.comp", "ssr/ssr", &[]),
             ("ssr/ssr.comp", "ssr/compose", &["-DCOMPOSE"]),
+            ("ssr/post.comp", "ssr/post_focus", &["-DFOCUS"]),
+            ("ssr/post.comp", "ssr/post_dof_prep", &["-DDOF_PREP"]),
+            ("ssr/post.comp", "ssr/post_dof_gather", &["-DDOF_GATHER"]),
+            ("ssr/post.comp", "ssr/post_dof_compose", &["-DDOF_COMPOSE"]),
+            ("ssr/post.comp", "ssr/post_bloom_prefilter", &["-DBLOOM_PREFILTER"]),
+            ("ssr/post.comp", "ssr/post_bloom_down", &["-DBLOOM_DOWN"]),
+            ("ssr/post.comp", "ssr/post_bloom_up", &["-DBLOOM_UP"]),
+            ("ssr/post.comp", "ssr/post_bloom_compose", &["-DBLOOM_COMPOSE"]),
         ];
         for (source, stem, defines) in shaders {
             let run = std::process::Command::new(GLSLC)
@@ -2913,6 +3328,11 @@ mod tests {
             [(SPIRV_DEPTH_MS, "depth_ms"), (SPIRV_DEPTH_1X, "depth_1x"), (SPIRV_SSR, "ssr"), (SPIRV_COMPOSE, "compose")]
         {
             assert_eq!(built, &words(&std::fs::read_to_string(android.join(format!("ssr/{stem}.spv.rs"))).unwrap())[..]);
+        }
+        for (built, variant) in post::SPIRV.iter().zip(post::VARIANTS) {
+            let stem = format!("ssr/post_{}", variant.to_lowercase());
+            assert!(shaders.iter().any(|(_, s, d)| *s == stem && d == &[format!("-D{variant}").as_str()]), "{stem} is listed");
+            assert_eq!(*built, &words(&std::fs::read_to_string(android.join(format!("{stem}.spv.rs"))).unwrap())[..]);
         }
     }
 }

@@ -118,6 +118,7 @@ intoxicated --update-apk # fetch the newest Roblox build, then exit
 intoxicated --update     # update Intoxicated itself (pull, build, reinstall)
 intoxicated --default-flags  # print the flags the client sets itself (JSON)
 intoxicated --ssr-looks  # print the reflections' settings and looks (JSON)
+intoxicated --shader-looks  # the same for reflections, depth of field, bloom
 intoxicated --version    # print the client's version line
 INTOXICATED_PROFILE=alt intoxicated   # run another profile (see below)
 ```
@@ -239,6 +240,42 @@ any screen-space effect they can only show what is on screen: anything off
 screen or hidden behind something else is missing from the reflection, which
 fades out towards the screen edges.
 
+Depth of field and bloom are two more experimental extras, each off by default
+and switched on its own: `INTOXICATED_DOF=1` and `INTOXICATED_BLOOM=1`. They
+are drawn at the same point as the reflections, after them and in that order,
+so the HUD is drawn over all three and is never blurred, reflected or made to
+glow. Neither shows anything the engine did not draw: the depth of field only
+blurs the picture, and the bloom only adds a glow around what is already
+bright, so fog and darkness stay as they are.
+
+- Depth of field keeps the focus sharp and blurs what is behind it (and, with
+  `INTOXICATED_DOF_NEAR_BLUR=1`, what is in front), more the further away,
+  like a camera lens, with a round bokeh; the sky counts as far. The focus is
+  the nearest thing around the screen centre, which in third person is your
+  character, eased over `INTOXICATED_DOF_FOCUS_TIME` seconds so it does not
+  pump, or a fixed `INTOXICATED_DOF_FOCUS_DISTANCE` in studs with
+  `INTOXICATED_DOF_AUTOFOCUS=0`. `_STRENGTH` is the largest blur as a radius
+  in pixels at 1080p, `_FOCUS_RANGE` how much either side of the focus stays
+  sharp, `_SAMPLES` the quality. A blurred background does not bleed over a
+  sharp edge in front of it. Looks: `cinematic` (the default), `subtle`,
+  `portrait` (`INTOXICATED_DOF_LOOK`).
+- Bloom makes bright lights, neon and bright sky glow:
+  `INTOXICATED_BLOOM_THRESHOLD` is the brightness it starts at, from 0 to 1
+  (the engine's picture is not HDR), with a soft `_KNEE`; `_INTENSITY`,
+  `_RADIUS` (tight to wide) and `_TINT` shape the glow. Looks: `soft` (the
+  default), `neon`, `dreamy` (`INTOXICATED_BLOOM_LOOK`).
+
+devctl takes `dof` and `bloom` with the same words as `ssr` (`on`, `off`,
+`get`, `set <name> <value>`, `look <name>`, `reset`, `stats`), and the
+Shaders page sets all of it. Limits: the depth of field works
+from the scene's depth, which glass, water and other transparent surfaces
+usually do not write, so they are blurred or kept sharp by what is behind them
+(INFERRED); the
+autofocus looks only at the screen centre, so in shift-lock (character off
+centre) it focuses on what the crosshair is on; and studs for the fixed focus
+assume Roblox's near plane of 0.1 studs (INFERRED from the depth of the scene
+at a known distance).
+
 When the disk holding the profile's Roblox data runs short, the client says so:
 below 2 GiB free as it hands Roblox its window, below 512 MiB again when the
 run ends. The engine itself never reports a full disk.
@@ -254,10 +291,12 @@ An optional desktop app for what is otherwise set by hand. FastFlags: presets
 MSAA), every flag in the profile's `flags.json` with inline editing, import of
 a JSON file (a Bloxstrap export or a `ClientAppSettings.json`) with a preview,
 export and reset. Client options: window, input, graphics, audio and session.
-Shaders: the screen-space reflections, with a switch, the named looks
-(Competitive, Wet road, Clean mirror, Puddles, Glossy) and a fine-tune row for
-each of their settings; picking a look clears the fine tuning, after asking,
-and each row has its own reset. Like the client options they apply from the
+Shaders: the screen-space reflections, the depth of field and the bloom, one
+group each with a switch, the named looks (Competitive, Wet road, Clean
+mirror, Puddles and Glossy for the reflections; Cinematic, Subtle and Portrait
+for the depth of field; Soft, Neon and Dreamy for the bloom) and a fine-tune
+row for each of their settings; picking a look clears the fine tuning, after
+asking, and each row has its own reset. Like the client options they apply from the
 next launch. Profiles: create, delete and pick the default one. And Play, a place id or
 link field, and the two update commands. It is a Qt 6 Widgets program in
 `settings/` that needs `qt6-base` and nothing else.
@@ -288,8 +327,8 @@ It writes two kinds of file, and both can still be edited by hand:
 
 Both are written to a temporary file and renamed into place. The presets show
 the client's own flags, which the app reads from `intoxicated --default-flags`,
-and the Shaders page shows the client's own looks and their values, read from
-`intoxicated --ssr-looks`, so the app keeps no copy of either.
+and the Shaders page shows the client's own effects, looks and values, read
+from `intoxicated --shader-looks`, so the app keeps no copy of either.
 A profile shows as in use while a client holds it, and is not deleted then.
 "Update Intoxicated" runs `intoxicated --update` with no terminal, so the
 installer asks for the password through the app's own dialog (`sudo -A` with

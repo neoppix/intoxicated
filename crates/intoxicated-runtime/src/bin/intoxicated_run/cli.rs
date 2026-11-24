@@ -1,5 +1,6 @@
 //! The command line: the options, the usage text, the parse errors,
-//! `--check-join-url`, `--print-default-flags` and `--print-ssr-looks`.
+//! `--check-join-url`, `--print-default-flags`, `--print-ssr-looks` and
+//! `--print-shader-looks`.
 //!
 //! Arguments are read left to right. A flag that takes a value consumes the
 //! next argument whatever it looks like, a repeated flag replaces the earlier
@@ -238,6 +239,16 @@ pub fn print_ssr_looks() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `--print-shader-looks`: every effect drawn before the HUD (reflections,
+/// depth of field, bloom), each with its switch, knobs and named looks
+/// ([`intoxicated_runtime::android::ssr::shader_looks_json`]), as one JSON
+/// object on stdout. Nothing else runs. The launcher's `--shader-looks` runs
+/// it for Intoxicated Settings' Shaders page.
+pub fn print_shader_looks() -> ExitCode {
+    println!("{}", intoxicated_runtime::android::ssr::shader_looks_json());
+    ExitCode::SUCCESS
+}
+
 /// The usage text, written to stderr by `--help` and after a parse error.
 ///
 /// One block per option, the flag and its placeholder padded to column 20
@@ -292,6 +303,10 @@ usage: intoxicated-run --lib-dir <dir> [options]
                     kind, range, default) and named looks (the value each
                     starts every knob at) as one JSON object, and exit 0.
                     Runs nothing else; the launcher's --ssr-looks runs it
+  --print-shader-looks  the same for every effect drawn before the HUD
+                    (reflections, depth of field, bloom), as one JSON object
+                    with a list of effects, and exit 0. Runs nothing else;
+                    the launcher's --shader-looks runs it
   --run <secs>      how long to let Roblox run after handover (default 15).
                     0 means no timer: run until the window is closed or the
                     process is sent SIGTERM/SIGINT. Closing the window ends the
@@ -466,6 +481,41 @@ env:
                                      reflects, 1 their brightness in the hue
                                      of the wet surface, so water stays blue
                                      (0.5)
+  INTOXICATED_DOF=1                  depth of field (experimental): what is
+                                     far from the focus is blurred, like a
+                                     camera lens, before the HUD is drawn, so
+                                     the HUD stays sharp. Off by default.
+                                     devctl's dof takes the same words as ssr
+  INTOXICATED_DOF_LOOK=<name>        cinematic (the defaults), subtle or
+                                     portrait; the variables below change it
+  INTOXICATED_DOF_STRENGTH=<0..32>   the largest blur, a radius in pixels at
+                                     1080p (8)
+  INTOXICATED_DOF_AUTOFOCUS=<0|1>    1 focus on the nearest thing around the
+                                     screen centre, eased over time; 0 at
+                                     FOCUS_DISTANCE (1)
+  INTOXICATED_DOF_FOCUS_DISTANCE=<studs>
+                                     the focus without autofocus (20)
+  INTOXICATED_DOF_FOCUS_RANGE=<0..4> how far either side of the focus stays
+                                     sharp, as a fraction of its distance
+                                     (0.3)
+  INTOXICATED_DOF_NEAR_BLUR=<0|1>    1 what is nearer than the focus blurs
+                                     too (0)
+  INTOXICATED_DOF_FOCUS_TIME=<secs>  how long the autofocus takes to settle
+                                     (0.3)
+  INTOXICATED_DOF_SAMPLES=<8..128>   taps of the blur (48)
+  INTOXICATED_BLOOM=1                bloom (experimental): a glow around
+                                     bright lights, drawn before the HUD, so
+                                     the HUD never glows. Off by default.
+                                     devctl's bloom takes the same words as
+                                     ssr
+  INTOXICATED_BLOOM_LOOK=<name>      soft (the defaults), neon or dreamy
+  INTOXICATED_BLOOM_INTENSITY=<0..2> how strong the glow is (0.35)
+  INTOXICATED_BLOOM_THRESHOLD=<0..1> the brightness a pixel starts to glow
+                                     at (0.75)
+  INTOXICATED_BLOOM_KNEE=<0..1>      how softly the glow starts around the
+                                     threshold (0.5)
+  INTOXICATED_BLOOM_RADIUS=<0..1>    0 a tight glow, 1 a wide one (0.7)
+  INTOXICATED_BLOOM_TINT=<r,g,b>     colour of the glow, each 0 to 2 (1,1,1)
   INTOXICATED_FILES_DIR=<dir>        the engine's data root (default
                                      <profile>/data): its files/ and cache/
   INTOXICATED_EARLY_DIRS=<keys>      directory setters sent before
@@ -590,6 +640,7 @@ mod tests {
         assert_eq!(error("--lib-dir x --check-join-url"), "unrecognised argument: --check-join-url");
         assert_eq!(error("--lib-dir x --print-default-flags"), "unrecognised argument: --print-default-flags");
         assert_eq!(error("--lib-dir x --print-ssr-looks"), "unrecognised argument: --print-ssr-looks");
+        assert_eq!(error("--lib-dir x --print-shader-looks"), "unrecognised argument: --print-shader-looks");
         for (flag, message) in [
             ("--lib-dir", "--lib-dir needs a value"),
             ("--library", "--library needs a value"),
@@ -751,6 +802,7 @@ mod tests {
             "--check-join-url",
             "--print-default-flags",
             "--print-ssr-looks",
+            "--print-shader-looks",
             "--run <secs>",
             "--dump-classes <f>",
             "-v, --verbose",

@@ -1,0 +1,414 @@
+// Depth of field and bloom on the engine's resolved scene colour (see
+// `ssr/post.rs`), recorded after the reflections and before the swapchain
+// pass that draws the HUD, so neither ever touches the interface. One source,
+// one variant per dispatch, chosen by a define:
+//
+//   FOCUS            one group: where the camera is focused, from the depth
+//                    of a small region around the screen centre, eased over
+//                    time, kept in a 1x1 image of ours from frame to frame.
+//   DOF_PREP         half resolution: the scene colour, 2x2 averaged, and the
+//                    signed circle of confusion of the nearest of the four.
+//   DOF_GATHER       half resolution: the blur, gathered over a golden-angle
+//                    disc (a round bokeh) as scatter would spread it.
+//   DOF_COMPOSE      full resolution: the sharp scene and the blur, mixed by
+//                    each pixel's own circle of confusion.
+//   BLOOM_PREFILTER  half resolution: what is brighter than the threshold,
+//                    with a soft knee.
+//   BLOOM_DOWN       one level of the chain down (a dual filter).
+//   BLOOM_UP         one level up: the coarser level, tent filtered, blended
+//                    into this one; how much is the radius.
+//   BLOOM_COMPOSE    full resolution: the glow screened over the scene.
+//
+// The scene colour is read from the engine's image when nothing before ran,
+// and from our own 32-bit result image (packed in the engine's format) when
+// the reflections or the depth of field already wrote it; the composes write
+// that image, which `ssr.rs` then copies over the engine's once.
+//
+// Depth is reversed-Z with the far plane at infinity: depth = near / z, the
+// sky is 0, so a distance in near-plane units is 1 / depth and anything
+// linear in 1 / z (a circle of confusion is) is linear in depth.
+//
+// Built by build.rs with the system's glslc when there is one, and otherwise
+// taken from the files beside this one, the numbers glslc prints wrapped in
+// `&[` and `]`, one per define:
+//
+//     glslc -O --target-env=vulkan1.0 -mfmt=num -D<VARIANT> post.comp -o -
+//         -> post_<variant in lower case>.spv.rs
+//
+// A test compiles every variant again and compares, whenever glslc is there.
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// Set 0 is the reflections' set: the engine's colour, our depth copy and
+// our result image.
+layout(set = 0, binding = 0) uniform sampler2D color_tex;
+layout(set = 0, binding = 2, r32f) uniform readonly image2D depth_copy;
+layout(set = 0, binding = 3, r32ui) uniform uimage2D result_img;
+// Set 1 is one per dispatch: what it reads, what it writes, a second input
+// and the focus.
+layout(set = 1, binding = 0) uniform sampler2D in_tex;
+layout(set = 1, binding = 1, rgba16f) uniform image2D out_img;
+layout(set = 1, binding = 2) uniform sampler2D aux_tex;
+layout(set = 1, binding = 3, r32f) uniform image2D focus_img;
+
+// std430, as push constants are laid out; `post::PostParams` mirrors it.
+layout(push_constant) uniform Params {
+    // The scene, and the image this dispatch writes.
+    uvec2 size;
+    uvec2 dst_size;
+    // The glow is multiplied by tint.rgb.
+    vec4 tint;
+    // Bit 0: the scene colour is in our result image. Bit 1: things nearer
+    // than the focus blur too. Bit 2: autofocus. Bit 3: the focus starts
+    // over (no easing). Bits 8 to 11: how the engine's format packs a pixel.
+    uint flags;
+    // The largest circle of confusion, as a radius in half-resolution pixels.
+    float coc_scale;
+    // The fixed focus distance, in near-plane units.
+    float focus_fixed;
+    // The band either side of the focus that stays sharp, as a fraction of
+    // the focus distance.
+    float focus_range;
+    // How far the focus moves towards where it should be this frame, 0 to 1.
+    float focus_blend;
+    // Bloom: the brightness it starts at, and the width of the soft knee
+    // around it as a fraction of the threshold.
+    float threshold;
+    float knee;
+    // How strong the glow is.
+    float intensity;
+    // 0: a tight glow from the finest level only; 1: mostly the coarsest.
+    float radius;
+    // Taps of the depth of field's gather.
+    uint samples;
+} pc;
+
+const uint SRC_RESULT = 1u;
+const uint NEAR_BLUR = 2u;
+const uint AUTOFOCUS = 4u;
+const uint FOCUS_RESET = 8u;
+
+// The sky, in near-plane units: far enough to count as infinity.
+const float SKY_Z = 1e7;
+// How quickly the far blur grows past the sharp band: at a distance of
+// (1 + 1 / FAR_GAIN) times the band's far edge it is at its largest.
+const float FAR_GAIN = 1.5;
+// The same for the near blur, towards the camera.
+const float NEAR_GAIN = 1.0;
+// The region the autofocus looks at: a square this fraction of the screen's
+// height either side of its centre.
+const float FOCUS_AREA = 0.05;
+
+vec4 unpack(uint w) {
+    uint mode = (pc.flags >> 8) & 0xfu;
+    if (mode == 2u) {
+        return unpackUnorm4x8(w);         // R8G8B8A8_UNORM
+    }
+    if (mode == 3u) {
+        return unpackUnorm4x8(w).bgra;    // B8G8R8A8_UNORM
+    }
+    vec4 q = vec4(uvec4(w & 1023u, (w >> 10) & 1023u, (w >> 20) & 1023u, w >> 30)) / vec4(1023.0, 1023.0, 1023.0, 3.0);
+    if (mode == 1u) {
+        q = q.bgra;                       // A2R10G10B10_UNORM_PACK32
+    }
+    return q;                             // A2B10G10R10_UNORM_PACK32
+}
+
+// The inverse of `unpack`, as `ssr.comp`'s compose writes it.
+uint pack(vec4 c) {
+    c = clamp(c, 0.0, 1.0);
+    uint mode = (pc.flags >> 8) & 0xfu;
+    if (mode == 2u) {
+        return packUnorm4x8(c);
+    }
+    if (mode == 3u) {
+        return packUnorm4x8(c.bgra);
+    }
+    uvec4 q = uvec4(round(c * vec4(1023.0, 1023.0, 1023.0, 3.0)));
+    if (mode == 1u) {
+        q = q.bgra;
+    }
+    return q.r | (q.g << 10) | (q.b << 20) | (q.a << 30);
+}
+
+// The scene colour at a full-resolution pixel, as the effects before left it.
+vec4 src_at(ivec2 p) {
+    p = clamp(p, ivec2(0), ivec2(pc.size) - 1);
+    if ((pc.flags & SRC_RESULT) != 0u) {
+        return unpack(imageLoad(result_img, p).r);
+    }
+    return texelFetch(color_tex, p, 0);
+}
+
+float depth_at(ivec2 p) {
+    return imageLoad(depth_copy, clamp(p, ivec2(0), ivec2(pc.size) - 1)).r;
+}
+
+float luma(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+// The signed circle of confusion of depth `d` with the camera focused at
+// `focus` (near-plane units), in half-resolution pixels: positive behind
+// the sharp band, negative in front of it (only with near blur), 0 inside.
+// Like a lens, it grows with the difference of inverse distances, so the
+// sky is as blurred as anything gets.
+float coc_of(float d, float focus) {
+    float hi = focus * (1.0 + pc.focus_range);
+    float lo = focus / (1.0 + pc.focus_range);
+    float far = clamp((1.0 - hi * d) * FAR_GAIN, 0.0, 1.0);
+    float near = 0.0;
+    if ((pc.flags & NEAR_BLUR) != 0u) {
+        near = clamp((lo * d - 1.0) * NEAR_GAIN, 0.0, 1.0);
+    }
+    return (far - near) * pc.coc_scale;
+}
+
+float focus_now() {
+    return imageLoad(focus_img, ivec2(0)).r;
+}
+
+#if defined(FOCUS)
+
+shared float nearest[64];
+
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    vec2 at = vec2(i % 8u, i / 8u) + 0.5;
+    vec2 offset = (at / 8.0 * 2.0 - 1.0) * FOCUS_AREA * float(pc.size.y);
+    nearest[i] = depth_at(ivec2(vec2(pc.size) * 0.5 + offset));
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1) {
+        if (i < s) {
+            nearest[i] = max(nearest[i], nearest[i + s]);
+        }
+        barrier();
+    }
+    if (i == 0u) {
+        // The nearest thing in the region: the character in third person,
+        // whatever is aimed at in first.
+        float target = nearest[0] > 0.0 ? 1.0 / nearest[0] : SKY_Z;
+        if ((pc.flags & AUTOFOCUS) == 0u) {
+            target = pc.focus_fixed;
+        }
+        target = clamp(target, 1.0, SKY_Z);
+        float old = focus_now();
+        float f = target;
+        // Eased in log distance, so a jump from 10 to 20 studs takes as
+        // long as one from 100 to 200.
+        if ((pc.flags & FOCUS_RESET) == 0u && old >= 1.0 && old <= SKY_Z) {
+            f = exp(mix(log(old), log(target), pc.focus_blend));
+        }
+        imageStore(focus_img, ivec2(0), vec4(f));
+    }
+}
+
+#elif defined(DOF_PREP)
+
+void main() {
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(q), pc.dst_size))) {
+        return;
+    }
+    vec3 sum = vec3(0.0);
+    float d = 0.0;
+    for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < 2; ++i) {
+            ivec2 p = 2 * q + ivec2(i, j);
+            sum += src_at(p).rgb;
+            d = max(d, depth_at(p));
+        }
+    }
+    // The circle of the nearest of the four: a block on the edge of a sharp
+    // thing in front of a blurred background stays sharp, so it is never
+    // spread over the background as a ghost of the edge.
+    imageStore(out_img, q, vec4(0.25 * sum, coc_of(d, focus_now())));
+}
+
+#elif defined(DOF_GATHER)
+
+const float GOLDEN_ANGLE = 2.39996323;
+
+void main() {
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(q), pc.dst_size))) {
+        return;
+    }
+    vec4 c = texelFetch(in_tex, q, 0);
+    float radius = pc.coc_scale;
+    if (radius < 0.5 || pc.samples == 0u) {
+        imageStore(out_img, q, vec4(c.rgb, 0.0));
+        return;
+    }
+    // Scatter as gather: each tap is a texel whose own circle may cover this
+    // one. A tap behind this texel covers it only as far as this texel's
+    // own circle reaches (twice it), so a blurred background never bleeds
+    // over a sharp edge in front of it; a tap in front covers it as far as
+    // its own circle goes, so a blurred foreground does spread over what
+    // is behind it.
+    float own = abs(c.a);
+    vec3 sum = c.rgb;
+    float weight = 1.0;
+    float front = 0.0;
+    ivec2 last = ivec2(pc.dst_size) - 1;
+    float n = float(pc.samples);
+    for (uint k = 0u; k < pc.samples; ++k) {
+        float r = radius * sqrt((float(k) + 0.5) / n);
+        float a = float(k) * GOLDEN_ANGLE;
+        ivec2 t = clamp(ivec2(floor(vec2(q) + 0.5 + r * vec2(cos(a), sin(a)))), ivec2(0), last);
+        vec4 s = texelFetch(in_tex, t, 0);
+        float size = abs(s.a);
+        bool behind = s.a > c.a;
+        if (behind) {
+            size = min(size, 2.0 * own);
+        }
+        float m = smoothstep(r - 0.5, r + 0.5, size);
+        sum += m * s.rgb;
+        weight += m;
+        if (s.a < c.a - 1.0) {
+            front += m;
+        }
+    }
+    // How much of the blur here is a nearer thing's: the compose shows the
+    // blur that much even where this pixel itself is sharp.
+    float near = clamp(2.0 * front / weight, 0.0, 1.0);
+    imageStore(out_img, q, vec4(sum / weight, near));
+}
+
+#elif defined(DOF_COMPOSE)
+
+// in_tex: the gathered blur; aux_tex: the prepared half resolution (for
+// each texel's circle).
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(p), pc.size))) {
+        return;
+    }
+    vec4 base = src_at(p);
+    float coc = coc_of(depth_at(p), focus_now());
+    // The four nearest half-resolution texels, bilinear but each weighted
+    // down the more its circle differs from this pixel's, so the blur of a
+    // background next to a sharp edge takes nothing of the edge.
+    vec2 h = (vec2(p) + 0.5) * 0.5 - 0.5;
+    ivec2 h0 = ivec2(floor(h));
+    vec2 f = h - vec2(h0);
+    ivec2 last = ivec2(pc.dst_size) - 1;
+    vec4 sum = vec4(0.0);
+    float weight = 0.0;
+    for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < 2; ++i) {
+            ivec2 t = clamp(h0 + ivec2(i, j), ivec2(0), last);
+            float w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y);
+            float like = 1.0 / (1.0 + 2.0 * abs(texelFetch(aux_tex, t, 0).a - coc));
+            w *= like + 1e-3;
+            sum += w * texelFetch(in_tex, t, 0);
+            weight += w;
+        }
+    }
+    vec4 blur = sum / max(weight, 1e-6);
+    float amount = max(smoothstep(0.25, 1.0, abs(coc)), blur.a);
+    base.rgb = mix(base.rgb, blur.rgb, amount);
+    imageStore(result_img, p, uvec4(pack(base), 0u, 0u, 0u));
+}
+
+#elif defined(BLOOM_PREFILTER)
+
+void main() {
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(q), pc.dst_size))) {
+        return;
+    }
+    // Weighted by 1 / (1 + luma), so a single bright pixel does not flicker
+    // as a big blob as it moves between blocks.
+    vec3 sum = vec3(0.0);
+    float weight = 0.0;
+    for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < 2; ++i) {
+            vec3 c = src_at(2 * q + ivec2(i, j)).rgb;
+            float w = 1.0 / (1.0 + luma(c));
+            sum += w * c;
+            weight += w;
+        }
+    }
+    vec3 c = sum / weight;
+    float bright = max(c.r, max(c.g, c.b));
+    float k = max(pc.threshold * pc.knee, 1e-4);
+    float soft = clamp(bright - pc.threshold + k, 0.0, 2.0 * k);
+    soft = soft * soft / (4.0 * k);
+    float keep = max(soft, bright - pc.threshold) / max(bright, 1e-4);
+    imageStore(out_img, q, vec4(c * keep, 1.0));
+}
+
+#elif defined(BLOOM_DOWN)
+
+// in_tex: the finer level, twice this one's size.
+void main() {
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(q), pc.dst_size))) {
+        return;
+    }
+    vec2 uv = (vec2(q) + 0.5) / vec2(pc.dst_size);
+    vec2 o = 1.0 / vec2(textureSize(in_tex, 0));
+    vec3 c = 4.0 * textureLod(in_tex, uv, 0.0).rgb;
+    c += textureLod(in_tex, uv + vec2(-o.x, -o.y), 0.0).rgb;
+    c += textureLod(in_tex, uv + vec2(o.x, -o.y), 0.0).rgb;
+    c += textureLod(in_tex, uv + vec2(-o.x, o.y), 0.0).rgb;
+    c += textureLod(in_tex, uv + vec2(o.x, o.y), 0.0).rgb;
+    imageStore(out_img, q, vec4(c / 8.0, 1.0));
+}
+
+#else
+
+// A 3 by 3 tent over `tex` around `uv`, one texel of it apart.
+vec3 tent(sampler2D tex, vec2 uv) {
+    vec2 o = 1.0 / vec2(textureSize(tex, 0));
+    vec3 c = 4.0 * textureLod(tex, uv, 0.0).rgb;
+    c += 2.0 * textureLod(tex, uv + vec2(o.x, 0.0), 0.0).rgb;
+    c += 2.0 * textureLod(tex, uv - vec2(o.x, 0.0), 0.0).rgb;
+    c += 2.0 * textureLod(tex, uv + vec2(0.0, o.y), 0.0).rgb;
+    c += 2.0 * textureLod(tex, uv - vec2(0.0, o.y), 0.0).rgb;
+    c += textureLod(tex, uv + o, 0.0).rgb;
+    c += textureLod(tex, uv - o, 0.0).rgb;
+    c += textureLod(tex, uv + vec2(o.x, -o.y), 0.0).rgb;
+    c += textureLod(tex, uv + vec2(-o.x, o.y), 0.0).rgb;
+    return c / 16.0;
+}
+
+#if defined(BLOOM_UP)
+
+// in_tex: the coarser level, already merged with those below it; out_img:
+// this level, read and written in place.
+void main() {
+    ivec2 q = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(q), pc.dst_size))) {
+        return;
+    }
+    vec2 uv = (vec2(q) + 0.5) / vec2(pc.dst_size);
+    vec3 own = imageLoad(out_img, q).rgb;
+    imageStore(out_img, q, vec4(mix(own, tent(in_tex, uv), pc.radius), 1.0));
+}
+
+#elif defined(BLOOM_COMPOSE)
+
+// in_tex: the finest level, merged with every coarser one.
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(p), pc.size))) {
+        return;
+    }
+    vec4 base = src_at(p);
+    vec2 uv = (vec2(p) + 0.5) / vec2(pc.size);
+    vec3 glow = clamp(tent(in_tex, uv) * pc.tint.rgb * pc.intensity, 0.0, 1.0);
+    // Screened rather than added: the scene is not HDR, and a sum would
+    // flatten every bright area to white.
+    base.rgb = 1.0 - (1.0 - base.rgb) * (1.0 - glow);
+    imageStore(result_img, p, uvec4(pack(base), 0u, 0u, 0u));
+}
+
+#else
+#error "post.comp needs one of FOCUS, DOF_PREP, DOF_GATHER, DOF_COMPOSE, BLOOM_PREFILTER, BLOOM_DOWN, BLOOM_UP, BLOOM_COMPOSE"
+#endif
+
+#endif

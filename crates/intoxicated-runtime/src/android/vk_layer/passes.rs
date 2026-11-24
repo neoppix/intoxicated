@@ -6,8 +6,9 @@
 //!
 //! The hooks here, and the image and view hooks in `vulkan_etc` that feed
 //! the registry, are handed out only when [`wanted`]: `INTOXICATED_TRACE_PASSES`
-//! is set, `INTOXICATED_SSR=1`, or dev control is on (devctl `passes`,
-//! `depthshot` and `ssr` need them). Otherwise the getters hand out exactly
+//! is set, `INTOXICATED_SSR=1`, `INTOXICATED_DOF=1` or `INTOXICATED_BLOOM=1`,
+//! or dev control is on (devctl `passes`, `depthshot`, `ssr`, `dof` and
+//! `bloom` need them). Otherwise the getters hand out exactly
 //! what they did before.
 //!
 //! When they are handed out, the creation hooks (render passes,
@@ -16,8 +17,9 @@
 //! end of a pass, draws, copies, barriers, submits, and the command buffer
 //! begin and compute binds the reflections follow) cost one relaxed load of
 //! [`WATCH`] and the forward, until something is watching: a trace for one
-//! frame, a depth capture until it is taken, or the screen-space reflections
-//! (`android::ssr`) while they are on.
+//! frame, a depth capture until it is taken, or the effects recorded before
+//! the swapchain pass (reflections, depth of field and bloom, all in
+//! `android::ssr`) while any of them is on.
 //!
 //! # The trace
 //!
@@ -54,7 +56,8 @@ const DEFAULT_TRACE_AT: u64 = 600;
 pub(crate) static WATCH: AtomicU32 = AtomicU32::new(0);
 pub(crate) const WATCH_TRACE: u32 = 0x1;
 pub(crate) const WATCH_DEPTH: u32 = 0x2;
-pub(crate) const WATCH_SSR: u32 = 0x4;
+/// The reflections, the depth of field or the bloom (`android::ssr`).
+pub(crate) const WATCH_POST: u32 = 0x4;
 
 /// The present count at which the next trace starts; `u64::MAX` for none.
 static TRACE_AT: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -81,7 +84,7 @@ pub(crate) fn wanted() -> bool {
         }
         let ssr = crate::android::ssr::requested_at_start();
         if ssr {
-            WATCH.fetch_or(WATCH_SSR, Relaxed);
+            WATCH.fetch_or(WATCH_POST, Relaxed);
         }
         at.is_some() || ssr || crate::devctl::enabled()
     })
@@ -892,7 +895,7 @@ unsafe fn pass_from_rendering(cmd: usize, info: *const c_void) -> Pass {
 /// Before the begin of a pass is forwarded. The reflections, when this is
 /// the pass they go in front of, record their work here.
 fn pass_begun(watch: u32, pass: Pass) {
-    if watch & WATCH_SSR != 0 {
+    if watch & WATCH_POST != 0 {
         crate::android::ssr::pass_begun(&pass);
     }
     if watch & WATCH_DEPTH != 0 {
@@ -1065,7 +1068,7 @@ fn transfer(cmd: *mut c_void, what: &'static str, src: u64, src_layout: u32, dst
     if w & WATCH_DEPTH != 0 && dst != 0 {
         crate::android::depth_capture::written(dst);
     }
-    if w & WATCH_SSR != 0 && dst != 0 {
+    if w & WATCH_POST != 0 && dst != 0 {
         if what.starts_with("vkCmdResolveImage") {
             crate::android::ssr::resolved(cmd, src, dst, dst_layout);
         } else {
@@ -1162,7 +1165,7 @@ fn cleared(cmd: *mut c_void, what: &'static str, image: u64, layout: u32) {
     if w & WATCH_DEPTH != 0 {
         crate::android::depth_capture::written(image);
     }
-    if w & WATCH_SSR != 0 {
+    if w & WATCH_POST != 0 {
         crate::android::ssr::written(cmd, image);
     }
 }
@@ -1200,7 +1203,7 @@ fn barriers(watch: u32, list: Vec<Event>) {
             }
         }
     }
-    if watch & WATCH_SSR != 0 {
+    if watch & WATCH_POST != 0 {
         if let Some(Event::Barrier { cmd, .. }) = list.first() {
             let layouts = list.iter().filter_map(|e| match e {
                 Event::Barrier { image, new, .. } => Some((*image, *new)),
@@ -1339,14 +1342,14 @@ extern "C" fn queue_submit2(queue: *mut c_void, count: u32, submits: *const c_vo
     submit(&QUEUE_SUBMIT2, (64, 32, 40, 32, 16), queue, count, submits, fence)
 }
 
-// ------------------------------------------------------------ for the reflections
+// ------------------------------------------------------------ for the reflections, depth of field and bloom
 //
 // The start of a recording, and the engine's compute state, which our
 // dispatch disturbs and puts back (see `android::ssr`). Graphics binds are
 // forwarded after one comparison.
 
 fn ssr_watching() -> bool {
-    WATCH.load(Relaxed) & WATCH_SSR != 0
+    WATCH.load(Relaxed) & WATCH_POST != 0
 }
 
 extern "C" fn begin_command_buffer(cmd: *mut c_void, info: *const c_void) -> i32 {

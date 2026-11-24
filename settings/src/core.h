@@ -257,14 +257,16 @@ std::optional<QByteArray> runLauncher(const QStringList &args, int timeoutMs, QS
 // `intoxicated --default-flags`, parsed.
 std::optional<FlagMap> readDefaultFlags(QString *error);
 
-// --- Reflections (the Shaders page) -----------------------------------------
+// --- Effects (the Shaders page) ---------------------------------------------
 
-// The client's screen-space reflections are set by settings.conf lines the
-// client reads at start: INTOXICATED_SSR=1 turns them on,
+// The client draws three effects before the HUD: screen-space reflections,
+// depth of field and bloom. Each is set by settings.conf lines the client
+// reads at start: INTOXICATED_SSR=1 (or _DOF, _BLOOM) turns it on,
 // INTOXICATED_SSR_LOOK=<name> starts from a named look and
-// INTOXICATED_SSR_<KNOB>=<value> overrides one knob of it. The knobs and the
-// looks are the client's own, read from `intoxicated --ssr-looks`, so this
-// app keeps no copy of them.
+// INTOXICATED_SSR_<KNOB>=<value> overrides one knob of it. The effects, their
+// knobs and looks are the client's own, read from `intoxicated
+// --shader-looks` (`--ssr-looks` for the reflections alone), so this app
+// keeps no copy of them. The types keep the Ssr names of the first effect.
 
 inline const QString kSsrSetting = QStringLiteral("INTOXICATED_SSR");
 inline const QString kSsrLookSetting = QStringLiteral("INTOXICATED_SSR_LOOK");
@@ -290,7 +292,15 @@ struct SsrLook {
     QMap<QString, SsrValue> values;
 };
 
+// One effect: its switch and look variables, knobs and looks.
 struct SsrTable {
+    // Its devctl name ("ssr"), its title and one line on what it does; empty
+    // when read from `--ssr-looks`, which does not carry them.
+    QString name;
+    QString title;
+    QString summary;
+    QString switchEnv = kSsrSetting;
+    QString lookEnv = kSsrLookSetting;
     QList<SsrKnob> knobs;
     QList<SsrLook> looks;
     QString defaultLook;
@@ -303,6 +313,10 @@ struct SsrTable {
 // that is not a usable table.
 bool parseSsrTable(const QByteArray &json, SsrTable *out, QString *error);
 std::optional<SsrTable> readSsrTable(QString *error);
+// Parse what `intoxicated --shader-looks` prints: every effect, in the order
+// the client draws them, each a usable table with its own variables.
+bool parseShaderTables(const QByteArray &json, QList<SsrTable> *out, QString *error);
+std::optional<QList<SsrTable>> readShaderTables(QString *error);
 
 // "wet_road" as a button says it: "Wet road".
 QString ssrLookTitle(const QString &name);
@@ -320,8 +334,11 @@ QString formatSsrValue(const SsrKnob &knob, const SsrValue &value);
 bool ssrOn(const SettingsConf &conf);
 // On writes INTOXICATED_SSR=1, off removes it.
 void setSsrOn(SettingsConf &conf, bool on);
-// The look the client starts from: the one INTOXICATED_SSR_LOOK names, else
-// the default one (also when it names no look). UNKNOWN is set to the
+// The same for any effect's switch (TABLE's, or the variable SWITCHENV).
+bool effectOn(const QString &switchEnv, const SettingsConf &conf);
+void setEffectOn(const QString &switchEnv, SettingsConf &conf, bool on);
+// The look the client starts from: the one the table's look variable names,
+// else the default one (also when it names no look). UNKNOWN is set to the
 // setting's text when it names no look.
 QString ssrLook(const SsrTable &table, const SettingsConf &conf, QString *unknown = nullptr);
 // The knob's line in settings.conf, when it has a non-blank one.
@@ -330,7 +347,7 @@ std::optional<QString> ssrOverride(const SettingsConf &conf, const SsrKnob &knob
 QStringList ssrOverrides(const SsrTable &table, const SettingsConf &conf);
 // The value the client starts with: a usable override, else the look's.
 SsrValue effectiveSsrValue(const SsrTable &table, const SettingsConf &conf, const SsrKnob &knob);
-// Start from LOOK: the default look removes INTOXICATED_SSR_LOOK, another one
+// Start from LOOK: the default look removes the look variable, another one
 // writes it. Either way every knob's override is removed. Refused, with CONF
 // unchanged, for a name that is not a look.
 bool applySsrLook(const SsrTable &table, SettingsConf &conf, const QString &look);

@@ -1,7 +1,9 @@
-// Intoxicated Settings: the Shaders page. The client's screen-space
-// reflections: the switch, the named looks and a fine-tune row per knob, each
-// written to settings.conf as it changes. The knobs and the looks come from
-// `intoxicated --ssr-looks`, so nothing here keeps a copy of their values.
+// Intoxicated Settings: the Shaders page. The effects the client draws into
+// the game before the HUD (screen-space reflections, depth of field, bloom),
+// one group each: the switch, the named looks and a fine-tune row per knob,
+// each written to settings.conf as it changes. The effects, their knobs and
+// their looks come from `intoxicated --shader-looks`, so nothing here keeps
+// a copy of their values.
 
 #include "app.h"
 #include "style.h"
@@ -23,6 +25,7 @@ namespace intox {
 namespace {
 
 struct KnobText {
+    const char *effect;
     const char *name;
     const char *title;
     const char *description;
@@ -31,32 +34,67 @@ struct KnobText {
 // What each knob is called on the page. A knob the client adds later gets
 // its name as a title until it is listed here.
 const KnobText kKnobText[] = {
-    {"intensity", "Intensity", "How much of the reflection is blended in"},
-    {"roughness", "Roughness", "Blur of the reflection, more the further away; 0 is still slightly soft"},
-    {"fresnel", "Fresnel", "0 the same at every angle like a mirror, 1 strong only at grazing angles"},
-    {"up_only", "Floors only", "Only surfaces that face up reflect; off for walls too"},
-    {"up_threshold", "Floor threshold", "How flat a surface must be to count as facing up"},
-    {"max_distance", "Ray length", "The longest ray, in multiples of the surface's distance; 0 for no limit"},
-    {"edge_fade", "Edge fade", "Fade towards the screen edges, as a fraction of the smaller side"},
-    {"darken", "Darken", "How much darker wet surfaces are"},
-    {"tint", "Tint", "The colour wet surfaces are multiplied by (red, green, blue)"},
-    {"steps", "Steps", "Steps along each ray: more is finer and costs more GPU time"},
-    {"thickness", "Thickness", "How far behind a surface a ray still hits it, relative to its distance"},
-    {"fov", "Field of view", "The camera's vertical field of view the reflections assume; Roblox's is 70"},
-    {"keep_colour", "Keep colour", "0 the colours it reflects, 1 their brightness in the surface's own hue"},
+    {"ssr", "intensity", "Intensity", "How much of the reflection is blended in"},
+    {"ssr", "roughness", "Roughness", "Blur of the reflection, more the further away; 0 is still slightly soft"},
+    {"ssr", "fresnel", "Fresnel", "0 the same at every angle like a mirror, 1 strong only at grazing angles"},
+    {"ssr", "up_only", "Floors only", "Only surfaces that face up reflect; off for walls too"},
+    {"ssr", "up_threshold", "Floor threshold", "How flat a surface must be to count as facing up"},
+    {"ssr", "max_distance", "Ray length", "The longest ray, in multiples of the surface's distance; 0 for no limit"},
+    {"ssr", "edge_fade", "Edge fade", "Fade towards the screen edges, as a fraction of the smaller side"},
+    {"ssr", "darken", "Darken", "How much darker wet surfaces are"},
+    {"ssr", "tint", "Tint", "The colour wet surfaces are multiplied by (red, green, blue)"},
+    {"ssr", "steps", "Steps", "Steps along each ray: more is finer and costs more GPU time"},
+    {"ssr", "thickness", "Thickness", "How far behind a surface a ray still hits it, relative to its distance"},
+    {"ssr", "fov", "Field of view", "The camera's vertical field of view the reflections assume; Roblox's is 70"},
+    {"ssr", "keep_colour", "Keep colour", "0 the colours it reflects, 1 their brightness in the surface's own hue"},
+    {"dof", "strength", "Strength", "The largest blur, as a radius in pixels at 1080p"},
+    {"dof", "autofocus", "Autofocus", "Focus on the nearest thing at the screen centre; off for a fixed distance"},
+    {"dof", "focus_distance", "Focus distance", "Where the focus is without autofocus, in studs"},
+    {"dof", "focus_range", "Focus range", "How far either side of the focus stays sharp, relative to its distance"},
+    {"dof", "near_blur", "Near blur", "Things nearer than the focus blur too"},
+    {"dof", "focus_time", "Focus time", "Seconds the autofocus takes to settle on a new distance"},
+    {"dof", "samples", "Samples", "Taps of the blur: more is smoother and costs more GPU time"},
+    {"bloom", "intensity", "Intensity", "How strong the glow is"},
+    {"bloom", "threshold", "Threshold", "How bright a pixel must be to glow, 0 to 1"},
+    {"bloom", "knee", "Softness", "How gently the glow fades in around the threshold"},
+    {"bloom", "radius", "Radius", "0 a tight glow around each light, 1 a wide haze"},
+    {"bloom", "tint", "Tint", "The colour of the glow (red, green, blue)"},
 };
 
-KnobText knobText(const QString &name) {
+// The switch row of each effect, and what is offered when the client cannot
+// be asked for its effects: only the switches, by their variables.
+struct EffectText {
+    const char *name;
+    const char *title;
+    const char *switchTitle;
+    const char *switchEnv;
+};
+
+const EffectText kEffectText[] = {
+    {"ssr", "Reflections (SSR)", "Screen-space reflections", "INTOXICATED_SSR"},
+    {"dof", "Depth of field", "Depth of field", "INTOXICATED_DOF"},
+    {"bloom", "Bloom", "Bloom", "INTOXICATED_BLOOM"},
+};
+
+KnobText knobText(const QString &effect, const QString &name) {
     for (const KnobText &t : kKnobText) {
-        if (name == QLatin1String(t.name))
+        if (effect == QLatin1String(t.effect) && name == QLatin1String(t.name))
             return t;
     }
-    return {nullptr, nullptr, nullptr};
+    return {nullptr, nullptr, nullptr, nullptr};
 }
 
-QString knobTitle(const QString &name) {
-    const KnobText t = knobText(name);
+QString knobTitle(const QString &effect, const QString &name) {
+    const KnobText t = knobText(effect, name);
     return t.title ? QString::fromLatin1(t.title) : ssrLookTitle(name);
+}
+
+QString switchTitle(const SsrTable &table) {
+    for (const EffectText &t : kEffectText) {
+        if (table.name == QLatin1String(t.name))
+            return QString::fromLatin1(t.switchTitle);
+    }
+    return table.title;
 }
 
 // The slider's step: whole numbers for a whole knob, else a power of ten
@@ -76,100 +114,155 @@ int decimalsOf(double step) { return step >= 1.0 ? 0 : int(std::lround(-std::log
 // V rounded to STEP's decimals, so 0.3 rather than 0.30000000000000004.
 double onStep(double v, double step) { return QString::number(v, 'f', decimalsOf(step)).toDouble(); }
 
-QGroupBox *group(QVBoxLayout *page, const QString &title, QVBoxLayout **rows) {
-    Section s = section(title);
-    auto *v = new QVBoxLayout(s.body);
-    v->setContentsMargins(8, 2, 8, 4);
-    v->setSpacing(0);
-    *rows = v;
-    page->addWidget(s.box);
-    page->addSpacing(8);
-    return s.box;
+QLabel *note(const QString &text) {
+    auto *l = new QLabel(text);
+    l->setObjectName(QStringLiteral("note"));
+    l->setWordWrap(true);
+    return l;
+}
+
+QLabel *problemLabel() {
+    auto *l = new QLabel;
+    l->setObjectName(QStringLiteral("error"));
+    l->setWordWrap(true);
+    l->setContentsMargins(6, 0, 6, 4);
+    l->hide();
+    return l;
 }
 
 } // namespace
 
 ShadersPage::ShadersPage(AppState *state) : m_state(state) {
     QVBoxLayout *b = pageLayout(this, QStringLiteral("Shaders"),
-                                QStringLiteral("Effects the client draws into the game itself, kept in settings.conf "
-                                               "for every profile. Changes apply the next time Intoxicated starts."));
+                                QStringLiteral("Effects the client draws into the game itself, under the HUD, kept in "
+                                               "settings.conf for every profile. Changes apply the next time "
+                                               "Intoxicated starts."));
     QString error;
-    m_table = readSsrTable(&error);
-
-    QVBoxLayout *rows = nullptr;
-    group(b, QStringLiteral("Reflections (SSR)"), &rows);
-    m_on = new Switch;
-    rows->addWidget(settingRow(QStringLiteral("Screen-space reflections"),
-                               QStringLiteral("Real reflections from the game's own depth, for about 0.5 ms of GPU "
-                                              "time a frame. Only what is on screen can be reflected."),
-                               m_on));
-    connect(m_on, &QCheckBox::clicked, this, [this](bool on) {
-        edit([on](SettingsConf &conf) {
-            setSsrOn(conf, on);
-            return true;
-        });
-    });
-    m_tableError = new QLabel;
-    m_tableError->setObjectName(QStringLiteral("error"));
-    m_tableError->setWordWrap(true);
-    m_tableError->setContentsMargins(6, 0, 6, 6);
-    setProblem(m_tableError, m_table ? QString()
-                                     : QStringLiteral("The looks could not be read, so only the switch is offered: %1")
-                                           .arg(error));
-    rows->addWidget(m_tableError);
-
-    // The look: one segment per named look, as the Quality presets.
-    Section look = section(QStringLiteral("Look"));
-    m_lookBox = look.box;
-    auto *lv = new QVBoxLayout(look.body);
-    lv->setContentsMargins(12, 10, 12, 10);
-    lv->setSpacing(8);
-    auto *row = new QHBoxLayout;
-    row->setSpacing(6);
-    if (m_table) {
-        for (int i = 0; i < m_table->looks.size(); ++i) {
-            auto *btn = new QPushButton(ssrLookTitle(m_table->looks[i].name));
-            btn->setObjectName(QStringLiteral("segment"));
-            btn->setCheckable(true);
-            btn->setCursor(Qt::PointingHandCursor);
-            btn->setFocusPolicy(Qt::NoFocus);
-            btn->setMinimumHeight(34);
-            row->addWidget(btn, 1);
-            m_lookButtons.append(btn);
-            connect(btn, &QPushButton::clicked, this, [this, i] { lookChosen(i); });
+    const auto tables = readShaderTables(&error);
+    m_tableError = problemLabel();
+    setProblem(m_tableError, tables ? QString()
+                                    : QStringLiteral("The effects could not be read, so only their switches are "
+                                                     "offered: %1")
+                                          .arg(error));
+    b->addWidget(m_tableError);
+    if (tables) {
+        for (const SsrTable &t : *tables) {
+            EffectUi fx;
+            fx.table = t;
+            fx.known = true;
+            m_effects.append(fx);
+        }
+    } else {
+        for (const EffectText &t : kEffectText) {
+            EffectUi fx;
+            fx.table.name = QString::fromLatin1(t.name);
+            fx.table.title = QString::fromLatin1(t.title);
+            fx.table.switchEnv = QString::fromLatin1(t.switchEnv);
+            fx.table.lookEnv = fx.table.switchEnv + QStringLiteral("_LOOK");
+            m_effects.append(fx);
         }
     }
-    lv->addLayout(row);
-    m_lookDesc = new QLabel;
-    m_lookDesc->setObjectName(QStringLiteral("note"));
-    m_lookDesc->setWordWrap(true);
-    lv->addWidget(m_lookDesc);
-    b->addWidget(look.box);
-    b->addSpacing(8);
-
-    m_tuneBox = group(b, QStringLiteral("Fine tune"), &rows);
-    auto *tuneNote = new QLabel(QStringLiteral("A change here overrides the look for that one setting; Reset puts "
-                                               "the look's value back. Picking a look clears them all."));
-    tuneNote->setObjectName(QStringLiteral("note"));
-    tuneNote->setWordWrap(true);
-    tuneNote->setContentsMargins(6, 8, 6, 4);
-    rows->addWidget(tuneNote);
-    m_problems = new QLabel;
-    m_problems->setObjectName(QStringLiteral("error"));
-    m_problems->setWordWrap(true);
-    m_problems->setContentsMargins(6, 0, 6, 4);
-    m_problems->hide();
-    rows->addWidget(m_problems);
-    if (m_table)
-        buildFineTune(rows);
+    for (int i = 0; i < m_effects.size(); ++i)
+        buildEffect(b, i);
     b->addStretch(1);
 
     connect(state, &AppState::settingsChanged, this, &ShadersPage::reload);
 }
 
-void ShadersPage::buildFineTune(QVBoxLayout *rows) {
-    for (int r = 0; r < m_table->knobs.size(); ++r) {
-        const SsrKnob &knob = m_table->knobs[r];
+void ShadersPage::buildEffect(QVBoxLayout *page, int index) {
+    EffectUi &fx = m_effects[index];
+    Section s = section(fx.table.title);
+    auto *v = new QVBoxLayout(s.body);
+    v->setContentsMargins(8, 2, 8, 4);
+    v->setSpacing(0);
+    page->addWidget(s.box);
+    page->addSpacing(8);
+
+    fx.on = new Switch;
+    v->addWidget(settingRow(switchTitle(fx.table), fx.table.summary, fx.on));
+    fx.on->setToolTip(fx.table.switchEnv);
+    connect(fx.on, &QCheckBox::clicked, this, [this, index](bool on) {
+        const QString env = m_effects[index].table.switchEnv;
+        edit([env, on](SettingsConf &conf) {
+            setEffectOn(env, conf, on);
+            return true;
+        });
+    });
+    if (!fx.known)
+        return;
+
+    fx.details = new QWidget;
+    auto *d = new QVBoxLayout(fx.details);
+    d->setContentsMargins(0, 0, 0, 0);
+    d->setSpacing(0);
+    v->addWidget(fx.details);
+
+    // The look: one segment per named look, as the Quality presets.
+    if (fx.table.looks.size() > 1) {
+        d->addWidget(separator());
+        auto *look = new QWidget;
+        auto *lv = new QVBoxLayout(look);
+        lv->setContentsMargins(6, 8, 6, 8);
+        lv->setSpacing(6);
+        auto *title = new QLabel(QStringLiteral("Look"));
+        title->setObjectName(QStringLiteral("rowTitle"));
+        lv->addWidget(title);
+        auto *row = new QHBoxLayout;
+        row->setSpacing(6);
+        for (int i = 0; i < fx.table.looks.size(); ++i) {
+            auto *btn = new QPushButton(ssrLookTitle(fx.table.looks[i].name));
+            btn->setObjectName(QStringLiteral("segment"));
+            btn->setCheckable(true);
+            btn->setCursor(Qt::PointingHandCursor);
+            btn->setFocusPolicy(Qt::NoFocus);
+            btn->setMinimumHeight(30);
+            row->addWidget(btn, 1);
+            fx.lookButtons.append(btn);
+            connect(btn, &QPushButton::clicked, this, [this, index, i] { lookChosen(index, i); });
+        }
+        lv->addLayout(row);
+        fx.lookDesc = note(QString());
+        lv->addWidget(fx.lookDesc);
+        d->addWidget(look);
+    }
+
+    d->addWidget(separator());
+    fx.tuneButton = new QPushButton;
+    fx.tuneButton->setObjectName(QStringLiteral("resetKnob"));
+    fx.tuneButton->setCheckable(true);
+    fx.tuneButton->setCursor(Qt::PointingHandCursor);
+    fx.tuneButton->setFocusPolicy(Qt::NoFocus);
+    d->addWidget(settingRow(QStringLiteral("Fine tune"),
+                            QStringLiteral("%1 settings. A change overrides the look for that one setting; Reset puts "
+                                           "the look's value back. Picking a look clears them all.")
+                                .arg(fx.table.knobs.size()),
+                            fx.tuneButton));
+    fx.problems = problemLabel();
+    d->addWidget(fx.problems);
+    fx.tune = new QWidget;
+    auto *t = new QVBoxLayout(fx.tune);
+    t->setContentsMargins(0, 0, 0, 0);
+    t->setSpacing(0);
+    t->addWidget(separator());
+    buildFineTune(t, index);
+    d->addWidget(fx.tune);
+    connect(fx.tuneButton, &QPushButton::toggled, this, [this, index](bool shown) {
+        EffectUi &e = m_effects[index];
+        e.tune->setVisible(shown);
+        e.tuneButton->setText(shown ? QStringLiteral("Hide") : QStringLiteral("Show"));
+    });
+    SettingsConf conf;
+    conf.load(settingsConfPath());
+    const bool tuned = !ssrOverrides(fx.table, conf).isEmpty();
+    fx.tuneButton->setChecked(tuned);
+    fx.tune->setVisible(tuned);
+    fx.tuneButton->setText(tuned ? QStringLiteral("Hide") : QStringLiteral("Show"));
+}
+
+void ShadersPage::buildFineTune(QVBoxLayout *rows, int index) {
+    EffectUi &fx = m_effects[index];
+    for (int r = 0; r < fx.table.knobs.size(); ++r) {
+        const SsrKnob &knob = fx.table.knobs[r];
         KnobRow kr;
         kr.name = knob.name;
         kr.step = sliderStep(knob);
@@ -187,7 +280,7 @@ void ShadersPage::buildFineTune(QVBoxLayout *rows) {
             kr.shown->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
             h->insertWidget(0, kr.shown);
             h->insertStretch(0, 1);
-            connect(kr.toggle, &QCheckBox::clicked, this, [this, r] { knobMoved(r); });
+            connect(kr.toggle, &QCheckBox::clicked, this, [this, index, r] { knobMoved(index, r); });
         } else {
             auto *grid = new QGridLayout;
             grid->setContentsMargins(0, 0, 0, 0);
@@ -216,14 +309,14 @@ void ShadersPage::buildFineTune(QVBoxLayout *rows) {
                 kr.sliders.append(slider);
                 kr.values.append(value);
                 const double step = kr.step;
-                connect(slider, &QSlider::valueChanged, this, [this, r, slider, value, step](int pos) {
+                connect(slider, &QSlider::valueChanged, this, [this, index, r, slider, value, step](int pos) {
                     value->setText(shortestFloat(float(onStep(pos * step, step))));
                     // A drag writes once, when it is let go; a click on the
                     // groove writes at once.
                     if (!m_filling && !slider->isSliderDown())
-                        knobMoved(r);
+                        knobMoved(index, r);
                 });
-                connect(slider, &QSlider::sliderReleased, this, [this, r] { knobMoved(r); });
+                connect(slider, &QSlider::sliderReleased, this, [this, index, r] { knobMoved(index, r); });
             }
             h->addLayout(grid);
         }
@@ -233,21 +326,21 @@ void ShadersPage::buildFineTune(QVBoxLayout *rows) {
         kr.reset->setFocusPolicy(Qt::NoFocus);
         h->addWidget(kr.reset, 0, Qt::AlignVCenter);
         const QString name = knob.name;
-        connect(kr.reset, &QPushButton::clicked, this, [this, name] {
-            edit([this, name](SettingsConf &conf) {
-                resetSsrKnob(conf, *m_table->knob(name));
+        connect(kr.reset, &QPushButton::clicked, this, [this, index, name] {
+            edit([this, index, name](SettingsConf &conf) {
+                resetSsrKnob(conf, *m_effects[index].table.knob(name));
                 return true;
             });
         });
 
-        const KnobText text = knobText(knob.name);
-        QWidget *line = settingRow(knobTitle(knob.name), text.description ? QString::fromLatin1(text.description) : QString(),
-                                   control);
+        const KnobText text = knobText(fx.table.name, knob.name);
+        QWidget *line = settingRow(knobTitle(fx.table.name, knob.name),
+                                   text.description ? QString::fromLatin1(text.description) : QString(), control);
         line->setToolTip(knob.env);
         if (r > 0)
             rows->addWidget(separator());
         rows->addWidget(line);
-        m_rows.append(kr);
+        fx.rows.append(kr);
     }
 }
 
@@ -271,38 +364,43 @@ void ShadersPage::reload() {
     QString error;
     if (!conf.load(settingsConfPath(), &error))
         QMessageBox::warning(this, QStringLiteral("Shaders"), error);
-    const bool on = ssrOn(conf);
-    m_on->setChecked(on);
-    m_lookBox->setEnabled(on && m_table);
-    m_tuneBox->setEnabled(on && m_table);
-    if (!m_table) {
-        m_lookDesc->setText(QStringLiteral("Not available until the looks can be read."));
-        m_filling = false;
+    for (EffectUi &fx : m_effects)
+        reloadEffect(conf, fx);
+    m_filling = false;
+}
+
+void ShadersPage::reloadEffect(const SettingsConf &conf, EffectUi &fx) {
+    const bool on = effectOn(fx.table.switchEnv, conf);
+    fx.on->setChecked(on);
+    if (!fx.known)
         return;
-    }
+    fx.details->setEnabled(on);
 
     QString unknown;
-    const QString current = ssrLook(*m_table, conf, &unknown);
-    for (int i = 0; i < m_lookButtons.size(); ++i)
-        m_lookButtons[i]->setChecked(unknown.isEmpty() && m_table->looks[i].name == current);
-    if (!unknown.isEmpty()) {
-        m_lookDesc->setText(QStringLiteral("%1=%2 names no look, so the client starts from %3. Pick one to fix it.")
-                                .arg(kSsrLookSetting, unknown, ssrLookTitle(m_table->defaultLook)));
-    } else {
-        const QStringList tuned = ssrOverrides(*m_table, conf);
-        QString text = m_table->look(current)->description;
-        if (!tuned.isEmpty())
-            text += QStringLiteral(" Fine tuned: %1.").arg(tuned.size() == 1 ? QStringLiteral("1 setting")
-                                                                            : QStringLiteral("%1 settings").arg(tuned.size()));
-        m_lookDesc->setText(text);
+    const QString current = ssrLook(fx.table, conf, &unknown);
+    for (int i = 0; i < fx.lookButtons.size(); ++i)
+        fx.lookButtons[i]->setChecked(unknown.isEmpty() && fx.table.looks[i].name == current);
+    if (fx.lookDesc) {
+        if (!unknown.isEmpty()) {
+            fx.lookDesc->setText(QStringLiteral("%1=%2 names no look, so the client starts from %3. Pick one to fix it.")
+                                     .arg(fx.table.lookEnv, unknown, ssrLookTitle(fx.table.defaultLook)));
+        } else {
+            const QStringList tuned = ssrOverrides(fx.table, conf);
+            QString text = fx.table.look(current)->description;
+            if (!tuned.isEmpty())
+                text += QStringLiteral(" Fine tuned: %1.")
+                            .arg(tuned.size() == 1 ? QStringLiteral("1 setting")
+                                                   : QStringLiteral("%1 settings").arg(tuned.size()));
+            fx.lookDesc->setText(text);
+        }
     }
 
     QStringList problems;
-    for (const KnobRow &row : m_rows) {
-        const SsrKnob &knob = *m_table->knob(row.name);
+    for (const KnobRow &row : fx.rows) {
+        const SsrKnob &knob = *fx.table.knob(row.name);
         const auto set = ssrOverride(conf, knob);
         const bool usable = set && parseSsrValue(knob, *set);
-        const SsrValue value = effectiveSsrValue(*m_table, conf, knob);
+        const SsrValue value = effectiveSsrValue(fx.table, conf, knob);
         if (row.toggle) {
             row.toggle->setChecked(value.value(0) != 0.0);
             row.shown->setText(value.value(0) != 0.0 ? QStringLiteral("On") : QStringLiteral("Off"));
@@ -324,9 +422,8 @@ void ShadersPage::reload() {
             problems.append(QStringLiteral("%1=%2 is not a value the client takes; it uses %3.")
                                 .arg(knob.env, *set, formatSsrValue(knob, value)));
     }
-    m_problems->setText(problems.join(QLatin1Char('\n')));
-    m_problems->setVisible(!problems.isEmpty());
-    m_filling = false;
+    fx.problems->setText(problems.join(QLatin1Char('\n')));
+    fx.problems->setVisible(!problems.isEmpty());
 }
 
 void ShadersPage::edit(const std::function<bool(SettingsConf &)> &change) {
@@ -346,15 +443,16 @@ void ShadersPage::edit(const std::function<bool(SettingsConf &)> &change) {
     reload();
 }
 
-void ShadersPage::lookChosen(int index) {
-    const SsrLook look = m_table->looks.at(index);
+void ShadersPage::lookChosen(int effect, int index) {
+    const SsrTable &table = m_effects.at(effect).table;
+    const SsrLook look = table.looks.at(index);
     SettingsConf conf;
     conf.load(settingsConfPath());
-    const QStringList tuned = ssrOverrides(*m_table, conf);
+    const QStringList tuned = ssrOverrides(table, conf);
     if (!tuned.isEmpty()) {
         QStringList titles;
         for (const QString &name : tuned)
-            titles.append(knobTitle(name));
+            titles.append(knobTitle(table.name, name));
         const auto answer = QMessageBox::question(
             this, ssrLookTitle(look.name),
             QStringLiteral("Use the %1 look? Your fine tuning of %2 is removed.")
@@ -365,14 +463,15 @@ void ShadersPage::lookChosen(int index) {
             return;
         }
     }
-    edit([this, look](SettingsConf &c) { return applySsrLook(*m_table, c, look.name); });
+    edit([this, effect, look](SettingsConf &c) { return applySsrLook(m_effects.at(effect).table, c, look.name); });
 }
 
-void ShadersPage::knobMoved(int row) {
+void ShadersPage::knobMoved(int effect, int row) {
     if (m_filling)
         return;
-    const KnobRow &kr = m_rows.at(row);
-    const SsrKnob &knob = *m_table->knob(kr.name);
+    const EffectUi &fx = m_effects.at(effect);
+    const KnobRow &kr = fx.rows.at(row);
+    const SsrKnob &knob = *fx.table.knob(kr.name);
     SsrValue value;
     if (kr.toggle) {
         value.append(kr.toggle->isChecked() ? 1.0 : 0.0);
@@ -386,7 +485,7 @@ void ShadersPage::knobMoved(int row) {
     SettingsConf conf;
     conf.load(settingsConfPath());
     if (!ssrOverride(conf, knob) &&
-        formatSsrValue(knob, value) == formatSsrValue(knob, effectiveSsrValue(*m_table, conf, knob)))
+        formatSsrValue(knob, value) == formatSsrValue(knob, effectiveSsrValue(fx.table, conf, knob)))
         return;
     edit([&knob, value](SettingsConf &conf) { return setSsrKnob(conf, knob, value); });
 }

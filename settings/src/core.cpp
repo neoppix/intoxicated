@@ -836,7 +836,7 @@ std::optional<FlagMap> readDefaultFlags(QString *error) {
     return flags;
 }
 
-// --- Reflections -------------------------------------------------------------
+// --- Effects -----------------------------------------------------------------
 
 const SsrKnob *SsrTable::knob(const QString &name) const {
     for (const SsrKnob &k : knobs) {
@@ -878,26 +878,21 @@ std::optional<SsrValue> ssrJsonValue(const SsrKnob &knob, const QJsonValue &v) {
     return out;
 }
 
-} // namespace
-
-bool parseSsrTable(const QByteArray &json, SsrTable *out, QString *error) {
+// One effect's object: its switch INTOXICATED_<NAME>, its look variable
+// <switch>_LOOK, knobs whose variables start with <switch>_, and looks.
+bool parseEffectObject(const QJsonObject &root, SsrTable *out, QString *error) {
     const auto fail = [&](const QString &why) {
         if (error)
             *error = why;
         return false;
     };
-    QJsonParseError parseError;
-    const QJsonDocument doc = QJsonDocument::fromJson(json, &parseError);
-    if (doc.isNull())
-        return fail(parseError.errorString());
-    if (!doc.isObject())
-        return fail(QStringLiteral("not a JSON object"));
-    const QJsonObject root = doc.object();
-    if (root.value(QStringLiteral("switch")).toString() != kSsrSetting ||
-        root.value(QStringLiteral("look_env")).toString() != kSsrLookSetting)
-        return fail(QStringLiteral("it names other settings than %1 and %2").arg(kSsrSetting, kSsrLookSetting));
-
+    static const QRegularExpression switchName(QStringLiteral("^INTOXICATED_[A-Z0-9]+$"));
     SsrTable table;
+    table.switchEnv = root.value(QStringLiteral("switch")).toString();
+    table.lookEnv = root.value(QStringLiteral("look_env")).toString();
+    if (!switchName.match(table.switchEnv).hasMatch() || table.lookEnv != table.switchEnv + QStringLiteral("_LOOK"))
+        return fail(QStringLiteral("it names no usable switch and look variables: %1 and %2")
+                        .arg(table.switchEnv, table.lookEnv));
     for (const QJsonValue &v : root.value(QStringLiteral("knobs")).toArray()) {
         const QJsonObject o = v.toObject();
         SsrKnob k;
@@ -914,8 +909,8 @@ bool parseSsrTable(const QByteArray &json, SsrTable *out, QString *error) {
             k.kind = SsrKind::Rgb;
         else
             return fail(QStringLiteral("knob %1 has a kind this app does not know: %2").arg(k.name, kind));
-        if (k.name.isEmpty() || !isSettingKey(k.env) || !k.env.startsWith(kSsrSetting + QLatin1Char('_')) ||
-            k.env == kSsrLookSetting || table.knob(k.name))
+        if (k.name.isEmpty() || !isSettingKey(k.env) || !k.env.startsWith(table.switchEnv + QLatin1Char('_')) ||
+            k.env == table.lookEnv || table.knob(k.name))
             return fail(QStringLiteral("a knob without a usable name or variable: %1").arg(k.name));
         if (!o.value(QStringLiteral("min")).isDouble() || !o.value(QStringLiteral("max")).isDouble())
             return fail(QStringLiteral("knob %1 has no range").arg(k.name));
@@ -952,6 +947,85 @@ bool parseSsrTable(const QByteArray &json, SsrTable *out, QString *error) {
         return fail(QStringLiteral("the default look %1 is not listed").arg(table.defaultLook));
     *out = table;
     return true;
+}
+
+} // namespace
+
+bool parseSsrTable(const QByteArray &json, SsrTable *out, QString *error) {
+    const auto fail = [&](const QString &why) {
+        if (error)
+            *error = why;
+        return false;
+    };
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(json, &parseError);
+    if (doc.isNull())
+        return fail(parseError.errorString());
+    if (!doc.isObject())
+        return fail(QStringLiteral("not a JSON object"));
+    const QJsonObject root = doc.object();
+    if (root.value(QStringLiteral("switch")).toString() != kSsrSetting ||
+        root.value(QStringLiteral("look_env")).toString() != kSsrLookSetting)
+        return fail(QStringLiteral("it names other settings than %1 and %2").arg(kSsrSetting, kSsrLookSetting));
+    return parseEffectObject(root, out, error);
+}
+
+bool parseShaderTables(const QByteArray &json, QList<SsrTable> *out, QString *error) {
+    const auto fail = [&](const QString &why) {
+        if (error)
+            *error = why;
+        return false;
+    };
+    QJsonParseError parseError;
+    const QJsonDocument doc = QJsonDocument::fromJson(json, &parseError);
+    if (doc.isNull())
+        return fail(parseError.errorString());
+    if (!doc.isObject())
+        return fail(QStringLiteral("not a JSON object"));
+    static const QRegularExpression effectName(QStringLiteral("^[a-z0-9_]+$"));
+    QList<SsrTable> tables;
+    QSet<QString> names;
+    QSet<QString> variables;
+    for (const QJsonValue &v : doc.object().value(QStringLiteral("effects")).toArray()) {
+        const QJsonObject o = v.toObject();
+        SsrTable t;
+        QString why;
+        if (!parseEffectObject(o, &t, &why))
+            return fail(QStringLiteral("effect %1: %2").arg(o.value(QStringLiteral("name")).toString(), why));
+        t.name = o.value(QStringLiteral("name")).toString();
+        t.title = o.value(QStringLiteral("title")).toString();
+        t.summary = o.value(QStringLiteral("summary")).toString();
+        if (!effectName.match(t.name).hasMatch() || names.contains(t.name) || t.title.isEmpty())
+            return fail(QStringLiteral("an effect without a usable name or title: %1").arg(t.name));
+        names.insert(t.name);
+        // No variable may belong to two effects.
+        QStringList own = {t.switchEnv, t.lookEnv};
+        for (const SsrKnob &k : t.knobs)
+            own.append(k.env);
+        for (const QString &var : own) {
+            if (variables.contains(var))
+                return fail(QStringLiteral("%1 belongs to more than one effect").arg(var));
+            variables.insert(var);
+        }
+        tables.append(t);
+    }
+    if (tables.isEmpty())
+        return fail(QStringLiteral("it lists no effects"));
+    *out = tables;
+    return true;
+}
+
+std::optional<QList<SsrTable>> readShaderTables(QString *error) {
+    const auto out = runLauncher({QStringLiteral("--shader-looks")}, 10000, error);
+    if (!out)
+        return std::nullopt;
+    QList<SsrTable> tables;
+    QString parseError;
+    if (!parseShaderTables(*out, &tables, &parseError)) {
+        *error = QStringLiteral("intoxicated --shader-looks printed something else: %1").arg(parseError);
+        return std::nullopt;
+    }
+    return tables;
 }
 
 std::optional<SsrTable> readSsrTable(QString *error) {
@@ -1049,20 +1123,24 @@ QString formatSsrValue(const SsrKnob &knob, const SsrValue &value) {
     return parts.join(QLatin1Char(','));
 }
 
-bool ssrOn(const SettingsConf &conf) {
-    const auto v = conf.value(kSsrSetting);
+bool effectOn(const QString &switchEnv, const SettingsConf &conf) {
+    const auto v = conf.value(switchEnv);
     return v && v->trimmed() == QLatin1String("1");
 }
 
-void setSsrOn(SettingsConf &conf, bool on) {
+void setEffectOn(const QString &switchEnv, SettingsConf &conf, bool on) {
     if (on)
-        conf.set(kSsrSetting, QStringLiteral("1"));
+        conf.set(switchEnv, QStringLiteral("1"));
     else
-        conf.remove(kSsrSetting);
+        conf.remove(switchEnv);
 }
 
+bool ssrOn(const SettingsConf &conf) { return effectOn(kSsrSetting, conf); }
+
+void setSsrOn(SettingsConf &conf, bool on) { setEffectOn(kSsrSetting, conf, on); }
+
 QString ssrLook(const SsrTable &table, const SettingsConf &conf, QString *unknown) {
-    const QString name = conf.value(kSsrLookSetting).value_or(QString()).trimmed();
+    const QString name = conf.value(table.lookEnv).value_or(QString()).trimmed();
     if (unknown)
         unknown->clear();
     if (name.isEmpty())
@@ -1103,9 +1181,9 @@ bool applySsrLook(const SsrTable &table, SettingsConf &conf, const QString &look
     if (!table.look(look))
         return false;
     if (look == table.defaultLook)
-        conf.remove(kSsrLookSetting);
+        conf.remove(table.lookEnv);
     else
-        conf.set(kSsrLookSetting, look);
+        conf.set(table.lookEnv, look);
     for (const SsrKnob &k : table.knobs)
         conf.remove(k.env);
     return true;

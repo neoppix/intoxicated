@@ -4,7 +4,8 @@
 //! As in `launcher_links.rs`, `packaging/freebsd/intoxicated` is run with
 //! `/bin/sh` against a scratch checkout whose `target/release/intoxicated-run`
 //! is a script. It hands `--check-join-url`, `--print-default-flags`,
-//! `--print-ssr-looks` and `--help` to the real binary and otherwise writes down its arguments, the
+//! `--print-ssr-looks`, `--print-shader-looks` and `--help` to the real
+//! binary and otherwise writes down its arguments, the
 //! `INTOXICATED_*` variables it was started with and the launcher's own
 //! arguments as `ps` shows them, then exits 0. HOME, XDG_CONFIG_HOME,
 //! XDG_DATA_HOME and XDG_CACHE_HOME all point into the scratch directory.
@@ -21,7 +22,7 @@ fn launcher() -> PathBuf {
 
 const FAKE: &str = r#"#!/bin/sh
 case "$1" in
-  --check-join-url|--print-default-flags|--print-ssr-looks|--help) exec "$REAL_INTOXICATED_RUN" "$@" ;;
+  --check-join-url|--print-default-flags|--print-ssr-looks|--print-shader-looks|--help) exec "$REAL_INTOXICATED_RUN" "$@" ;;
 esac
 for a in "$@"; do printf '%s\n' "$a"; done > "$RECORD/args"
 env | grep '^INTOXICATED_' > "$RECORD/env"
@@ -254,6 +255,20 @@ fn default_flags_ssr_looks_and_version_come_from_the_client() {
     s.settings("INTOXICATED_SSR=1\nINTOXICATED_SSR_LOOK=glossy\nINTOXICATED_SSR_INTENSITY=1\n");
     let r = s.run(&["--ssr-looks"], &[]);
     assert_eq!(r.stdout, intoxicated_runtime::android::ssr::looks_json() + "\n");
+    s.settings("");
+
+    // Every effect drawn before the HUD, the reflections' table among them.
+    let r = s.run(&["--shader-looks"], &[]);
+    assert_eq!(r.status, 0, "{}", r.stderr);
+    assert!(r.args.is_none(), "the client was not started");
+    assert_eq!(r.stdout, intoxicated_runtime::android::ssr::shader_looks_json() + "\n");
+    let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("JSON");
+    let effects = doc["effects"].as_array().expect("a list of effects");
+    let switches: Vec<&str> = effects.iter().map(|e| e["switch"].as_str().unwrap()).collect();
+    assert_eq!(switches, ["INTOXICATED_SSR", "INTOXICATED_DOF", "INTOXICATED_BLOOM"]);
+    s.settings("INTOXICATED_DOF=1\nINTOXICATED_DOF_STRENGTH=20\nINTOXICATED_BLOOM_LOOK=neon\n");
+    let r = s.run(&["--shader-looks"], &[]);
+    assert_eq!(r.stdout, intoxicated_runtime::android::ssr::shader_looks_json() + "\n");
     s.settings("");
 
     let r = s.run(&["--version"], &[]);

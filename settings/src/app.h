@@ -171,8 +171,10 @@ private:
     bool m_filling = false;
 };
 
-// Effects the client draws itself; today the screen-space reflections. Each
-// control writes settings.conf as it changes.
+// Effects the client draws into the game before the HUD: screen-space
+// reflections, depth of field and bloom, one group each with its switch, its
+// looks and a fine-tune row per knob. Each control writes settings.conf as it
+// changes.
 class ShadersPage : public QWidget {
     Q_OBJECT
 public:
@@ -193,25 +195,36 @@ private:
         QLabel *shown = nullptr;
         QPushButton *reset = nullptr;
     };
+    // One effect's group. Without its table (the client could not be asked)
+    // only the switch is offered.
+    struct EffectUi {
+        SsrTable table;
+        bool known = false;
+        Switch *on = nullptr;
+        QWidget *details = nullptr;
+        QList<QPushButton *> lookButtons;
+        QLabel *lookDesc = nullptr;
+        QLabel *problems = nullptr;
+        // The fine-tune rows, shown or hidden by their button; shown at
+        // first when the effect has overrides.
+        QWidget *tune = nullptr;
+        QPushButton *tuneButton = nullptr;
+        QList<KnobRow> rows;
+    };
 
-    void buildFineTune(QVBoxLayout *rows);
+    void buildEffect(QVBoxLayout *page, int index);
+    void buildFineTune(QVBoxLayout *rows, int index);
+    void reloadEffect(const SettingsConf &conf, EffectUi &fx);
     // Load settings.conf, apply CHANGE, write it, show the result.
     void edit(const std::function<bool(SettingsConf &)> &change);
-    void lookChosen(int index);
+    void lookChosen(int effect, int index);
     // Write row ROW's override from its controls.
-    void knobMoved(int row);
+    void knobMoved(int effect, int row);
     void showSliders(const KnobRow &row, const SsrValue &value);
 
     AppState *m_state;
-    std::optional<SsrTable> m_table;
-    Switch *m_on;
-    QGroupBox *m_lookBox;
-    QGroupBox *m_tuneBox;
-    QList<QPushButton *> m_lookButtons;
-    QLabel *m_lookDesc;
+    QList<EffectUi> m_effects;
     QLabel *m_tableError;
-    QLabel *m_problems;
-    QList<KnobRow> m_rows;
     bool m_filling = false;
 };
 

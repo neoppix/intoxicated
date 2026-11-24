@@ -744,6 +744,136 @@ void testSsrLauncher(const QString &scratch) {
     qputenv("PATH", savedPath);
 }
 
+// What `intoxicated --shader-looks` prints, cut down: the reflections with
+// one knob, the depth of field and the bloom with two each.
+const QByteArray kShaderLooks = R"json({
+  "effects": [
+    {"name": "ssr", "title": "Reflections (SSR)", "summary": "Reflections.",
+     "switch": "INTOXICATED_SSR", "look_env": "INTOXICATED_SSR_LOOK", "default_look": "competitive",
+     "knobs": [{"default": 0.4, "env": "INTOXICATED_SSR_INTENSITY", "kind": "number", "max": 1.0, "min": 0.0, "name": "intensity"}],
+     "looks": [{"description": "Faint.", "name": "competitive", "values": {"intensity": 0.4}}]},
+    {"name": "dof", "title": "Depth of field", "summary": "Blur.",
+     "switch": "INTOXICATED_DOF", "look_env": "INTOXICATED_DOF_LOOK", "default_look": "cinematic",
+     "knobs": [{"default": 8, "env": "INTOXICATED_DOF_STRENGTH", "kind": "number", "max": 32, "min": 0, "name": "strength"},
+               {"default": 0, "env": "INTOXICATED_DOF_NEAR_BLUR", "kind": "switch", "max": 1, "min": 0, "name": "near_blur"}],
+     "looks": [{"description": "Soft background.", "name": "cinematic", "values": {"strength": 8, "near_blur": 0}},
+               {"description": "Strong.", "name": "portrait", "values": {"strength": 14, "near_blur": 1}}]},
+    {"name": "bloom", "title": "Bloom", "summary": "Glow.",
+     "switch": "INTOXICATED_BLOOM", "look_env": "INTOXICATED_BLOOM_LOOK", "default_look": "soft",
+     "knobs": [{"default": 0.35, "env": "INTOXICATED_BLOOM_INTENSITY", "kind": "number", "max": 2, "min": 0, "name": "intensity"},
+               {"default": [1, 1, 1], "env": "INTOXICATED_BLOOM_TINT", "kind": "rgb", "max": 2, "min": 0, "name": "tint"}],
+     "looks": [{"description": "Soft.", "name": "soft", "values": {"intensity": 0.35, "tint": [1, 1, 1]}},
+               {"description": "Neon.", "name": "neon", "values": {"intensity": 0.7, "tint": [1, 1, 1]}}]}
+  ]
+})json";
+
+void testShaderTables() {
+    QList<SsrTable> tables;
+    QString error;
+    check(parseShaderTables(kShaderLooks, &tables, &error), "the effects parse: " + error);
+    same(tables.size(), 3, "three effects");
+    if (tables.size() != 3)
+        return;
+    same(tables[0].name, QString("ssr"), "in the client's order");
+    same(tables[1].title, QString("Depth of field"), "an effect's title");
+    same(tables[2].summary, QString("Glow."), "an effect's summary");
+    same(tables[1].switchEnv, QString("INTOXICATED_DOF"), "an effect's switch");
+    same(tables[2].lookEnv, QString("INTOXICATED_BLOOM_LOOK"), "an effect's look variable");
+    same(tables[1].defaultLook, QString("cinematic"), "an effect's default look");
+    check(tables[2].knob("tint") && tables[2].knob("tint")->kind == SsrKind::Rgb, "the bloom's tint is a colour");
+    check(!tables[1].knob("intensity"), "the depth of field has no intensity of its own");
+    SsrTable ssrOnly;
+    parseSsrTable(kSsrLooks, &ssrOnly, nullptr);
+    same(ssrOnly.switchEnv, QString("INTOXICATED_SSR"), "--ssr-looks is the reflections' table");
+    same(ssrOnly.lookEnv, QString("INTOXICATED_SSR_LOOK"), "with their look variable");
+
+    const auto refused = [](const QByteArray &json, const QString &what) {
+        QList<SsrTable> t;
+        QString why;
+        check(!parseShaderTables(json, &t, &why) && !why.isEmpty(), "refused: " + what + " (" + why + ")");
+    };
+    refused("not json", "not JSON");
+    refused("{\"effects\": []}", "no effects");
+    refused(QByteArray(kShaderLooks).replace("\"name\": \"bloom\"", "\"name\": \"dof\""), "an effect listed twice");
+    refused(QByteArray(kShaderLooks).replace("\"title\": \"Bloom\"", "\"title\": \"\""), "an effect without a title");
+    refused(QByteArray(kShaderLooks).replace("\"look_env\": \"INTOXICATED_DOF_LOOK\"", "\"look_env\": \"INTOXICATED_SSR_LOOK\""),
+            "a look variable that is not the switch's");
+    refused(QByteArray(kShaderLooks).replace("\"switch\": \"INTOXICATED_BLOOM\", \"look_env\": \"INTOXICATED_BLOOM_LOOK\"",
+                                             "\"switch\": \"INTOXICATED_DOF\", \"look_env\": \"INTOXICATED_DOF_LOOK\""),
+            "two effects with one switch");
+    refused(QByteArray(kShaderLooks).replace("\"env\": \"INTOXICATED_DOF_STRENGTH\"", "\"env\": \"INTOXICATED_SSR_STRENGTH\""),
+            "a knob with another effect's prefix");
+    refused(QByteArray(kShaderLooks).replace("\"switch\": \"INTOXICATED_SSR\"", "\"switch\": \"PATH\""),
+            "a switch that is not an Intoxicated setting");
+    refused(QByteArray(kShaderLooks).replace("\"default_look\": \"soft\"", "\"default_look\": \"glowy\""),
+            "a default look that is not listed");
+}
+
+void testEffectSettings() {
+    QList<SsrTable> tables;
+    parseShaderTables(kShaderLooks, &tables, nullptr);
+    if (tables.size() != 3)
+        return;
+    const SsrTable &dof = tables[1];
+    const SsrTable &bloom = tables[2];
+    const QString path = settingsConfPath();
+    const auto reloaded = [&] {
+        SettingsConf c;
+        c.load(path);
+        return c;
+    };
+    QString error;
+    writeAll(path, "INTOXICATED_SSR=1\n");
+    SettingsConf conf = reloaded();
+    check(!effectOn(dof.switchEnv, conf) && !effectOn(bloom.switchEnv, conf), "depth of field and bloom start off");
+    check(effectOn(kSsrSetting, conf), "the reflections' switch is their own");
+    setEffectOn(dof.switchEnv, conf, true);
+    setEffectOn(bloom.switchEnv, conf, true);
+    check(applySsrLook(dof, conf, "portrait"), "pick a depth of field look");
+    check(setSsrKnob(conf, *bloom.knob("tint"), {1.0, 0.9, 0.8}), "tint the bloom");
+    check(setSsrKnob(conf, *dof.knob("strength"), {12.0}), "set the strength");
+    check(!setSsrKnob(conf, *dof.knob("strength"), {40.0}), "a strength out of range is refused");
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path),
+         QByteArray("INTOXICATED_SSR=1\nINTOXICATED_DOF=1\nINTOXICATED_BLOOM=1\nINTOXICATED_DOF_LOOK=portrait\n"
+                    "INTOXICATED_BLOOM_TINT=1,0.9,0.8\nINTOXICATED_DOF_STRENGTH=12\n"),
+         "each effect writes its own variables");
+    conf = reloaded();
+    same(ssrLook(dof, conf), QString("portrait"), "the look reads back");
+    same(ssrLook(bloom, conf), QString("soft"), "another effect keeps its default look");
+    same(effectiveSsrValue(dof, conf, *dof.knob("near_blur")), SsrValue({1.0}), "the look's switch");
+    same(effectiveSsrValue(dof, conf, *dof.knob("strength")), SsrValue({12.0}), "the override");
+    same(ssrOverrides(dof, conf), QStringList({"strength"}), "only the depth of field's own overrides");
+    check(applySsrLook(dof, conf, "cinematic"), "back to the default look");
+    setEffectOn(bloom.switchEnv, conf, false);
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path), QByteArray("INTOXICATED_SSR=1\nINTOXICATED_DOF=1\nINTOXICATED_BLOOM_TINT=1,0.9,0.8\n"),
+         "the default look and an override of the depth of field are gone, the bloom's tint kept");
+    QFile::remove(path);
+}
+
+// readShaderTables runs `intoxicated --shader-looks`.
+void testShaderLauncher(const QString &scratch) {
+    const QString bin = scratch + "/bin2";
+    QDir().mkpath(bin);
+    writeAll(scratch + "/shaders.json", kShaderLooks);
+    const QString launcher = bin + "/intoxicated";
+    writeAll(launcher, "#!/bin/sh\n[ \"$1\" = --shader-looks ] && [ $# -eq 1 ] && exec cat '" + QFile::encodeName(scratch) +
+                           "/shaders.json'\nexit 7\n");
+    QFile::setPermissions(launcher, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
+    const QByteArray savedPath = qgetenv("PATH");
+    qputenv("PATH", QFile::encodeName(bin) + ":" + savedPath);
+    QString error;
+    const auto tables = readShaderTables(&error);
+    check(tables.has_value(), "the effects come from intoxicated --shader-looks: " + error);
+    if (tables)
+        same(tables->size(), 3, "all of them");
+    writeAll(launcher, "#!/bin/sh\necho '{\"effects\": 1}'\n");
+    check(!readShaderTables(&error), "something else is refused");
+    check(error.startsWith("intoxicated --shader-looks printed something else"), "and said: " + error);
+    qputenv("PATH", savedPath);
+}
+
 } // namespace
 
 int runSelfTest() {
@@ -775,6 +905,9 @@ int runSelfTest() {
     testSsrValues();
     testSsrSettings();
     testSsrLauncher(root);
+    testShaderTables();
+    testEffectSettings();
+    testShaderLauncher(root);
 
     std::printf("self-test: %d checks, %d failed (scratch %s)\n", g_checks, g_failures, qPrintable(root));
     return g_failures == 0 ? 0 : 1;
