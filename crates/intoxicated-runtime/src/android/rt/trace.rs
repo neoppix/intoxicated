@@ -55,6 +55,11 @@ const ST_IMAGE_MEMORY_BARRIER: i32 = 45;
 const FORMAT_RGBA8: u32 = 37;
 const USAGE_SAMPLED: u32 = 0x4;
 const DESCRIPTOR_COMBINED_IMAGE_SAMPLER: u32 = 1;
+const DESCRIPTOR_UNIFORM_BUFFER: u32 = 6;
+const USAGE_UNIFORM: u32 = 0x10;
+/// The engine's per-frame uniform block, as far as the trace reads it
+/// (61 vec4s; see ssr.comp).
+const FRAME_BLOCK_BYTES: u64 = 61 * 16;
 const LAYOUT_SHADER_READ_ONLY: i32 = 5;
 
 const SHADER_STAGE_COMPUTE: u32 = 0x20;
@@ -169,12 +174,14 @@ pub(crate) fn set_on(v: bool) {
     on().store(v, Relaxed);
 }
 
-/// Where a hit's colour comes from: its own (texture times colour, times the
-/// exposure), mixed with a quarter of the screen's where the screen shows
-/// it, or the screen's wherever it shows it (the first way, to compare).
+/// Where a hit's colour comes from: its own (texture times colour) lit as
+/// the engine lights it (its sun, with a ray for the shadow, and ambient,
+/// from its per-frame uniform block; the default), its own times the
+/// measured exposure, that mixed with a quarter of the screen's where the
+/// screen shows it, or the screen's wherever it shows it (the first way).
 /// `INTOXICATED_RT_SHADE`, devctl `rt shade`.
 pub const SHADE_ENV: &str = "INTOXICATED_RT_SHADE";
-pub(crate) const SHADES: [&str; 3] = ["own", "mix", "screen"];
+pub(crate) const SHADES: [&str; 4] = ["lit", "own", "mix", "screen"];
 static SHADE: OnceLock<std::sync::atomic::AtomicUsize> = OnceLock::new();
 
 fn shade() -> &'static std::sync::atomic::AtomicUsize {
@@ -194,13 +201,18 @@ pub(crate) fn set_shade(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `ssr.comp` flags: bit 8 the engine's light is bound, bit 9 shade lit.
+const FLAG_LIGHT: u32 = 256;
+const FLAG_LIT: u32 = 512;
+
 /// The trace's push constant flags for the shade (`ssr.comp`: bit 3 the
 /// screen's colour, bit 4 a quarter of it).
 pub(crate) fn shade_flags() -> u32 {
     match shade().load(Relaxed) {
-        1 => 16,
-        2 => 8,
-        _ => 0,
+        1 => 0,
+        2 => 16,
+        3 => 8,
+        _ => FLAG_LIT,
     }
 }
 
@@ -355,6 +367,8 @@ pub(crate) struct Stats {
     pub fit: Option<[u32; GLOBALS_READ]>,
     /// The frame the cache was last copied out at, for `rt dump-cache`.
     pub cache_dumped_at: u64,
+    /// The engine's light was bound for the last trace.
+    pub light: bool,
 }
 
 struct Gpu {
@@ -381,6 +395,8 @@ struct Gpu {
     draws: Owned,
     tex_map: Owned,
     env: Owned,
+    /// A zeroed stand-in for the engine's per-frame uniform block.
+    no_frame_block: Owned,
     /// Set 2 of the trace: the frame's textures, one set per ring slot, and
     /// its layout; a 1 by 1 image of ours fills the places no texture takes.
     /// Host-visible: a copy of the cache, made for `rt dump-cache`.
@@ -474,6 +490,7 @@ impl Gpu {
             self.draws,
             self.tex_map,
             self.env,
+            self.no_frame_block,
             self.readback,
             self.cache_copy,
         ] {
@@ -562,6 +579,7 @@ fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool, extent: [u32; 2]) -
         draws: Owned::default(),
         tex_map: Owned::default(),
         env: Owned::default(),
+        no_frame_block: Owned::default(),
         cache_copy: Owned::default(),
         cache_copy_ptr: 0,
         tex_layout: 0,
@@ -597,24 +615,43 @@ fn make_textures(g: &mut Gpu, types: &[u32]) -> Result<(), String> {
     let d = g.device as Dev;
     let none: *const c_void = std::ptr::null();
     let f = &g.fns;
-    let binding = DescriptorSetLayoutBinding {
-        binding: 0,
-        kind: DESCRIPTOR_COMBINED_IMAGE_SAMPLER,
-        count: TEXTURES,
-        stages: SHADER_STAGE_COMPUTE,
-        immutable_samplers: none.cast(),
-    };
+    // 0 the textures, 1 the engine's per-frame uniform block (its light).
+    let bindings = [
+        DescriptorSetLayoutBinding {
+            binding: 0,
+            kind: DESCRIPTOR_COMBINED_IMAGE_SAMPLER,
+            count: TEXTURES,
+            stages: SHADER_STAGE_COMPUTE,
+            immutable_samplers: none.cast(),
+        },
+        DescriptorSetLayoutBinding {
+            binding: 1,
+            kind: DESCRIPTOR_UNIFORM_BUFFER,
+            count: 1,
+            stages: SHADER_STAGE_COMPUTE,
+            immutable_samplers: none.cast(),
+        },
+    ];
     let layout = DescriptorSetLayoutCreateInfo {
         s_type: ST_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         p_next: none,
         flags: 0,
-        count: 1,
-        bindings: &binding,
+        count: 2,
+        bindings: bindings.as_ptr(),
     };
     check((f.create_set_layout)(d, &layout, none, &mut g.tex_layout), "vkCreateDescriptorSetLayout")?;
-    let size = DescriptorPoolSize { kind: DESCRIPTOR_COMBINED_IMAGE_SAMPLER, count: TEXTURES * RING as u32 };
-    let pool =
-        DescriptorPoolCreateInfo { s_type: ST_DESCRIPTOR_POOL_CREATE_INFO, p_next: none, flags: 0, max_sets: RING as u32, count: 1, sizes: &size };
+    let sizes = [
+        DescriptorPoolSize { kind: DESCRIPTOR_COMBINED_IMAGE_SAMPLER, count: TEXTURES * RING as u32 },
+        DescriptorPoolSize { kind: DESCRIPTOR_UNIFORM_BUFFER, count: RING as u32 },
+    ];
+    let pool = DescriptorPoolCreateInfo {
+        s_type: ST_DESCRIPTOR_POOL_CREATE_INFO,
+        p_next: none,
+        flags: 0,
+        max_sets: RING as u32,
+        count: 2,
+        sizes: sizes.as_ptr(),
+    };
     check((f.create_descriptor_pool)(d, &pool, none, &mut g.tex_pool), "vkCreateDescriptorPool")?;
     let layouts = [g.tex_layout; RING];
     let alloc = DescriptorSetAllocateInfo {
@@ -707,6 +744,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
     g.draws = make_buffer(&g.buffers, d, &types, 16 * MAX_DRAWS as u64, usage, false)?;
     g.tex_map = make_buffer(&g.buffers, d, &types, 8 * TEX_MAP as u64, usage, false)?;
     g.env = make_buffer(&g.buffers, d, &types, ENV_BYTES, usage, false)?;
+    g.no_frame_block = make_buffer(&g.buffers, d, &types, FRAME_BLOCK_BYTES, USAGE_UNIFORM | USAGE_TRANSFER_DST, false)?;
     make_textures(g, &types)?;
     g.readback = make_buffer(&g.buffers, d, &types, 256, USAGE_TRANSFER_DST, true)?;
     let mut mapped = std::ptr::null_mut();
@@ -962,6 +1000,7 @@ pub(crate) fn record(
         (f.cmd_fill_buffer)(cmd, g.globals.buffer, 16, GLOBALS_BYTES - 16, 0);
         (f.cmd_fill_buffer)(cmd, g.slots.buffer, 0, SLOT_BYTES * SLOTS as u64, 0);
         (f.cmd_fill_buffer)(cmd, g.env.buffer, 0, ENV_BYTES, 0);
+        (f.cmd_fill_buffer)(cmd, g.no_frame_block.buffer, 0, FRAME_BLOCK_BYTES, 0);
     }
     g.barrier(cmd, STAGE_TRANSFER | STAGE_COMPUTE, ACCESS_TRANSFER_WRITE | ACCESS_SHADER_WRITE);
     let current = (triangles.min(capacity / capture::TRIANGLE_BYTES)) as u32;
@@ -994,6 +1033,27 @@ pub(crate) fn record(
         texel_views: std::ptr::null(),
     };
     (f.update_descriptor_sets)(g.device as Dev, 1, &write, 0, std::ptr::null());
+    // The engine's per-frame uniform block where a captured draw read one
+    // large enough, else a zeroed one of ours.
+    let block = capture::frame_block(device).filter(|b| b.2 >= FRAME_BLOCK_BYTES);
+    let block_info = match block {
+        Some((buffer, offset, _)) => DescriptorBufferInfo { buffer, offset, range: FRAME_BLOCK_BYTES },
+        None => DescriptorBufferInfo { buffer: g.no_frame_block.buffer, offset: 0, range: FRAME_BLOCK_BYTES },
+    };
+    let write = WriteDescriptorSet {
+        s_type: ST_WRITE_DESCRIPTOR_SET,
+        p_next: std::ptr::null(),
+        set: g.tex_sets[slot],
+        binding: 1,
+        element: 0,
+        count: 1,
+        kind: DESCRIPTOR_UNIFORM_BUFFER,
+        image: std::ptr::null(),
+        buffer: &block_info,
+        texel_views: std::ptr::null(),
+    };
+    (f.update_descriptor_sets)(g.device as Dev, 1, &write, 0, std::ptr::null());
+    st.stats.light = block.is_some();
     if !draws.is_empty() {
         (f.cmd_update_buffer)(cmd, g.draws.buffer, 0, 16 * draws.len() as u64, draws.as_ptr().cast());
     }
@@ -1083,6 +1143,9 @@ pub(crate) fn record(
     let mut tp = *params;
     if !env_on() {
         tp.flags |= FLAG_NO_ENV;
+    }
+    if st.stats.light {
+        tp.flags |= FLAG_LIGHT;
     }
     (f.cmd_push_constants)(
         cmd,
@@ -1225,10 +1288,11 @@ pub(crate) fn stats_line() -> String {
     let st = state();
     let s = &st.stats;
     format!(
-        "on={} reflections={} shade={} environment={} view={} traced={} skipped={} keys={} {} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} gpu_samples={}{}",
+        "on={} reflections={} shade={} engine_light={} environment={} view={} traced={} skipped={} keys={} {} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} gpu_samples={}{}",
         is_on(),
         if super::super::ssr::reflections_on() { "on" } else { "off" },
         SHADES[shade().load(Relaxed)],
+        if s.light { "bound" } else { "none" },
         if env_on() { "on" } else { "off" },
         VIEWS[VIEW.load(Relaxed) as usize],
         s.frames,

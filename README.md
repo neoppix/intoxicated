@@ -318,11 +318,14 @@ What to know before turning it on:
 - While on it replaces the screen-space reflections entirely.
 - A hit takes its own colour, as the engine's shader makes it: the part's
   colour times its texture where the shader samples the texture at the
-  coordinates it is given (clothing and faces), else the part's flat colour,
-  at the brightness the screen shows such colours at on average.
-  `INTOXICATED_RT_SHADE=mix` blends in a quarter of the screen's colour where
-  the screen shows the hit, `screen` takes the screen's colour there (the
-  first way); devctl `rt shade own|mix|screen`.
+  coordinates it is given (clothing and faces), else the part's flat colour;
+  lit as the engine lights it, with its sun (a ray to the sun for the
+  shadow), its ambient and its exposure, read from the engine's per-frame
+  uniform block, which the trace binds as the engine does.
+  `INTOXICATED_RT_SHADE=own` leaves the light out (the colour at the
+  brightness the screen shows such colours at on average), `mix` blends in
+  a quarter of the screen's colour where the screen shows the hit, `screen`
+  takes the screen's colour there; devctl `rt shade lit|own|mix|screen`.
 - Interface drawn in the world, such as leaderboards, name tags and trophy
   icons, does not reflect, nor do particles or see-through parts (of what
   the game draws blended, only characters are traced, where their alpha is

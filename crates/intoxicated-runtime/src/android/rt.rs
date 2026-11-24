@@ -557,7 +557,7 @@ pub fn control(args: &[&str]) -> Result<String, String> {
                 trace::stats_line()
             ))
         }
-        _ => Err("rt [stats] | on | off | shade own|mix|screen | env on|off | view off|normal|source | draws | dump <path> | dump-cache <path>".into()),
+        _ => Err("rt [stats] | on | off | shade lit|own|mix|screen | env on|off | view off|normal|source | draws | dump <path> | dump-cache <path>".into()),
     }
 }
 

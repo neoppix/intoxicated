@@ -221,6 +221,10 @@ struct Cmd {
     /// pushed: (set, binding) to (image view, layout).
     sets: [u64; 8],
     pushed: HashMap<(u32, u32), (u64, u32)>,
+    /// The engine's per-frame uniform block (set 0, binding 0): pushed
+    /// (buffer, offset, range), and the first dynamic offset bound with set 0.
+    pushed_frame: Option<(u64, u64, u64)>,
+    set0_dynamic: u32,
 }
 
 /// Our objects on one device.
@@ -244,6 +248,9 @@ struct Gpu {
     /// (serial, view, layout).
     draws: Vec<[u32; 3]>,
     textures: Vec<(u32, u64, u32)>,
+    /// The per-frame uniform block a captured draw last read (buffer,
+    /// offset, range): the engine's lighting, read by the trace.
+    frame_block: Option<(u64, u64, u64)>,
     /// A draw to capture found no room this frame.
     overflowed: bool,
 }
@@ -300,6 +307,9 @@ struct State {
     /// view lives, so cached triangles can name their texture.
     view_serials: HashMap<u64, u32>,
     next_serial: u32,
+    /// Binding 0 of each descriptor set the engine wrote as a uniform
+    /// buffer: (buffer, offset, range, dynamic).
+    set_frames: HashMap<u64, (u64, u64, u64, bool)>,
 }
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
@@ -678,6 +688,23 @@ unsafe fn image_writes(count: u32, writes: *const u8) -> Vec<(u64, u32, u64, u32
     out
 }
 
+/// A template entry that is the per-frame uniform block (bit 0: dynamic).
+const FRAME_BLOCK_ENTRY: u32 = 1 << 31;
+
+/// The per-frame uniform block a template writes: (buffer, offset, range,
+/// dynamic).
+///
+/// # Safety
+/// `data` must be what the engine passes with this template.
+unsafe fn template_frame_block(entries: &[(u32, usize)], data: *const u8) -> Option<(u64, u64, u64, bool)> {
+    if data.is_null() {
+        return None;
+    }
+    let &(tag, offset) = entries.iter().find(|e| e.0 & FRAME_BLOCK_ENTRY != 0)?;
+    let b = data.add(offset) as *const c_void;
+    Some((get(b, 0), get(b, 8), get(b, 16), tag & 1 != 0))
+}
+
 /// The (binding, view, layout) a template writes from `data`.
 ///
 /// # Safety
@@ -688,6 +715,7 @@ unsafe fn template_images(entries: &[(u32, usize)], data: *const u8) -> Vec<(u32
     }
     entries
         .iter()
+        .filter(|e| e.0 & FRAME_BLOCK_ENTRY == 0)
         .map(|&(binding, offset)| {
             let info = data.add(offset) as *const c_void;
             (binding, get::<u64>(info, 8), get::<u32>(info, 16))
@@ -695,13 +723,48 @@ unsafe fn template_images(entries: &[(u32, usize)], data: *const u8) -> Vec<(u32
         .collect()
 }
 
+const DESCRIPTOR_UNIFORM_BUFFER: u32 = 6;
+const DESCRIPTOR_UNIFORM_BUFFER_DYNAMIC: u32 = 8;
+
+/// The uniform buffer at binding 0, element 0, among `count`
+/// `VkWriteDescriptorSet`: (set, buffer, offset, range, dynamic).
+///
+/// # Safety
+/// `writes` must be `count` valid `VkWriteDescriptorSet`.
+unsafe fn frame_block_writes(count: u32, writes: *const u8) -> Vec<(u64, u64, u64, u64, bool)> {
+    let mut out = Vec::new();
+    if writes.is_null() {
+        return out;
+    }
+    for i in 0..count as usize {
+        let w = writes.add(i * 72) as *const c_void;
+        let (set, binding, element, n, kind, buffers): (u64, u32, u32, u32, u32, *const u8) =
+            (get(w, 16), get(w, 24), get(w, 28), get(w, 32), get(w, 36), get(w, 48));
+        if binding != 0 || element != 0 || n == 0 || buffers.is_null() {
+            continue;
+        }
+        if !matches!(kind, DESCRIPTOR_UNIFORM_BUFFER | DESCRIPTOR_UNIFORM_BUFFER_DYNAMIC) {
+            continue;
+        }
+        // `VkDescriptorBufferInfo`: buffer, offset, range.
+        let b = buffers as *const c_void;
+        out.push((set, get(b, 0), get(b, 8), get(b, 16), kind == DESCRIPTOR_UNIFORM_BUFFER_DYNAMIC));
+    }
+    out
+}
+
 extern "C" fn update_sets(device: *mut c_void, count: u32, writes: *const u8, copies: u32, copy_list: *const c_void) {
     // SAFETY: the engine's own array, read during its call.
     let found = unsafe { image_writes(count, writes) };
-    if !found.is_empty() {
+    // SAFETY: as above.
+    let blocks = unsafe { frame_block_writes(count, writes) };
+    if !found.is_empty() || !blocks.is_empty() {
         let mut st = state();
         for (set, binding, view, layout) in found {
             st.set_views.entry(set).or_default().insert(binding, (view, layout));
+        }
+        for (set, buffer, offset, range, dynamic) in blocks {
+            st.set_frames.insert(set, (buffer, offset, range, dynamic));
         }
     }
     if let Some(f) = next::<extern "C" fn(*mut c_void, u32, *const u8, u32, *const c_void)>(&UPDATE_SETS) {
@@ -726,6 +789,11 @@ extern "C" fn create_template(device: *mut c_void, info: *const c_void, alloc: *
                 if element == 0 && count > 0 && matches!(kind, DESCRIPTOR_COMBINED_IMAGE_SAMPLER | DESCRIPTOR_SAMPLED_IMAGE) {
                     e.push((binding, offset));
                 }
+                // The per-frame uniform block, by an impossible binding
+                // number so the image readers pass it by.
+                if binding == 0 && element == 0 && count > 0 && matches!(kind, DESCRIPTOR_UNIFORM_BUFFER | DESCRIPTOR_UNIFORM_BUFFER_DYNAMIC) {
+                    e.push((FRAME_BLOCK_ENTRY | u32::from(kind == DESCRIPTOR_UNIFORM_BUFFER_DYNAMIC), offset));
+                }
             }
             (e, set)
         };
@@ -742,9 +810,14 @@ extern "C" fn update_with_template(device: *mut c_void, set: u64, template: u64,
         if let Some((entries, _)) = st.templates.get(&template) {
             // SAFETY: the engine's data for this template, read during its call.
             let found = unsafe { template_images(entries, data) };
+            // SAFETY: as above.
+            let block = unsafe { template_frame_block(entries, data) };
             let views = st.set_views.entry(set).or_default();
             for (binding, view, layout) in found {
                 views.insert(binding, (view, layout));
+            }
+            if let Some(b) = block {
+                st.set_frames.insert(set, b);
             }
         }
     }
@@ -773,6 +846,12 @@ extern "C" fn cmd_bind_sets(
                     *slot = unsafe { *sets.add(i as usize) };
                 }
             }
+            // Dynamic offsets go in set and binding order: set 0's first,
+            // binding 0 its first when it is dynamic.
+            if first == 0 && dynamic_count > 0 && !dynamic.is_null() {
+                // SAFETY: the engine's array of `dynamic_count` offsets.
+                c.set0_dynamic = unsafe { *dynamic };
+            }
         }
     }
     if let Some(f) = next::<extern "C" fn(*mut c_void, u32, u64, u32, u32, *const u64, u32, *const u32)>(&CMD_BIND_SETS) {
@@ -784,10 +863,17 @@ extern "C" fn cmd_push(cmd: *mut c_void, bind_point: u32, layout: u64, set: u32,
     if bind_point == BIND_POINT_GRAPHICS {
         // SAFETY: the engine's own array, read during its call.
         let found = unsafe { image_writes(count, writes) };
+        // SAFETY: as above.
+        let blocks = unsafe { frame_block_writes(count, writes) };
         let mut st = state();
         if let Some(c) = st.cmds.get_mut(&(cmd as usize)) {
             for (_, binding, view, layout) in found {
                 c.pushed.insert((set, binding), (view, layout));
+            }
+            if set == 0 {
+                if let Some(&(_, buffer, offset, range, _)) = blocks.first() {
+                    c.pushed_frame = Some((buffer, offset, range));
+                }
             }
         }
     }
@@ -802,9 +888,14 @@ extern "C" fn cmd_push_template(cmd: *mut c_void, template: u64, layout: u64, se
         if let Some((entries, _)) = st.templates.get(&template) {
             // SAFETY: the engine's data for this template, read during its call.
             let found = unsafe { template_images(entries, data) };
+            // SAFETY: as above.
+            let block = unsafe { template_frame_block(entries, data) };
             if let Some(c) = st.cmds.get_mut(&(cmd as usize)) {
                 for (binding, view, layout) in found {
                     c.pushed.insert((set, binding), (view, layout));
+                }
+                if let (0, Some((buffer, offset, range, _))) = (set, block) {
+                    c.pushed_frame = Some((buffer, offset, range));
                 }
             }
         }
@@ -941,6 +1032,7 @@ pub(crate) fn pass_beginning(pass: &Pass) {
         g.overflowed = false;
         g.draws.clear();
         g.textures.clear();
+        g.frame_block = None;
         g.frame = presents;
         st.stats.frames += 1;
         st.frame_log.clear();
@@ -1149,7 +1241,17 @@ pub(crate) fn drew(cmd: *mut c_void, kind: &'static str, count: u32, instances: 
                     }
                     None => 0,
                 };
+                let frame_block = st.cmds.get(&(cmd as usize)).and_then(|c| {
+                    c.pushed_frame.or_else(|| {
+                        st.set_frames.get(&c.sets[0]).map(|&(buffer, offset, range, dynamic)| {
+                            (buffer, offset + if dynamic { c.set0_dynamic as u64 } else { 0 }, range)
+                        })
+                    })
+                });
                 let g = st.gpus.iter_mut().find(|g| g.device == device).expect("found above");
+                if frame_block.is_some() {
+                    g.frame_block = frame_block;
+                }
                 let blended = u32::from(p.as_ref().is_some_and(|p| p.blends));
                 if g.draws.last().map_or((0, 0), |d| (d[1], d[2])) != (code, blended) {
                     g.draws.push([(g.bytes / TRIANGLE_BYTES) as u32, code, blended]);
@@ -1263,6 +1365,12 @@ pub(crate) fn frame_captured(device: usize) -> Option<Captured> {
 pub(crate) fn frame_textures(device: usize) -> (Vec<[u32; 3]>, Vec<(u32, u64, u32)>) {
     let st = state();
     st.gpus.iter().find(|g| g.device == device).map_or((Vec::new(), Vec::new()), |g| (g.draws.clone(), g.textures.clone()))
+}
+
+/// The engine's per-frame uniform block this frame's captured draws read:
+/// (buffer, offset, range).
+pub(crate) fn frame_block(device: usize) -> Option<(u64, u64, u64)> {
+    state().gpus.iter().find(|g| g.device == device).and_then(|g| g.frame_block)
 }
 
 /// This frame's capture on one device.
@@ -1517,6 +1625,7 @@ fn make_gpu(device: usize) -> Result<Gpu, String> {
         overflowed: false,
         draws: Vec::new(),
         textures: Vec::new(),
+        frame_block: None,
     };
     let made = (|| {
         g.xfb = make_buffer(&g.fns, d, &types, capacity, USAGE_XFB | USAGE_STORAGE | USAGE_TRANSFER_SRC | USAGE_TRANSFER_DST, false)?;
