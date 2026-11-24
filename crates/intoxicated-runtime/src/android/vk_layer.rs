@@ -481,6 +481,7 @@ extern "C" fn vk_destroy_device(device: *mut c_void, allocator: *const c_void) {
     super::frame_capture::device_destroying(device);
     super::depth_capture::device_destroying(device);
     super::ssr::device_destroying(device);
+    super::rt::device_destroying(device);
     passes::device_destroying(device);
     let f = NEXT_DESTROY_DEVICE.load(std::sync::atomic::Ordering::Relaxed);
     if f != 0 {
@@ -673,9 +674,15 @@ extern "C" fn vk_create_instance(
     ));
     let copy = VkInstanceCreateInfo { pp_enabled_extension_names: rewritten.as_ptr(), ..*engine };
     let used: *const VkInstanceCreateInfo = if replaced { &copy } else { info };
+    // With `INTOXICATED_RT=1`, an API version the ray-traced reflections'
+    // device extensions can be enabled at; see `rt`.
+    // SAFETY: `used` is the engine's create info or our copy of it.
+    let raised = unsafe { super::rt::raise_api_version(used as *const c_void) };
+    let used = raised.as_ref().map_or(used, |r| r.as_ptr() as *const VkInstanceCreateInfo);
     // SAFETY: the engine's create info or our copy of it, whose name list
-    // outlives the call.
+    // (and application info) outlives the call.
     let rc = unsafe { (h.create_instance)(used, allocator, instance_out) };
+    drop(raised);
     if rc == VK_SUCCESS && !instance_out.is_null() {
         // SAFETY: success means the loader wrote the handle.
         HOST_INSTANCE.store(unsafe { *instance_out } as usize, Relaxed);
@@ -777,11 +784,28 @@ extern "C" fn vk_create_device(
     // anything it cleared in the engine's own structures.
     let stripped = super::vulkan_etc::strip_device_features(physical_device, create_info);
     let info = stripped.as_ref().map_or(create_info, |s| s.as_ptr());
-    let rc = f(physical_device, info, allocator, device_out);
+    // With `INTOXICATED_RT=1`, the extensions and features of the ray-traced
+    // reflections the GPU has, added to the engine's; nothing otherwise. See
+    // `rt`.
+    // SAFETY: `info` is the engine's create info or `vulkan_etc`'s copy.
+    let extended = unsafe { super::rt::extend_device(physical_device, info) };
+    let info = extended.as_ref().map_or(info, |e| e.as_ptr());
+    let mut rc = f(physical_device, info, allocator, device_out);
+    let mut rt_enabled = extended.as_ref().map(|e| e.enabled);
+    drop(extended);
+    if rc != VK_SUCCESS && rt_enabled.is_some() {
+        // Fail safe: the device as the engine asked for it.
+        println!("[android] vulkan: rt: vkCreateDevice returned {rc} with the reflections' extensions; made again without them");
+        rt_enabled = None;
+        rc = f(physical_device, stripped.as_ref().map_or(create_info, |s| s.as_ptr()), allocator, device_out);
+    }
     drop(stripped);
     if rc == VK_SUCCESS && !device_out.is_null() {
         // SAFETY: success means the driver wrote the handle.
         let device = unsafe { *device_out };
+        if let Some(e) = rt_enabled {
+            super::rt::device_created(device, e);
+        }
         super::vulkan_etc::device_created(physical_device, device);
         super::frame_capture::device_created(physical_device, device, first_family);
     }

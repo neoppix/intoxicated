@@ -33,6 +33,7 @@ pub mod looper;
 pub mod native_window;
 pub mod physical_size;
 pub mod present_stats;
+pub mod rt;
 pub mod ssr;
 pub mod system;
 pub mod vk_layer;

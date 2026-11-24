@@ -385,6 +385,14 @@ fn reply(line: &str) -> String {
                 None => format!("err unknown verb {verb:?}"),
             }
         }
+        // The ray-traced reflections (`INTOXICATED_RT=1`). See `android::rt`.
+        "rt" => {
+            let args: Vec<&str> = it.collect();
+            match crate::android::rt::control(&args) {
+                Ok(state) => format!("ok {state}"),
+                Err(reason) => format!("err {reason}"),
+            }
+        }
         other => format!("err unknown verb {other:?}"),
     }
 }
