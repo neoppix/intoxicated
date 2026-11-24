@@ -123,6 +123,8 @@ const TEXTURES: u32 = capture::MAX_TEXTURES as u32;
 /// reads back of them.
 const GLOBALS_BYTES: u64 = 256;
 const GLOBALS_READ: usize = 57;
+/// Byte offset of `full_rate` in the globals.
+const GLOBALS_FULL_RATE: u64 = 208;
 /// Bytes per traced 2 by 2 block.
 const BLOCK_BYTES: u64 = 16;
 /// The blocks buffer has room for at least this extent's.
@@ -952,7 +954,8 @@ pub(crate) fn record(
     (f.cmd_fill_buffer)(cmd, g.globals.buffer, 0, 16, 0);
     (f.cmd_fill_buffer)(cmd, g.globals.buffer, 132, 12, 0);
     (f.cmd_fill_buffer)(cmd, g.globals.buffer, 160, 4, 0);
-    (f.cmd_fill_buffer)(cmd, g.globals.buffer, 224, 4, 0);
+    // `full_rate`: std430 puts the `sky` vec4 before it at 192, so 208.
+    (f.cmd_fill_buffer)(cmd, g.globals.buffer, GLOBALS_FULL_RATE, 4, 0);
     (f.cmd_fill_buffer)(cmd, g.flags.buffer, 0, 4 * n as u64, 0);
     if clear_blocks {
         (f.cmd_fill_buffer)(cmd, g.blocks.buffer, 0, BLOCK_BYTES * g.block_room, 0);
@@ -1214,7 +1217,7 @@ fn fit_text(fit: Option<[u32; GLOBALS_READ]>) -> String {
         w[32] & 0xff,
         w[40],
         w[41],
-        w[56]
+        w[GLOBALS_FULL_RATE as usize / 4]
     )
 }
 

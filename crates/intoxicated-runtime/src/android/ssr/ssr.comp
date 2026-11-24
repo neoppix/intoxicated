@@ -1004,28 +1004,41 @@ void main() {
     vec4 r = vec4(0.0);
     uint from = leader(b);
     float d = 0.0;
+    // Whether the block lies on a curved mesh: its triangle's vertex normal
+    // turns from the depth's flat one. Kept as the stored depth's sign, for
+    // the upsample.
+    bool curved = false;
     if (from != NO_PIXEL) {
         ivec2 p = ivec2(from & 0xffffu, from >> 16);
         d = depth_at(p);
         vec3 P = view_pos(vec2(p) + 0.5, d);
         vec3 N = surface_at(p, P).n;
         float wet = N == vec3(0.0) ? 0.0 : wetness(N);
-        if (N != vec3(0.0) && ((pc.flags >> 6) & 3u) != 0u) {
-            r = debug_view(surface_normal(p, P, N));
-        } else if (wet > 0.0) {
-            r = reflection_rt(p, P, surface_normal(p, P, N), wet);
+        if (N != vec3(0.0)) {
+            vec3 n = surface_normal(p, P, N);
+            curved = g_source > 1.5 && dot(n, N) < 0.9995;
+            if (((pc.flags >> 6) & 3u) != 0u) {
+                r = debug_view(n);
+            } else if (wet > 0.0) {
+                r = reflection_rt(p, P, n, wet);
+            }
         }
     }
     uint i = uint(b.y) * hs.x + uint(b.x);
     uvec4 last = blocks[i];
-    float last_d = uintBitsToFloat(last.w);
-    if (from != NO_PIXEL && last.z == from && abs(last_d - d) <= 0.001 * d) {
+    float last_d = abs(uintBitsToFloat(last.w));
+    // The last frame's result is kept only to steady noise: where the pixel
+    // is where it was, not on a curved mesh, and what it reflects has not
+    // changed (a moving head reflected in a still shoulder, or anything
+    // that moved, would lag behind and jump).
+    if (from != NO_PIXEL && !curved && last.z == from && abs(last_d - d) <= 0.001 * d) {
         vec4 h = vec4(unpackHalf2x16(last.x), unpackHalf2x16(last.y));
-        if (!any(isnan(h)) && !any(isinf(h))) {
+        vec4 diff = abs(h - r);
+        if (!any(isnan(h)) && !any(isinf(h)) && max(max(diff.r, diff.g), max(diff.b, diff.a)) < 0.08) {
             r = mix(r, h, HISTORY);
         }
     }
-    blocks[i] = uvec4(packHalf2x16(r.rg), packHalf2x16(r.ba), from, floatBitsToUint(d));
+    blocks[i] = uvec4(packHalf2x16(r.rg), packHalf2x16(r.ba), from, floatBitsToUint(curved ? -d : d));
 }
 
 #else
@@ -1080,13 +1093,16 @@ void main() {
                     mean += k * dot(samples[n].rgb, vec3(0.2126, 0.7152, 0.0722));
                 }
             }
-            // Near the camera (within 16 studs) on a clearly curved surface
-            // (its neighbours' normals turn more than about 5 degrees from
-            // its own), the pixel traces its own ray instead: a 2 by 2 block
-            // is too coarse there. At most FULL_RATE_MAX pixels a frame.
-            if (P.z * g_near < 16.0 && g_fit) {
-                vec3 s = smoothed(p, P, N);
-                if (dot(s, N) < 0.996 && atomicAdd(full_rate, 1u) < FULL_RATE_MAX) {
+            // Near the camera (within 24 studs) on a curved mesh (its block's
+            // triangle has vertex normals that turn from the flat one, such
+            // as a head), or on a clearly curved depth (neighbours' normals
+            // turning more than about 5 degrees), the pixel traces its own
+            // ray instead: a 2 by 2 block is too coarse there. At most
+            // FULL_RATE_MAX pixels a frame.
+            if (P.z * g_near < 24.0 && g_fit) {
+                uvec4 own = blocks[uint(b0.y) * hs.x + uint(b0.x)];
+                bool curved = uintBitsToFloat(own.w) < 0.0 || dot(smoothed(p, P, N), N) < 0.996;
+                if (curved && atomicAdd(full_rate, 1u) < FULL_RATE_MAX) {
                     vec3 n = surface_normal(p, P, N);
                     imageStore(trace_img, p, ((pc.flags >> 6) & 3u) != 0u ? debug_view(n) : reflection_rt(p, P, n, wet));
                     return;
