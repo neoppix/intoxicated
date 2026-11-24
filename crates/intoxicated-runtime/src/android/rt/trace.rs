@@ -122,7 +122,7 @@ const TEXTURES: u32 = capture::MAX_TEXTURES as u32;
 /// Bytes of the globals (`build.comp`'s `Globals`) and of what `rt stats`
 /// reads back of them.
 const GLOBALS_BYTES: u64 = 256;
-const GLOBALS_READ: usize = 42;
+const GLOBALS_READ: usize = 57;
 /// Bytes per traced 2 by 2 block.
 const BLOCK_BYTES: u64 = 16;
 /// The blocks buffer has room for at least this extent's.
@@ -952,6 +952,7 @@ pub(crate) fn record(
     (f.cmd_fill_buffer)(cmd, g.globals.buffer, 0, 16, 0);
     (f.cmd_fill_buffer)(cmd, g.globals.buffer, 132, 12, 0);
     (f.cmd_fill_buffer)(cmd, g.globals.buffer, 160, 4, 0);
+    (f.cmd_fill_buffer)(cmd, g.globals.buffer, 224, 4, 0);
     (f.cmd_fill_buffer)(cmd, g.flags.buffer, 0, 4 * n as u64, 0);
     if clear_blocks {
         (f.cmd_fill_buffer)(cmd, g.blocks.buffer, 0, BLOCK_BYTES * g.block_room, 0);
@@ -1193,7 +1194,7 @@ fn fit_text(fit: Option<[u32; GLOBALS_READ]>) -> String {
     format!(
         "fit=ok fit_samples={} fov_x={:.2} fov_y={:.2} near={:.4} forward_len={:.4} world_up={:.3},{:.3},{:.3} exposure={:.3} \
          camera={:.1},{:.1},{:.1} cache_listed={} cache_new={} cache_dropped={} cache_full={} cache_generation={} \
-         list_cut={} fit_failures={}",
+         list_cut={} fit_failures={} full_rate_pixels={}",
         w[1],
         2.0 * f(4).atan().to_degrees(),
         2.0 * f(5).atan().to_degrees(),
@@ -1212,7 +1213,8 @@ fn fit_text(fit: Option<[u32; GLOBALS_READ]>) -> String {
         w[34],
         w[32] & 0xff,
         w[40],
-        w[41]
+        w[41],
+        w[56]
     )
 }
 

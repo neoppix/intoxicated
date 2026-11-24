@@ -115,6 +115,8 @@ layout(std430, set = BUFSET, binding = 6) buffer Globals {
     uint sky_b;
     uint sky_n;
     vec4 sky;
+    // Pixels that traced their own ray this frame (ssr.comp's upsample).
+    uint full_rate;
 };
 // Triangles to trace, six vec4 each: three vertices (world xyz, the colour
 // packed in w), the texture coordinates of A and B, then those of C, the

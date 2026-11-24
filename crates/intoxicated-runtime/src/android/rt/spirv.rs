@@ -569,17 +569,22 @@ pub(crate) struct VertexInfo {
     pub uv: Option<u32>,
     /// It passes on a vertex normal: a lit mesh, not a flat interface quad.
     pub normal: bool,
+    /// It places its vertices by bones (a character), not by the part's own
+    /// matrices.
+    pub skinned: bool,
 }
 
 pub(crate) fn vertex_info(words: &[u32]) -> Option<VertexInfo> {
     let list = instructions(words).ok()?;
     let flow = Flow::new(words, &list);
     let colour = colour_output(words, &list, &flow)?;
-    let camera = camera_vector_output(words, &list, &flow).map_or(0, |c| c.output);
+    let camera = camera_vector_output(words, &list, &flow);
+    let output = camera.as_ref().map_or(0, |c| c.output);
     Some(VertexInfo {
         colour: *flow.loc.get(&colour)?,
         uv: uv_output(words, &list, &flow).map(|(l, _)| l),
-        normal: normal_output(words, &list, &flow, camera, colour).is_some(),
+        normal: normal_output(words, &list, &flow, output, colour).is_some(),
+        skinned: camera.is_some_and(|c| !c.fixed),
     })
 }
 
@@ -970,7 +975,8 @@ mod tests {
         assert_eq!(fragment_albedo(VS), None, "a vertex shader has none");
         // The test vertex shader passes its colour at 1 and has no texture
         // coordinates.
-        assert_eq!(vertex_info(VS), Some(VertexInfo { colour: 1, uv: None, normal: true }));
+        assert_eq!(vertex_info(VS), Some(VertexInfo { colour: 1, uv: None, normal: true, skinned: false }));
+        assert!(vertex_info(SKINNED).is_some_and(|v| v.skinned && v.normal));
     }
 
     #[test]

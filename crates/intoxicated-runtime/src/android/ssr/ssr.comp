@@ -534,6 +534,7 @@ layout(std430, set = 1, binding = 6) buffer Globals {
     uint sky_b;
     uint sky_n;
     vec4 sky;
+    uint full_rate;
 };
 // The environment: what the screen showed in each direction where it showed
 // sky, kept over frames, octahedral around world up, `ENV_SIZE` squared:
@@ -801,6 +802,10 @@ vec3 hit_colour(uint tri, vec2 uv, float t) {
     return any(isnan(c)) ? vec3(0.5) : clamp(c, 0.0, 1.0);
 }
 
+const float NORMAL_REACH = 48.0;
+// Pixels a frame that may trace their own ray (see the upsample).
+const uint FULL_RATE_MAX = 65536u;
+
 // The pixel's own triangle's normal, from the normals the engine's vertex
 // shader gave its corners, at the point a ray from the camera meets it:
 // smooth where the engine shades smoothly. N (the depth's) where the ray
@@ -808,6 +813,11 @@ vec3 hit_colour(uint tri, vec2 uv, float t) {
 // normals, or they turn more than 60 degrees from N.
 vec3 rt_normal(vec3 P, vec3 N) {
     float dist = length(P) * g_near;
+    // Further away a triangle covers a few pixels and the evened-out normal
+    // is as good, for no ray.
+    if (dist > NORMAL_REACH) {
+        return N;
+    }
     vec3 D = normalize(world_dir(P));
     uint tri;
     vec2 uv;
@@ -1070,12 +1080,13 @@ void main() {
                     mean += k * dot(samples[n].rgb, vec3(0.2126, 0.7152, 0.0722));
                 }
             }
-            // Near the camera (within 24 studs) on a curved surface (its
-            // neighbours' normals turn from its own), the pixel traces its
-            // own ray instead: a 2 by 2 block is too coarse there.
-            if (P.z * g_near < 24.0 && g_fit) {
+            // Near the camera (within 16 studs) on a clearly curved surface
+            // (its neighbours' normals turn more than about 5 degrees from
+            // its own), the pixel traces its own ray instead: a 2 by 2 block
+            // is too coarse there. At most FULL_RATE_MAX pixels a frame.
+            if (P.z * g_near < 16.0 && g_fit) {
                 vec3 s = smoothed(p, P, N);
-                if (dot(s, N) < 0.9995) {
+                if (dot(s, N) < 0.996 && atomicAdd(full_rate, 1u) < FULL_RATE_MAX) {
                     vec3 n = surface_normal(p, P, N);
                     imageStore(trace_img, p, ((pc.flags >> 6) & 3u) != 0u ? debug_view(n) : reflection_rt(p, P, n, wet));
                     return;

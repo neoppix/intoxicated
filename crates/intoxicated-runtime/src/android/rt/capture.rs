@@ -564,14 +564,17 @@ unsafe fn describe_pipeline(info: *const c_void, device: usize, modules: &HashMa
                 get::<u32>(a, 0) != 0 && get::<u32>(a, 28) != 0
             })
     };
-    // A blending pipeline whose vertex shader passes on a vertex normal is a
-    // lit mesh that may be see-through (the engine draws characters' heads
-    // and other meshes this way, opaque or nearly): captured as opaque.
-    // One without, the interface drawn in the world, is not.
-    let lit_mesh = matches!(vertex, Some(Some(m)) if m.outputs.is_some_and(|o| o.normal));
+    // A blending pipeline is captured only for characters: a skinned lit
+    // mesh (the engine draws characters' heads so, opaque or nearly), and
+    // then only its triangles whose colour is opaque (see `build.comp`).
+    // Blending static parts are left out: the game's nearly invisible
+    // barriers and zone markers are drawn so, some with their transparency
+    // where the capture cannot see it; and so is the interface drawn in the
+    // world.
+    let character = matches!(vertex, Some(Some(m)) if m.outputs.is_some_and(|o| o.normal && o.skinned));
     p.blends = blends;
-    if blends && !lit_mesh {
-        fail(&mut p, "it blends and passes on no normal (interface drawn in the world)");
+    if blends && !character {
+        fail(&mut p, "it blends and is not a character (see-through parts, interface drawn in the world)");
     }
     if is_dynamic(dynamic, &[DYNAMIC_COLOR_WRITE_ENABLE, DYNAMIC_COLOR_WRITE_MASK]) {
         fail(&mut p, "its colour writes are dynamic");
