@@ -557,7 +557,7 @@ impl Fns {
 }
 
 const RING: usize = 16;
-const STAMPS: usize = 6;
+const STAMPS: usize = 8;
 const WINDOW: usize = 512;
 
 #[derive(Default)]
@@ -569,8 +569,9 @@ pub(crate) struct Stats {
     pub build_ms: std::collections::VecDeque<f64>,
     pub trace_ms: std::collections::VecDeque<f64>,
     /// The trace's parts: the Neon tiles, the indirect light's rays, its
-    /// filter, the reflections (with their history and blur).
-    pub parts_ms: [std::collections::VecDeque<f64>; 4],
+    /// filter, the reflections (with their history and blur), and of those
+    /// the rays, the upsample, the history and blur.
+    pub parts_ms: [std::collections::VecDeque<f64>; 6],
     pub keys: u32,
     /// The blocks' sizes in pixels a side: the reflections', the indirect
     /// light's.
@@ -776,7 +777,7 @@ impl Gpu {
 
     /// The build and trace milliseconds this slot held, when they are in,
     /// and the trace's parts (see `Stats::parts_ms`).
-    fn collect(&mut self, slot: usize, period_ns: f64, mask: u64) -> Option<(f64, f64, [f64; 4])> {
+    fn collect(&mut self, slot: usize, period_ns: f64, mask: u64) -> Option<(f64, f64, [f64; 6])> {
         if !self.pending[slot] || self.query_pool == 0 {
             return None;
         }
@@ -797,7 +798,11 @@ impl Gpu {
         }
         let ms = |a: u64, b: u64| super::super::ssr::ticks_to_ms(a, b, mask, period_ns);
         let t = |i: usize| out[2 * i];
-        Some((ms(t(0), t(1)), ms(t(1), t(5)), [ms(t(1), t(2)), ms(t(2), t(3)), ms(t(3), t(4)), ms(t(4), t(5))]))
+        Some((
+            ms(t(0), t(1)),
+            ms(t(1), t(7)),
+            [ms(t(1), t(2)), ms(t(2), t(3)), ms(t(3), t(4)), ms(t(4), t(7)), ms(t(4), t(5)), ms(t(5), t(6))],
+        ))
     }
 }
 
@@ -1269,8 +1274,17 @@ pub(crate) fn record(
     let slot = g.next_slot;
     g.next_slot = (slot + 1) % RING;
     if let Some((b, t, parts)) = g.collect(slot, period_ns, mask) {
-        let [p0, p1, p2, p3] = &mut st.stats.parts_ms;
-        for (q, v) in [(&mut st.stats.build_ms, b), (&mut st.stats.trace_ms, t), (p0, parts[0]), (p1, parts[1]), (p2, parts[2]), (p3, parts[3])] {
+        let [p0, p1, p2, p3, p4, p5] = &mut st.stats.parts_ms;
+        for (q, v) in [
+            (&mut st.stats.build_ms, b),
+            (&mut st.stats.trace_ms, t),
+            (p0, parts[0]),
+            (p1, parts[1]),
+            (p2, parts[2]),
+            (p3, parts[3]),
+            (p4, parts[4]),
+            (p5, parts[5]),
+        ] {
             if q.len() == WINDOW {
                 q.pop_front();
             }
@@ -1604,9 +1618,11 @@ pub(crate) fn record(
     stamp(4);
     // One ray per 2 by 2 block, then every pixel from the blocks around it.
     half(TRACE);
+    stamp(5);
     g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
     (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[UPSAMPLE]);
     (f.cmd_dispatch)(cmd, extent[0].div_ceil(8), extent[1].div_ceil(8), 1);
+    stamp(6);
     if temporal {
         // Each pixel's history (by the frame's parity), then that into the
         // trace image the compose reads.
@@ -1625,7 +1641,7 @@ pub(crate) fn record(
             }
         }
     }
-    stamp(5);
+    stamp(7);
     if timed {
         g.pending[slot] = true;
     }
@@ -1783,7 +1799,7 @@ pub(crate) fn stats_line() -> String {
     let st = state();
     let s = &st.stats;
     format!(
-        "on={} reflections={} shade={} engine_light={} environment={} gi={} gi_gain={:.2} glow={} view={} soft={} blocks={}x{} gi_blocks={}x{} traced={} skipped={} keys={} {} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} lights_ms={:.3} gi_ms={:.3} gi_filter_ms={:.3} reflections_ms={:.3} reflections_p95={:.3} gpu_samples={}{}",
+        "on={} reflections={} shade={} engine_light={} environment={} gi={} gi_gain={:.2} glow={} view={} soft={} blocks={}x{} gi_blocks={}x{} traced={} skipped={} keys={} {} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} lights_ms={:.3} gi_ms={:.3} gi_filter_ms={:.3} reflections_ms={:.3} reflections_p95={:.3} reflection_rays_ms={:.3} upsample_ms={:.3} gpu_samples={}{}",
         is_on(),
         if super::super::ssr::reflections_on() { "on" } else { "off" },
         SHADES[shade().load(Relaxed)],
@@ -1811,6 +1827,8 @@ pub(crate) fn stats_line() -> String {
         mean(&s.parts_ms[2]),
         mean(&s.parts_ms[3]),
         p95(&s.parts_ms[3]),
+        mean(&s.parts_ms[4]),
+        mean(&s.parts_ms[5]),
         s.build_ms.len(),
         s.last_skip.as_ref().map_or(String::new(), |w| format!(" last_skip={w:?}"))
     )

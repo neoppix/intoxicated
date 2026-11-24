@@ -381,9 +381,11 @@ their light is taken exactly (each triangle's form factor at half its engine
 brightness, no random samples), so the glow beside a Neon panel is strong and
 steady. A tile keeps the lights it chose the frame before (found through the
 last frame's camera and favoured by half again) and weighs them against up to
-1024 more, so its choice holds from frame to frame; the sight rays are cast
-one invocation per tile and light, new choices at once and kept ones in turn
-every fourth frame. With the bloom on, what the ray-traced reflections and
+512 more within 128 studs, so its choice holds from frame to frame; the sight
+rays are cast one invocation per tile and light, new choices at once and kept
+ones in turn every fourth frame. Reflected hits the screen does not show take
+Neon light from eight random Neon triangles without a sight ray, so a Neon
+part behind a wall can light them there. With the bloom on, what the ray-traced reflections and
 the indirect light have above white (reflected Neon, its glow on a wall) is
 added to what the bloom blooms (`INTOXICATED_RT_GLOW=0` or devctl `rt glow
 off` leaves it out; INFERRED: the pass runs, but in the Timebomb Duels lobby
@@ -465,7 +467,12 @@ ms budget leaves after the hierarchy's build for three looks in a row (two
 seconds each at 60 fps), and back after three looks well under it; their
 history is carried across a change, not cleared (`rt stats`: `blocks`,
 `gi_blocks`, and the trace's parts `lights_ms`, `gi_ms`, `gi_filter_ms`,
-`reflections_ms`). Only at 2 by 2 with the indirect light not coarsened by
+`reflections_ms`, of which `reflection_rays_ms` and `upsample_ms`).
+Reflection rays end after 1024 studs (then the sky) and rays towards the sun
+after 512. Measured fullscreen at 3440x1440 in Jailbreak's menu flight: build
+1.3 to 1.6 ms, trace 3.4 to 5.1 ms (Neon tiles 0.4 to 1.3, indirect light 0.7
+to 1.6 at 5 by 5 under the budget, reflections 2.0 to 2.5, of which their rays
+1.1 to 1.6). Only at 2 by 2 with the indirect light not coarsened by
 the budget do near curved pixels trace their own rays. `rt stats` also reports the render thread's time in the
 client's capture hooks (`cpu_us_frame`, `cpu_ns_draw`).
 

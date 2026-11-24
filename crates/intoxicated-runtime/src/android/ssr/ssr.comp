@@ -984,9 +984,9 @@ bool emits(uint tri) {
 
 // The light the listed Neon triangles give a point X with normal n (world),
 // in the GI's units (the cosine-weighted average of the light coming in):
-// four of them picked at random, one of those by what it would give
-// (resampled importance sampling), and a ray towards a random point on it
-// for whether it is in view. 0 where there are none.
+// eight of them picked at random, one of those by what it would give
+// (resampled importance sampling), not checked for whether it is in view
+// (see the end). 0 where there are none.
 // Neon as a light: a quarter of its drawn brightness, falling off faster
 // than the square of the distance beyond NEON_NEAR studs, so a panel lights
 // the wall and floor beside it strongly while a street of lit windows does
@@ -1068,14 +1068,11 @@ vec3 emitter_light(vec3 X, vec3 n, uint seed) {
     if (chosen_p <= 0.0) {
         return vec3(0.0);
     }
-    vec3 d = chosen_y - X;
-    float len = length(d);
-    uint st;
-    vec2 su;
-    vec3 O = X + n * (0.002 * len + 0.02);
-    if (trace_ray(O, normalize(chosen_y - O), 0.01, len * 0.97, st, su) > 0.0) {
-        return vec3(0.0);
-    }
+    // No ray for whether it is in sight: this lights reflected hits the
+    // screen does not show, where the GI has no light to give, and a ray
+    // here cost the reflections at 3440x1440 0.7 to 2 ms (Jailbreak's
+    // city, measured); a Neon part behind a wall so lights it in the
+    // reflections, within NEON_NEAR studs or so.
     return min(chosen_f / chosen_p * (wsum / float(M)), vec3(4.0));
 }
 
@@ -1189,13 +1186,20 @@ const uint S_COL = 17u;
 // at world point `Hw` with normal `n`, lit as the engine's shaders light it,
 // in linear before the exposure: the colour squared times ambient, the sun
 // where a ray towards it is free, and the light from the other side.
+// How far a ray towards the sun looks for what shades a hit (studs), and
+// how far a reflection ray goes before it takes the sky: past them the
+// cache holds nothing (it traces within 512 studs) and the long rays cost
+// most at 3440x1440.
+const float SHADOW_REACH = 512.0;
+const float REFLECT_REACH = 1024.0;
+
 vec3 lit_linear(vec3 c, vec3 n, vec3 Hw) {
     vec3 to_sun = -frame_block[16].xyz;
     float sun = max(dot(n, to_sun), 0.0);
     if (sun > 0.0) {
         uint st;
         vec2 su;
-        if (trace_ray(Hw + n * 0.05, normalize(to_sun), 0.01, 2048.0, st, su) > 0.0) {
+        if (trace_ray(Hw + n * 0.05, normalize(to_sun), 0.01, SHADOW_REACH, st, su) > 0.0) {
             sun = 0.0;
         }
     }
@@ -1253,7 +1257,7 @@ vec4 reflection_rt(ivec2 p, vec3 P, vec3 N, float wet) {
     vec3 O = to_world(P + N * (0.002 * P.z));
     vec3 Rw = normalize(world_dir(R));
     float scale = g_near;
-    float t_max = pc.max_distance > 0.0 ? pc.max_distance * length(P) * scale : 3.0e38;
+    float t_max = pc.max_distance > 0.0 ? min(pc.max_distance * length(P) * scale, REFLECT_REACH) : REFLECT_REACH;
     uint tri;
     vec2 uv;
     float t = trace_ray(O, Rw, 0.002 * P.z * scale, t_max, tri, uv);
@@ -1816,7 +1820,7 @@ void main() {
 // frame to frame and a tile does not switch between two near equal lights
 // (temporal reuse of the choices, as in ReSTIR, but keeping the strongest
 // rather than resampling: the light is summed exactly, not estimated).
-const uint LIGHT_CANDIDATES = 1024u;
+const uint LIGHT_CANDIDATES = 512u;
 const float LIGHT_KEEP = 1.5;
 // A kept choice's ray is cast again one frame in LIGHT_RECHECK, in turn.
 const uint LIGHT_RECHECK = 4u;
@@ -1837,9 +1841,16 @@ shared vec4 sh_mid[64];
 shared vec4 sh_nrm[64];
 shared uvec2 sh_id[64];
 
+// Neon triangles farther than this (studs) are not chosen: their light is
+// faint, and their long sight rays were most of this pass's time.
+const float LIGHT_REACH = 128.0;
+
 float score_of(vec4 mp, vec4 na, vec3 X, vec3 n) {
     vec3 dv = mp.xyz - X;
     float d2 = max(dot(dv, dv), 0.25);
+    if (d2 > LIGHT_REACH * LIGHT_REACH) {
+        return 0.0;
+    }
     vec3 dir = dv * inversesqrt(d2);
     float cx = dot(n, dir);
     if (cx <= 0.0) {
