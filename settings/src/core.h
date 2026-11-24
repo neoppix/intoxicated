@@ -332,9 +332,19 @@ struct ShaderMode {
     QMap<QString, QPair<bool, QString>> effects;
 };
 
+// Whether JSON is what a client built without the visual effects prints for
+// `--shader-looks` and `--ssr-looks` (install.sh --no-effects): an object
+// whose "available" is false.
+bool effectsUnavailable(const QByteArray &json);
+// How the effects are added to such a client.
+inline const QString kAddEffectsCommand = QStringLiteral("intoxicated --update --effects");
+
 // `intoxicated --shader-looks`, parsed. MODES, when given, gets the
 // whole-page modes the client lists (none from a client that lists none).
-std::optional<QList<SsrTable>> readShaderTables(QString *error, QList<ShaderMode> *modes = nullptr);
+// From a client built without the effects: nullopt, with UNAVAILABLE (when
+// given) set and ERROR saying so.
+std::optional<QList<SsrTable>> readShaderTables(QString *error, QList<ShaderMode> *modes = nullptr,
+                                                bool *unavailable = nullptr);
 
 // Parse the "modes" of what `intoxicated --shader-looks` prints, against its
 // TABLES: every mode names a look of each effect. No "modes" is no modes.

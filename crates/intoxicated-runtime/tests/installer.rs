@@ -10,6 +10,8 @@
 //! a question can only be answered by `INTOXICATED_YES=1`.
 
 use std::fs;
+use std::io::{Read, Write};
+use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -135,6 +137,25 @@ impl Setup {
     }
 
     fn run(&self, env: &[(&str, &str)]) -> Outcome {
+        self.run_with(&[], env, None)
+    }
+
+    /// The choice the installer keeps between runs, if any.
+    fn install_conf(&self) -> Option<String> {
+        fs::read_to_string(self.root.join("home/.config/intoxicated/install.conf")).ok()
+    }
+
+    /// The Roblox build in place, so a run does not fetch it.
+    fn roblox_build(&self) {
+        let apk = self.root.join("cache/intoxicated/apk");
+        fs::create_dir_all(apk.join("lib/x86_64")).unwrap();
+        fs::write(apk.join("candidate-0.apk"), b"").unwrap();
+        fs::write(apk.join("lib/x86_64/libroblox.so"), b"").unwrap();
+    }
+
+    /// `install.sh ARGS`; with `answers`, on a terminal of its own that has
+    /// them typed in already, one question per line.
+    fn run_with(&self, args: &[&str], env: &[(&str, &str)], answers: Option<&str>) -> Outcome {
         let path = format!(
             "{}:/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin",
             self.root.join("bin").display()
@@ -142,6 +163,7 @@ impl Setup {
         let mut command = Command::new("/bin/sh");
         command
             .arg(installer())
+            .args(args)
             .env_clear()
             .env("PATH", path)
             .env("HOME", self.root.join("home"))
@@ -154,14 +176,84 @@ impl Setup {
         for (k, v) in env {
             command.env(k, v);
         }
-        // SAFETY: setsid is async-signal-safe and touches no Rust state.
+        // One terminal run at a time (ptsname has one buffer).
+        static TERMINAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _one = answers.map(|_| TERMINAL.lock().unwrap_or_else(|e| e.into_inner()));
+        let tty = answers.map(|typed| {
+            let fail = |what: &str| -> ! { panic!("{what}: {}", std::io::Error::last_os_error()) };
+            // Both ends close on exec from the start, so no other test's
+            // child, forked meanwhile, holds one open.
+            let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+            // SAFETY: plain calls on a descriptor of ours; ptsname's buffer
+            // is read at once, under the lock above.
+            let (master, slave) = unsafe {
+                let master = libc::posix_openpt(flags);
+                if master < 0 {
+                    fail("posix_openpt");
+                }
+                if libc::grantpt(master) != 0 || libc::unlockpt(master) != 0 {
+                    fail("grantpt");
+                }
+                let name = libc::ptsname(master);
+                if name.is_null() {
+                    fail("ptsname");
+                }
+                let slave = libc::open(name, flags);
+                if slave < 0 {
+                    fail("open the terminal");
+                }
+                (master, slave)
+            };
+            // SAFETY: the master is ours alone from here on.
+            let mut m = unsafe { fs::File::from_raw_fd(master) };
+            // Waiting in the terminal's input queue until each is read.
+            m.write_all(typed.as_bytes()).unwrap();
+            (m, slave)
+        });
+        let slave = tty.as_ref().map(|(_, s)| *s);
+        // SAFETY: setsid and ioctl are async-signal-safe and touch no Rust
+        // state. The terminal, when there is one, becomes the session's.
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
                 libc::setsid();
+                if let Some(s) = slave {
+                    if libc::ioctl(s, libc::TIOCSCTTY, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
                 Ok(())
             });
         }
-        let out = command.output().expect("/bin/sh runs");
+        // The terminal is read while the installer runs: when it exits, as
+        // the session's leader, what is still queued on it is dropped.
+        let reader = tty.map(|(m, s)| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut m = m;
+                let mut chunk = [0u8; 4096];
+                while let Ok(n @ 1..) = m.read(&mut chunk) {
+                    if tx.send(chunk[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            });
+            (rx, s)
+        });
+        let out = command.output().unwrap_or_else(|e| panic!("/bin/sh runs: {e}"));
+        let terminal = match reader {
+            Some((rx, s)) => {
+                // SAFETY: closed once, here; the installer has exited, so the
+                // reader sees the end of the terminal.
+                unsafe { libc::close(s) };
+                // What came, without waiting on a reader that never ends.
+                let mut bytes = Vec::new();
+                while let Ok(chunk) = rx.recv_timeout(std::time::Duration::from_secs(2)) {
+                    bytes.extend(chunk);
+                }
+                String::from_utf8_lossy(&bytes).into_owned()
+            }
+            None => String::new(),
+        };
         let record = self.root.join("record");
         let read = |f: &str| fs::read_to_string(record.join(f)).unwrap_or_default();
         let mut batches = Vec::new();
@@ -179,6 +271,7 @@ impl Setup {
             askpass: read("askpass"),
             user: read("user"),
             launcher: read("launcher"),
+            terminal,
         };
         for f in fs::read_dir(&record).unwrap() {
             fs::remove_file(f.unwrap().path()).unwrap();
@@ -203,6 +296,9 @@ struct Outcome {
     askpass: String,
     user: String,
     launcher: String,
+    /// What the questions wrote on the terminal, when there was one: the
+    /// prompts and the answers echoed.
+    terminal: String,
 }
 
 const YES: (&str, &str) = ("INTOXICATED_YES", "1");
@@ -517,4 +613,152 @@ fn the_launchers_update_runs_the_checkouts_installer() {
         .expect("/bin/sh runs");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(fs::read_to_string(root.join("ran")).unwrap(), format!("{}|\n", root.display()));
+}
+
+const EFFECTS_QUESTION: &str =
+    "Install visual effects (reflections, depth of field, bloom, sharpening; optional, off until you turn them on)? [y/N]";
+
+/// Asked on a terminal, after Intoxicated Settings: an empty answer is no,
+/// so the client is built without the runtime's default (`shaders`)
+/// feature, and the choice is kept.
+#[test]
+fn a_fresh_install_declines_the_visual_effects_by_default() {
+    let s = Setup::new("effects-declined");
+    // Intoxicated Settings, the effects, the root batch, the Play button:
+    // each takes its default.
+    let o = s.run_with(&[], &[], Some("\n\n\n\n\n\n"));
+    assert_eq!(o.status, 0, "{o:#?}");
+    let settings = o.terminal.find("Also install Intoxicated Settings").expect("asked about the app first");
+    let effects = o.terminal.find(EFFECTS_QUESTION).expect("asked about the effects");
+    assert!(settings < effects, "{o:#?}");
+    assert_eq!(o.cargo.trim(), format!("{} build --release --no-default-features", s.home_repo().display()));
+    assert!(o.stdout.contains("without the visual effects"), "{o:#?}");
+    assert!(o.stdout.contains("intoxicated --update --effects adds them"), "{o:#?}");
+    assert_eq!(s.install_conf().as_deref(), Some("EFFECTS=no\n"));
+    assert!(s.root.join("prefix/bin/intoxicated-settings").is_file(), "the app took its own default: {o:#?}");
+}
+
+#[test]
+fn a_fresh_install_can_take_the_visual_effects() {
+    let s = Setup::new("effects-taken");
+    let o = s.run_with(&[], &[], Some("\ny\n\n\n\n\n"));
+    assert_eq!(o.status, 0, "{o:#?}");
+    assert!(o.terminal.contains(EFFECTS_QUESTION), "{o:#?}");
+    assert_eq!(o.cargo.trim(), format!("{} build --release", s.home_repo().display()));
+    assert!(o.stdout.contains("with the visual effects"), "{o:#?}");
+    assert_eq!(s.install_conf().as_deref(), Some("EFFECTS=yes\n"));
+
+    // INTOXICATED_YES=1 says yes to it as to every question.
+    let s = Setup::new("effects-yes");
+    let o = s.run(&[YES]);
+    assert_eq!(o.status, 0, "{o:#?}");
+    assert_eq!(o.cargo.trim(), format!("{} build --release", s.home_repo().display()));
+    assert_eq!(s.install_conf().as_deref(), Some("EFFECTS=yes\n"));
+}
+
+/// An update (here with no terminal, as Intoxicated Settings runs it, and
+/// with INTOXICATED_YES=1 as well) builds as the first install chose and
+/// asks nothing.
+#[test]
+fn an_update_keeps_the_remembered_choice_without_asking() {
+    let s = Setup::new("effects-update");
+    assert_eq!(s.run_with(&[], &[], Some("\n\n\n\n\n\n")).status, 0);
+    s.roblox_build();
+    let repo = s.home_repo();
+    for env in [vec![("FAKE_HANDLER", "intoxicated.desktop")], vec![YES, ("FAKE_HANDLER", "intoxicated.desktop")]] {
+        let o = s.run(&env);
+        assert_eq!(o.status, 0, "{o:#?}");
+        assert!(!o.stderr.contains("no terminal to ask"), "{o:#?}");
+        assert!(o.stdout.contains("visual effects: left out, as before (--effects adds them)"), "{o:#?}");
+        assert_eq!(o.cargo.trim(), format!("{} build --release --no-default-features", repo.display()));
+        assert_eq!(s.install_conf().as_deref(), Some("EFFECTS=no\n"));
+    }
+
+    // The same the other way round.
+    let s = Setup::new("effects-update-yes");
+    assert_eq!(s.run(&[YES]).status, 0);
+    s.roblox_build();
+    let o = s.run(&[("FAKE_HANDLER", "intoxicated.desktop")]);
+    assert_eq!(o.status, 0, "{o:#?}");
+    assert!(o.stdout.contains("visual effects: built in, as before (--no-effects leaves them out)"), "{o:#?}");
+    assert_eq!(o.cargo.trim(), format!("{} build --release", s.home_repo().display()));
+}
+
+/// An install from before there was a choice had the effects; with no
+/// choice kept, an update keeps them rather than asking.
+#[test]
+fn an_install_from_before_the_choice_keeps_its_effects() {
+    let s = Setup::new("effects-older");
+    assert_eq!(s.run(&[YES]).status, 0);
+    fs::remove_file(s.root.join("home/.config/intoxicated/install.conf")).unwrap();
+    s.roblox_build();
+    let o = s.run(&[("FAKE_HANDLER", "intoxicated.desktop")]);
+    assert_eq!(o.status, 0, "{o:#?}");
+    assert!(!o.stderr.contains("no terminal to ask"), "{o:#?}");
+    assert!(o.stdout.contains("visual effects: kept, as this install had them"), "{o:#?}");
+    assert_eq!(o.cargo.trim(), format!("{} build --release", s.home_repo().display()));
+    assert_eq!(s.install_conf().as_deref(), Some("EFFECTS=yes\n"));
+}
+
+/// --effects and --no-effects change the kept choice, with or without a
+/// terminal, and other lines of the file are left as they were.
+#[test]
+fn effects_and_no_effects_change_the_choice() {
+    let s = Setup::new("effects-flags");
+    let o = s.run_with(&["--no-effects"], &[YES], None);
+    assert_eq!(o.status, 0, "{o:#?}");
+    assert!(o.stdout.contains("visual effects: left out (--no-effects)"), "{o:#?}");
+    let repo = s.home_repo();
+    assert_eq!(o.cargo.trim(), format!("{} build --release --no-default-features", repo.display()));
+    assert_eq!(s.install_conf().as_deref(), Some("EFFECTS=no\n"));
+
+    s.roblox_build();
+    let conf = s.root.join("home/.config/intoxicated/install.conf");
+    fs::write(&conf, "# kept\nEFFECTS=no\n").unwrap();
+    let o = s.run_with(&["--effects"], &[("FAKE_HANDLER", "intoxicated.desktop")], None);
+    assert_eq!(o.status, 0, "{o:#?}");
+    assert!(o.stdout.contains("visual effects: built in (--effects)"), "{o:#?}");
+    assert_eq!(o.cargo.trim(), format!("{} build --release", repo.display()));
+    assert_eq!(s.install_conf().as_deref(), Some("# kept\nEFFECTS=yes\n"));
+
+    // Kept from then on.
+    let o = s.run(&[("FAKE_HANDLER", "intoxicated.desktop")]);
+    assert_eq!(o.cargo.trim(), format!("{} build --release", repo.display()));
+
+    let o = s.run_with(&["--no-effects"], &[("FAKE_HANDLER", "intoxicated.desktop")], None);
+    assert_eq!(o.status, 0, "{o:#?}");
+    assert_eq!(o.cargo.trim(), format!("{} build --release --no-default-features", repo.display()));
+    assert_eq!(s.install_conf().as_deref(), Some("# kept\nEFFECTS=no\n"));
+
+    // Anything else is refused before anything runs.
+    let o = s.run_with(&["--effect"], &[YES], None);
+    assert_eq!(o.status, 1, "{o:#?}");
+    assert!(o.stderr.contains("unknown argument: --effect"), "{o:#?}");
+    assert!(o.stderr.contains("usage: install.sh [--effects | --no-effects]"), "{o:#?}");
+    assert!(o.cargo.is_empty() && o.batches.is_empty(), "{o:#?}");
+    let o = s.run_with(&["--help"], &[], None);
+    assert_eq!(o.status, 0, "{o:#?}");
+    assert!(o.stdout.contains("--no-effects  build without them"), "{o:#?}");
+}
+
+#[test]
+fn the_launchers_update_hands_its_arguments_to_the_installer() {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("installer/launcher-update-effects");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("home")).unwrap();
+    fs::write(root.join("install.sh"), "printf '%s\\n' \"$*\" > \"$INTOXICATED_REPO/ran\"\n").unwrap();
+    let launcher = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packaging/freebsd/intoxicated");
+    for flag in ["--effects", "--no-effects"] {
+        let out = Command::new("/bin/sh")
+            .arg(&launcher)
+            .args(["--update", flag])
+            .env_clear()
+            .env("PATH", "/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin")
+            .env("HOME", root.join("home"))
+            .env("INTOXICATED_REPO", &root)
+            .output()
+            .expect("/bin/sh runs");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(fs::read_to_string(root.join("ran")).unwrap(), format!("{flag}\n"));
+    }
 }

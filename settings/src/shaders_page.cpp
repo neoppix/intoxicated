@@ -148,7 +148,28 @@ ShadersPage::ShadersPage(AppState *state) : m_state(state) {
                                                "settings.conf for every profile. Changes apply the next time "
                                                "Intoxicated starts."));
     QString error;
-    const auto tables = readShaderTables(&error, &m_modes);
+    const auto tables = readShaderTables(&error, &m_modes, &m_unavailable);
+    if (m_unavailable) {
+        // A client built without them (install.sh --no-effects): nothing to
+        // set, so the page only says how to add them.
+        Section s = section(QStringLiteral("Not installed"));
+        auto *v = new QVBoxLayout(s.body);
+        v->setContentsMargins(14, 10, 14, 10);
+        v->setSpacing(6);
+        v->addWidget(note(QStringLiteral("This Intoxicated was installed without the visual effects (reflections, "
+                                         "depth of field, bloom, lens and sharpening). To add them, run %1 in a "
+                                         "terminal, or the installer with --effects. They stay off until you turn "
+                                         "them on here; --no-effects takes them out again.")
+                              .arg(kAddEffectsCommand)));
+        auto *command = new QLabel(kAddEffectsCommand);
+        command->setObjectName(QStringLiteral("rowTitle"));
+        command->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        v->addWidget(command);
+        b->addWidget(s.box);
+        b->addStretch(1);
+        m_tableError = nullptr;
+        return;
+    }
     m_tableError = problemLabel();
     setProblem(m_tableError, tables ? QString()
                                     : QStringLiteral("The effects could not be read, so only their switches are "
@@ -421,6 +442,8 @@ void ShadersPage::showSliders(const KnobRow &row, const SsrValue &value) {
 }
 
 void ShadersPage::reload() {
+    if (m_unavailable)
+        return;
     m_filling = true;
     SettingsConf conf;
     QString error;

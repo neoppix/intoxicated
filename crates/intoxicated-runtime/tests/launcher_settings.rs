@@ -263,9 +263,16 @@ fn default_flags_ssr_looks_and_version_come_from_the_client() {
     assert!(r.args.is_none(), "the client was not started");
     assert_eq!(r.stdout, intoxicated_runtime::android::ssr::shader_looks_json() + "\n");
     let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("JSON");
-    let effects = doc["effects"].as_array().expect("a list of effects");
-    let switches: Vec<&str> = effects.iter().map(|e| e["switch"].as_str().unwrap()).collect();
-    assert_eq!(switches, ["INTOXICATED_SSR", "INTOXICATED_DOF", "INTOXICATED_BLOOM", "INTOXICATED_LENS", "INTOXICATED_SHARPEN"]);
+    if cfg!(feature = "shaders") {
+        assert_eq!(doc["available"], true);
+        let effects = doc["effects"].as_array().expect("a list of effects");
+        let switches: Vec<&str> = effects.iter().map(|e| e["switch"].as_str().unwrap()).collect();
+        assert_eq!(switches, ["INTOXICATED_SSR", "INTOXICATED_DOF", "INTOXICATED_BLOOM", "INTOXICATED_LENS", "INTOXICATED_SHARPEN"]);
+    } else {
+        // Built without the visual effects: the launcher hands on the
+        // client's own word for it.
+        assert_eq!(doc["available"], false);
+    }
     s.settings("INTOXICATED_DOF=1\nINTOXICATED_DOF_STRENGTH=20\nINTOXICATED_BLOOM_LOOK=neon\n");
     let r = s.run(&["--shader-looks"], &[]);
     assert_eq!(r.stdout, intoxicated_runtime::android::ssr::shader_looks_json() + "\n");

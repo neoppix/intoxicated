@@ -12,12 +12,16 @@
 #   intoxicated --update-apk         # re-download the Roblox build, then exit
 #   intoxicated --update             # update Intoxicated: install.sh from the
 #                                    # checkout pulls, builds and reinstalls
+#   intoxicated --update --effects   # the same, building the visual effects
+#                                    # in from now on (--no-effects: without)
 #   intoxicated --default-flags      # print the client's built-in flags as JSON
 #   intoxicated --ssr-looks          # print the reflections' knobs and looks
 #                                    # as JSON
 #   intoxicated --shader-looks       # the same for every effect drawn before
 #                                    # the HUD (reflections, depth of field,
-#                                    # bloom, lens, sharpen) and the modes
+#                                    # bloom, lens, sharpen) and the modes;
+#                                    # {"available": false} from a client
+#                                    # built without the visual effects
 #   intoxicated --version            # print the client's version line
 #
 # INTOXICATED_PROFILE=<name> picks the profile (default: default).
@@ -184,7 +188,8 @@ need_bin() {
 
 case "${1:-}" in
   --update-apk) fetch_apk; exit $? ;;
-  --update) INTOXICATED_REPO="$REPO" exec /bin/sh "$REPO/install.sh" ;;
+  # What follows goes to install.sh: --effects or --no-effects.
+  --update) shift; INTOXICATED_REPO="$REPO" exec /bin/sh "$REPO/install.sh" "$@" ;;
   # The flags the client sets itself, so Intoxicated Settings can show them
   # without keeping a copy.
   --default-flags) need_bin; "$BIN" --print-default-flags; exit $? ;;

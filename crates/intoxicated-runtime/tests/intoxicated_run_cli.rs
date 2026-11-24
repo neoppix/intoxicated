@@ -172,6 +172,25 @@ fn print_default_flags_prints_the_built_in_layer_and_nothing_else() {
     assert!(text(&help.stderr).contains("\n  --print-default-flags  "), "listed in --help");
 }
 
+/// Built without the visual effects, both tables say they are unavailable,
+/// and still nothing else runs.
+#[cfg(not(feature = "shaders"))]
+#[test]
+fn without_the_effects_the_looks_say_they_are_unavailable() {
+    let root = scratch("no-effects-looks");
+    for flag in ["--print-shader-looks", "--print-ssr-looks"] {
+        let out = run(&root, &[flag], &[("INTOXICATED_SSR", "1")]);
+        assert_eq!(out.status.code(), Some(0));
+        assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
+        let stdout = text(&out.stdout);
+        let doc: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON object");
+        assert_eq!(doc["available"], false, "{stdout}");
+        assert!(doc["how_to_add"].as_str().unwrap().contains("--effects"), "{stdout}");
+    }
+    assert!(!root.join("data/intoxicated").exists(), "no profile was touched");
+}
+
+#[cfg(feature = "shaders")]
 #[test]
 fn print_ssr_looks_prints_the_knobs_and_looks_and_nothing_else() {
     let root = scratch("ssr-looks");

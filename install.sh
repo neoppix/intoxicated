@@ -12,6 +12,14 @@
 # there; `intoxicated --update` does the same. README.md has the same steps
 # done by hand.
 #
+# It also asks whether to build in the visual effects (reflections, depth of
+# field, bloom, lens, sharpening), no by default. The answer is kept in
+# ~/.config/intoxicated/install.conf, so an update builds the same way
+# without asking again; either of these changes it:
+#
+#   --effects      build the visual effects in (they stay off until turned on)
+#   --no-effects   build without them
+#
 #   INTOXICATED_REPO   where the checkout goes (default ~/intoxicated)
 #   INTOXICATED_YES=1  answer yes to every question
 #   PREFIX             where the launcher goes (default /usr/local)
@@ -27,6 +35,8 @@ BRANCH=freebsd-port
 PREFIX="${PREFIX:-/usr/local}"
 REPO="${INTOXICATED_REPO:-$HOME/intoxicated}"
 APKDIR="${XDG_CACHE_HOME:-$HOME/.cache}/intoxicated/apk"
+# Choices kept between runs, one KEY=VALUE per line: EFFECTS=yes or no.
+INSTALL_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/intoxicated/install.conf"
 
 # Built, run, or loaded at run time by the client and the launcher.
 PACKAGES="git rust cmake pkgconf libepoll-shim libX11 libXi libXinerama libXrandr libxkbcommon vulkan-loader jq"
@@ -140,16 +150,65 @@ want_settings() {
   fi
 }
 
+# The visual effects (the runtime's `shaders` feature): yes when they are
+# built in. --effects or --no-effects decides; otherwise the choice kept in
+# INSTALL_CONF; otherwise an install from before there was a choice, whose
+# client had them, keeps them; otherwise ask, no by default.
+EFFECTS=""
+EFFECTS_FLAG=""
+
+remembered_effects() {
+  [ -f "$INSTALL_CONF" ] || return 0
+  sed -n 's/^EFFECTS=//p' "$INSTALL_CONF" | tail -n 1
+}
+
+want_effects() {
+  if [ -n "$EFFECTS_FLAG" ]; then
+    EFFECTS=$EFFECTS_FLAG
+    if [ "$EFFECTS" = yes ]; then
+      note "visual effects: built in (--effects)"
+    else
+      note "visual effects: left out (--no-effects)"
+    fi
+    return
+  fi
+  case $(remembered_effects) in
+    yes) EFFECTS=yes; note "visual effects: built in, as before (--no-effects leaves them out)"; return ;;
+    no) EFFECTS=no; note "visual effects: left out, as before (--effects adds them)"; return ;;
+  esac
+  if [ -e "$PREFIX/bin/intoxicated" ]; then
+    EFFECTS=yes
+    note "visual effects: kept, as this install had them (--no-effects leaves them out)"
+    return
+  fi
+  if ask "Install visual effects (reflections, depth of field, bloom, sharpening; optional, off until you turn them on)?" n; then
+    EFFECTS=yes
+  else
+    EFFECTS=no
+    note "visual effects left out; install.sh --effects (or intoxicated --update --effects) adds them later"
+  fi
+}
+
+# Keep the choice for the next run, once a build has it.
+remember_effects() {
+  dir=$(dirname "$INSTALL_CONF")
+  mkdir -p "$dir" || die "could not create $dir"
+  { [ -f "$INSTALL_CONF" ] && grep -v '^EFFECTS=' "$INSTALL_CONF"; printf 'EFFECTS=%s\n' "$EFFECTS"; } > "$INSTALL_CONF.new" &&
+    mv "$INSTALL_CONF.new" "$INSTALL_CONF" || die "could not write $INSTALL_CONF"
+}
+
 check_packages() {
   step "Checking packages"
   if ! pkg -N >/dev/null 2>&1; then
     note "pkg is not set up yet"
     queue "env ASSUME_ALWAYS_YES=yes pkg bootstrap"
     want_settings no
+    want_effects
     missing=" $PACKAGES $DESKTOP_PACKAGES"
     [ "$SETTINGS_APP" = yes ] && missing="$missing $SETTINGS_PACKAGE"
   else
     want_settings yes
+    want_effects
     missing=""
     for p in $PACKAGES $DESKTOP_PACKAGES; do
       installed "$p" || missing="$missing $p"
@@ -307,9 +366,17 @@ install_files() {
   [ "$launcher" = "$REPO/packaging/freebsd/intoxicated" ] || rm -f "$launcher"
 }
 
+# The effects are the runtime's one default feature, so without them every
+# default feature is turned off.
 build() {
-  step "Building (a first build takes a few minutes)"
-  (cd "$REPO" && cargo build --release) || die "the build failed; the output above says why"
+  if [ "$EFFECTS" = yes ]; then
+    step "Building, with the visual effects (a first build takes a few minutes)"
+    (cd "$REPO" && cargo build --release) || die "the build failed; the output above says why"
+  else
+    step "Building, without the visual effects (a first build takes a few minutes)"
+    (cd "$REPO" && cargo build --release --no-default-features) || die "the build failed; the output above says why"
+  fi
+  remember_effects
 }
 
 link_handler() {
@@ -336,7 +403,22 @@ check_session() {
   [ -n "${DISPLAY:-}" ] || note "start Intoxicated from an X11 session (DISPLAY is not set here)"
 }
 
+usage() {
+  printf 'usage: install.sh [--effects | --no-effects]\n'
+  printf '  --effects     build the visual effects in (off until turned on)\n'
+  printf '  --no-effects  build without them\n'
+  printf 'Without either, the last choice is kept; a first install asks.\n'
+}
+
 main() {
+  for arg in "$@"; do
+    case $arg in
+      --effects) EFFECTS_FLAG=yes ;;
+      --no-effects) EFFECTS_FLAG=no ;;
+      -h|--help) usage; exit 0 ;;
+      *) usage >&2; die "unknown argument: $arg" ;;
+    esac
+  done
   check_system
   check_packages
   check_gpu
@@ -351,6 +433,11 @@ main() {
   note "Start it with: intoxicated"
   note "or straight into a game: intoxicated <placeId>, or a roblox.com game link"
   [ "$SETTINGS_BUILT" = yes ] && note "Flags, client options and profiles: intoxicated-settings"
+  if [ "$EFFECTS" = yes ]; then
+    note "Visual effects are built in, off until turned on (the Shaders page, or README.md)"
+  else
+    note "Built without visual effects; intoxicated --update --effects adds them"
+  fi
   note "Update later with: intoxicated --update"
 }
 

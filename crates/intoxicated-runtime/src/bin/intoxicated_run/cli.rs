@@ -306,7 +306,9 @@ usage: intoxicated-run --lib-dir <dir> [options]
   --print-shader-looks  the same for every effect drawn before the HUD
                     (reflections, depth of field, bloom, lens, sharpen), as
                     one JSON object with a list of effects, and exit 0. Runs
-                    nothing else; the launcher's --shader-looks runs it
+                    nothing else; the launcher's --shader-looks runs it. A
+                    client built without the visual effects prints
+                    a JSON object whose available is false for both instead
   --run <secs>      how long to let Roblox run after handover (default 15).
                     0 means no timer: run until the window is closed or the
                     process is sent SIGTERM/SIGINT. Closing the window ends the
@@ -444,7 +446,12 @@ env:
                                      effect's own switch or LOOK variable
                                      wins over it, its knobs change it as
                                      always. devctl's shaders mode <name>
-                                     does the same live
+                                     does the same live. A client built
+                                     without the visual effects (install.sh
+                                     --no-effects) ignores this and every
+                                     effect's variables below, says so once,
+                                     and answers their devctl verbs with
+                                     err not built
   INTOXICATED_SSR=1                  screen-space reflections (experimental):
                                      wet-ground style reflections drawn into
                                      the 3D scene before the HUD, by compute

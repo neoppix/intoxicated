@@ -70,10 +70,28 @@ module), lists the commands that need root and asks before running them, with
 the password going to sudo, doas or su. Then it clones the checkout to
 `~/intoxicated` (`INTOXICATED_REPO` picks another place), builds it, installs
 the launcher and the desktop entry, offers
-[Intoxicated Settings](#intoxicated-settings) and to open roblox.com's Play
-button in Intoxicated, and fetches the Roblox build. Running it again, or
+[Intoxicated Settings](#intoxicated-settings), the
+[visual effects](#visual-effects) and to open roblox.com's Play button in
+Intoxicated, and fetches the Roblox build. Running it again, or
 `intoxicated --update`, updates an install. It does what the steps below do,
 which stay here for anyone who would rather do them by hand.
+
+The visual effects (screen-space reflections, depth of field, bloom, lens and
+sharpening) are optional and asked about after Intoxicated Settings, no by
+default; even when installed they stay off until you turn them on. The answer
+is kept in `~/.config/intoxicated/install.conf`, so `intoxicated --update`
+builds the same way and does not ask again. To change it later:
+
+```sh
+intoxicated --update --effects      # add them (or: sh install.sh --effects)
+intoxicated --update --no-effects   # take them out again
+```
+
+Without them the client is built with `cargo build --release
+--no-default-features`: none of their code or shaders is in it, their
+`INTOXICATED_*` variables are ignored (the log says so once), their devctl
+verbs answer `err not built`, and the Shaders page of Intoxicated Settings
+says how to add them. An install from before this choice keeps its effects.
 
 **1. Prerequisites** (as root):
 
@@ -100,6 +118,7 @@ git clone --recursive https://github.com/neoppix/intoxicated ~/intoxicated
 cd ~/intoxicated
 cargo build -p intoxicated-runtime --release
 # produces target/release/intoxicated-run, a native FreeBSD binary
+# (add --no-default-features to leave the visual effects out)
 ```
 
 **3. Install the launcher** (as root):
@@ -120,9 +139,12 @@ intoxicated '<link>'     # a roblox:// link, roblox.com's Play link, or a
                          # https://www.roblox.com/games/<id> page link
 intoxicated --update-apk # fetch the newest Roblox build, then exit
 intoxicated --update     # update Intoxicated itself (pull, build, reinstall)
+intoxicated --update --effects     # the same, adding the visual effects
+intoxicated --update --no-effects  # the same, taking them out
 intoxicated --default-flags  # print the flags the client sets itself (JSON)
 intoxicated --ssr-looks  # print the reflections' settings and looks (JSON)
 intoxicated --shader-looks  # the same for every effect, and the modes
+                            # ({"available": false} when built without them)
 intoxicated --version    # print the client's version line
 INTOXICATED_PROFILE=alt intoxicated   # run another profile (see below)
 ```
@@ -134,7 +156,8 @@ in step 3:
 ```sh
 cd ~/intoxicated
 git pull --recurse-submodules
-cargo build --release    # the client and the APK fetcher
+cargo build --release    # the client and the APK fetcher; add
+                         # --no-default-features for no visual effects
 ```
 
 The git history was restarted on 2026-11-23, so a clone made before then
@@ -239,8 +262,12 @@ switched on one by one, or all at once with a mode:
 | Sharpen | `INTOXICATED_SHARPEN=1` | contrast adaptive sharpening |
 | Modes | `INTOXICATED_SHADERS_MODE=competitive` or `cinematic` | every effect at once, from a playable or a clip look |
 
-The settings app's Shaders page sets all of this. Each effect is described in
-detail below.
+The settings app's Shaders page sets all of this. The effects are optional:
+the installer asks whether to build them in (no by default), and a client
+built without them ignores every variable here and says so once in its log.
+`intoxicated --update --effects` adds them later and
+`intoxicated --update --no-effects` takes them out again (see
+[Get it running](#get-it-running)). Each effect is described in detail below.
 
 Screen-space reflections are an experimental extra, off by default:
 `INTOXICATED_SSR=1` (in the environment or in `settings.conf`) makes surfaces
@@ -399,7 +426,9 @@ bloom; Subtle, Prism and Film for the lens; Light, Crisp and Crunchy for the
 sharpen) and a fine-tune row for each of their settings (the depth of
 field's focus as Fixed distance, Character or Past the character); picking a
 look clears that effect's fine tuning, after asking, and each row has its
-own reset. Like the client options they apply from the next launch. Macros:
+own reset. Like the client options they apply from the next launch. With a
+client built without the visual effects the Shaders page only says how to
+add them (`intoxicated --update --effects`). Macros:
 the profile's in-game macros, a list on the left and the selected one's trigger
 key, Ctrl/Shift/Alt, and steps on the right, with a master switch for the lot;
 see [Macros](#macros) below. Profiles: create, delete and pick the default one. And Play, a place id or

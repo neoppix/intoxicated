@@ -177,7 +177,8 @@ private:
 // whole-page modes (Off, Competitive, Cinematic, and Custom when the effects
 // were changed by hand), then one group per effect with its switch, its
 // looks and a fine-tune row per knob. Each control writes settings.conf as it
-// changes.
+// changes. A client built without the visual effects gets a short page
+// saying how to add them instead.
 class ShadersPage : public QWidget {
     Q_OBJECT
 public:
@@ -238,6 +239,9 @@ private:
     QLabel *m_modeDesc = nullptr;
     QLabel *m_tableError;
     bool m_filling = false;
+    // The client was built without the effects: the page only says how to
+    // add them.
+    bool m_unavailable = false;
 };
 
 class ProfilesPage : public QWidget {

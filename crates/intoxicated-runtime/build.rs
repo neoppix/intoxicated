@@ -48,13 +48,19 @@ const SHADERS: [(&str, &str, &[&str]); 18] = [
 
 /// Each shader compiled by glslc when it is installed, so an edited source is
 /// what runs; the committed SPIR-V otherwise, so a build without glslc
-/// works. A source glslc rejects stops the build.
+/// works. A source glslc rejects stops the build. The visual effects' own
+/// (under `ssr/`) only with the `shaders` feature: without it nothing
+/// includes them.
 fn compile_shaders() {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"));
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"));
     let android = manifest.join("src/android");
     let have_glslc = std::path::Path::new(GLSLC).is_file();
+    let effects = std::env::var_os("CARGO_FEATURE_SHADERS").is_some();
     for (source, stem, defines) in SHADERS {
+        if source.starts_with("ssr/") && !effects {
+            continue;
+        }
         let src = android.join(source);
         let committed = android.join(format!("{stem}.spv.rs"));
         println!("cargo:rerun-if-changed={}", src.display());

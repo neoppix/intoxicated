@@ -1015,10 +1015,27 @@ bool parseShaderTables(const QByteArray &json, QList<SsrTable> *out, QString *er
     return true;
 }
 
-std::optional<QList<SsrTable>> readShaderTables(QString *error, QList<ShaderMode> *modes) {
+bool effectsUnavailable(const QByteArray &json) {
+    const QJsonDocument doc = QJsonDocument::fromJson(json);
+    if (!doc.isObject())
+        return false;
+    const QJsonValue available = doc.object().value(QStringLiteral("available"));
+    return available.isBool() && !available.toBool();
+}
+
+std::optional<QList<SsrTable>> readShaderTables(QString *error, QList<ShaderMode> *modes, bool *unavailable) {
+    if (unavailable)
+        *unavailable = false;
     const auto out = runLauncher({QStringLiteral("--shader-looks")}, 10000, error);
     if (!out)
         return std::nullopt;
+    if (effectsUnavailable(*out)) {
+        if (unavailable)
+            *unavailable = true;
+        *error = QStringLiteral("this Intoxicated was built without visual effects; %1 adds them")
+                     .arg(kAddEffectsCommand);
+        return std::nullopt;
+    }
     QList<SsrTable> tables;
     QList<ShaderMode> parsedModes;
     QString parseError;

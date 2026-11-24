@@ -1028,9 +1028,32 @@ void testShaderLauncher(const QString &scratch) {
     if (tables)
         same(tables->size(), 3, "all of them");
     same(modes.size(), 3, "and the modes");
+    bool unavailable = true;
+    check(readShaderTables(&error, nullptr, &unavailable).has_value() && !unavailable,
+          "a client with the effects has them available");
     writeAll(launcher, "#!/bin/sh\necho '{\"effects\": 1}'\n");
-    check(!readShaderTables(&error), "something else is refused");
+    check(!readShaderTables(&error, nullptr, &unavailable), "something else is refused");
     check(error.startsWith("intoxicated --shader-looks printed something else"), "and said: " + error);
+    check(!unavailable, "which is not the effects being left out");
+
+    // A client built without the visual effects, as the runtime prints it.
+    const QByteArray without = "{\n  \"available\": false,\n  \"reason\": \"built without visual effects\",\n"
+                               "  \"how_to_add\": \"run install.sh with --effects (intoxicated --update --effects)\"\n}\n";
+    check(effectsUnavailable(without), "available false is the effects left out");
+    check(!effectsUnavailable(kShaderLooks), "a table is not");
+    check(!effectsUnavailable("{\"available\": \"no\"}"), "only a false counts");
+    check(!effectsUnavailable("not json"), "nor anything that is not JSON");
+    writeAll(scratch + "/without.json", without);
+    writeAll(launcher, "#!/bin/sh\n[ \"$1\" = --shader-looks ] && [ $# -eq 1 ] && exec cat '" + QFile::encodeName(scratch) +
+                           "/without.json'\nexit 7\n");
+    QList<ShaderMode> noModes;
+    check(!readShaderTables(&error, &noModes, &unavailable), "no tables from a client without the effects");
+    check(unavailable, "and it says they are unavailable");
+    check(noModes.isEmpty(), "and no modes");
+    check(error.contains(kAddEffectsCommand), "with how to add them: " + error);
+    // Without asking for it, still refused, with the same word.
+    check(!readShaderTables(&error), "refused without the flag too");
+    check(error.contains("built without visual effects"), "and said: " + error);
     qputenv("PATH", savedPath);
 }
 

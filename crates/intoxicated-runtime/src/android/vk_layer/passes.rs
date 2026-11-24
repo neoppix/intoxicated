@@ -19,7 +19,10 @@
 //! [`WATCH`] and the forward, until something is watching: a trace for one
 //! frame, a depth capture until it is taken, or the effects recorded before
 //! the swapchain pass (reflections, depth of field, bloom, lens and sharpen,
-//! all in `android::ssr`) while any of them is on.
+//! all in `android::ssr`) while any of them is on. A client built without
+//! the `shaders` feature never watches for the effects and does not hook
+//! the command buffer begin or the compute binds at all
+//! (`passes::compute_state` is not built).
 //!
 //! # The trace
 //!
@@ -687,15 +690,18 @@ slots!(
     PIPELINE_BARRIER2,
     QUEUE_SUBMIT,
     QUEUE_SUBMIT2,
-    BEGIN_COMMAND_BUFFER,
-    BIND_PIPELINE,
-    BIND_DESCRIPTOR_SETS,
-    PUSH_CONSTANTS,
-    PUSH_DESCRIPTOR_SET,
-    PUSH_DESCRIPTOR_SET_WITH_TEMPLATE,
-    BIND_DESCRIPTOR_BUFFERS,
-    BIND_SHADERS,
 );
+
+// The command buffer begin and the compute binds, which only the effects
+// drawn before the HUD follow; not built without them.
+#[cfg(feature = "shaders")]
+mod compute_state;
+#[cfg(feature = "shaders")]
+use compute_state::ours as effects_ours;
+#[cfg(not(feature = "shaders"))]
+fn effects_ours(_: &[u8]) -> Option<(&'static AtomicUsize, *const ())> {
+    None
+}
 
 /// The function in `slot` as `F`, an `extern "C" fn` type matching the
 /// specification's prototype for the name the slot was filled for.
@@ -751,17 +757,7 @@ fn ours(name: &[u8]) -> Option<(&'static AtomicUsize, *const ())> {
         b"vkCmdPipelineBarrier2" | b"vkCmdPipelineBarrier2KHR" => (&PIPELINE_BARRIER2, cmd_pipeline_barrier2 as *const ()),
         b"vkQueueSubmit" => (&QUEUE_SUBMIT, queue_submit as *const ()),
         b"vkQueueSubmit2" | b"vkQueueSubmit2KHR" => (&QUEUE_SUBMIT2, queue_submit2 as *const ()),
-        b"vkBeginCommandBuffer" => (&BEGIN_COMMAND_BUFFER, begin_command_buffer as *const ()),
-        b"vkCmdBindPipeline" => (&BIND_PIPELINE, cmd_bind_pipeline as *const ()),
-        b"vkCmdBindDescriptorSets" => (&BIND_DESCRIPTOR_SETS, cmd_bind_descriptor_sets as *const ()),
-        b"vkCmdPushConstants" => (&PUSH_CONSTANTS, cmd_push_constants as *const ()),
-        b"vkCmdPushDescriptorSetKHR" | b"vkCmdPushDescriptorSet" => (&PUSH_DESCRIPTOR_SET, cmd_push_descriptor_set as *const ()),
-        b"vkCmdPushDescriptorSetWithTemplateKHR" | b"vkCmdPushDescriptorSetWithTemplate" => {
-            (&PUSH_DESCRIPTOR_SET_WITH_TEMPLATE, cmd_push_descriptor_set_with_template as *const ())
-        }
-        b"vkCmdBindDescriptorBuffersEXT" => (&BIND_DESCRIPTOR_BUFFERS, cmd_bind_descriptor_buffers as *const ()),
-        b"vkCmdBindShadersEXT" => (&BIND_SHADERS, cmd_bind_shaders as *const ()),
-        _ => return None,
+        _ => return effects_ours(name),
     })
 }
 
@@ -1342,122 +1338,6 @@ extern "C" fn queue_submit2(queue: *mut c_void, count: u32, submits: *const c_vo
     submit(&QUEUE_SUBMIT2, (64, 32, 40, 32, 16), queue, count, submits, fence)
 }
 
-// ------------------------------------------------------------ for the effects drawn before the HUD
-//
-// The start of a recording, and the engine's compute state, which our
-// dispatch disturbs and puts back (see `android::ssr`). Graphics binds are
-// forwarded after one comparison.
-
-fn ssr_watching() -> bool {
-    WATCH.load(Relaxed) & WATCH_POST != 0
-}
-
-extern "C" fn begin_command_buffer(cmd: *mut c_void, info: *const c_void) -> i32 {
-    let Some(f) = next::<extern "C" fn(*mut c_void, *const c_void) -> i32>(&BEGIN_COMMAND_BUFFER) else {
-        return VK_ERROR_INITIALIZATION_FAILED;
-    };
-    let rc = f(cmd, info);
-    if rc == VK_SUCCESS && ssr_watching() {
-        crate::android::ssr::cmd_begun(cmd);
-    }
-    rc
-}
-
-extern "C" fn cmd_bind_pipeline(cmd: *mut c_void, bind_point: u32, pipeline: u64) {
-    if bind_point == crate::android::ssr::BIND_POINT_COMPUTE && ssr_watching() {
-        crate::android::ssr::compute(cmd, |c| c.bind_pipeline(pipeline));
-    }
-    if let Some(f) = next::<extern "C" fn(*mut c_void, u32, u64)>(&BIND_PIPELINE) {
-        f(cmd, bind_point, pipeline);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-extern "C" fn cmd_bind_descriptor_sets(
-    cmd: *mut c_void,
-    bind_point: u32,
-    layout: u64,
-    first: u32,
-    count: u32,
-    sets: *const u64,
-    dynamic_count: u32,
-    dynamic: *const u32,
-) {
-    if bind_point == crate::android::ssr::BIND_POINT_COMPUTE && ssr_watching() {
-        // SAFETY: the engine's arrays of `count` sets and `dynamic_count`
-        // offsets, read during its own call.
-        let (sets_v, dynamic_v) = unsafe {
-            (
-                if sets.is_null() { Vec::new() } else { std::slice::from_raw_parts(sets, count as usize).to_vec() },
-                if dynamic.is_null() { Vec::new() } else { std::slice::from_raw_parts(dynamic, dynamic_count as usize).to_vec() },
-            )
-        };
-        crate::android::ssr::compute(cmd, |c| {
-            c.bind_sets(crate::android::ssr::SetBind { layout, first, sets: sets_v, dynamic: dynamic_v })
-        });
-    }
-    type Fn_ = extern "C" fn(*mut c_void, u32, u64, u32, u32, *const u64, u32, *const u32);
-    if let Some(f) = next::<Fn_>(&BIND_DESCRIPTOR_SETS) {
-        f(cmd, bind_point, layout, first, count, sets, dynamic_count, dynamic);
-    }
-}
-
-extern "C" fn cmd_push_constants(cmd: *mut c_void, layout: u64, stages: u32, offset: u32, size: u32, values: *const c_void) {
-    if stages & crate::android::ssr::SHADER_STAGE_COMPUTE != 0 && !values.is_null() && ssr_watching() {
-        // SAFETY: the engine's `size` bytes, read during its own call.
-        let bytes = unsafe { std::slice::from_raw_parts(values as *const u8, size as usize) }.to_vec();
-        crate::android::ssr::compute(cmd, |c| c.push(crate::android::ssr::Push { layout, stages, offset, bytes }));
-    }
-    if let Some(f) = next::<extern "C" fn(*mut c_void, u64, u32, u32, u32, *const c_void)>(&PUSH_CONSTANTS) {
-        f(cmd, layout, stages, offset, size, values);
-    }
-}
-
-/// Compute state the reflections cannot put back: the command buffer is
-/// left alone from then on.
-fn unrestorable(cmd: *mut c_void, why: &'static str) {
-    if ssr_watching() {
-        crate::android::ssr::compute(cmd, |c| c.unrestorable = Some(why));
-    }
-}
-
-extern "C" fn cmd_push_descriptor_set(cmd: *mut c_void, bind_point: u32, layout: u64, set: u32, count: u32, writes: *const c_void) {
-    if bind_point == crate::android::ssr::BIND_POINT_COMPUTE {
-        unrestorable(cmd, "the engine pushed descriptors for compute");
-    }
-    if let Some(f) = next::<extern "C" fn(*mut c_void, u32, u64, u32, u32, *const c_void)>(&PUSH_DESCRIPTOR_SET) {
-        f(cmd, bind_point, layout, set, count, writes);
-    }
-}
-
-extern "C" fn cmd_push_descriptor_set_with_template(cmd: *mut c_void, template: u64, layout: u64, set: u32, data: *const c_void) {
-    // The bind point is inside the template, which is not followed.
-    unrestorable(cmd, "the engine pushed descriptors with a template");
-    if let Some(f) = next::<extern "C" fn(*mut c_void, u64, u64, u32, *const c_void)>(&PUSH_DESCRIPTOR_SET_WITH_TEMPLATE) {
-        f(cmd, template, layout, set, data);
-    }
-}
-
-extern "C" fn cmd_bind_descriptor_buffers(cmd: *mut c_void, count: u32, infos: *const c_void) {
-    unrestorable(cmd, "the engine uses descriptor buffers");
-    if let Some(f) = next::<extern "C" fn(*mut c_void, u32, *const c_void)>(&BIND_DESCRIPTOR_BUFFERS) {
-        f(cmd, count, infos);
-    }
-}
-
-extern "C" fn cmd_bind_shaders(cmd: *mut c_void, count: u32, stages: *const u32, shaders: *const u64) {
-    if !stages.is_null() && ssr_watching() {
-        // SAFETY: the engine's array of `count` stages.
-        let list = unsafe { std::slice::from_raw_parts(stages, count as usize) };
-        if list.iter().any(|&s| s & crate::android::ssr::SHADER_STAGE_COMPUTE != 0) {
-            unrestorable(cmd, "the engine binds compute shader objects");
-        }
-    }
-    if let Some(f) = next::<extern "C" fn(*mut c_void, u32, *const u32, *const u64)>(&BIND_SHADERS) {
-        f(cmd, count, stages, shaders);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1561,7 +1441,11 @@ mod tests {
         let p = 0x1234 as *mut c_void;
         assert_eq!(hook(b"vkCmdSetViewport", p), p);
         assert!(ours(b"vkCmdSetViewport").is_none() && ours(b"vkCmdBindVertexBuffers").is_none());
-        assert!(ours(b"vkCmdBindPipeline").is_some() && ours(b"vkBeginCommandBuffer").is_some(), "for the reflections");
+        // For the effects, and only in a client built with them.
+        let effects = cfg!(feature = "shaders");
+        assert_eq!(ours(b"vkCmdBindPipeline").is_some(), effects);
+        assert_eq!(ours(b"vkBeginCommandBuffer").is_some(), effects);
+        assert_eq!(ours(b"vkCmdPushConstants").is_some(), effects);
         assert!(hook(b"vkCmdDraw", std::ptr::null_mut()).is_null());
         assert!(ours(b"vkCmdDraw").is_some() && ours(b"vkCmdBeginRenderPass2KHR").is_some());
         assert!(ours(b"vkCreateImage").is_none(), "images are vulkan_etc's single hook");

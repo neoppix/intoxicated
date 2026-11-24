@@ -144,6 +144,10 @@ use super::vk_layer::registry::{self, Registry, UNUSED};
 
 // ------------------------------------------------------------- switches
 
+/// Whether the effects are built in (the `shaders` feature): here they are.
+/// `android::no_effects` stands in without them.
+pub const AVAILABLE: bool = true;
+
 /// The switch: `1` draws reflections from the start.
 pub const ENV: &str = "INTOXICATED_SSR";
 
@@ -747,8 +751,10 @@ pub fn looks_json() -> String {
 }
 
 /// What `intoxicated-run --print-shader-looks` prints, for Intoxicated
-/// Settings' Shaders page: `{"effects": [...], "mode_env": ..., "modes":
-/// [...]}`, every effect in the order it is recorded, each as
+/// Settings' Shaders page: `{"available": true, "effects": [...],
+/// "mode_env": ..., "modes": [...]}` (a client built without the effects
+/// prints `{"available": false, ...}` instead), every effect in the order it
+/// is recorded, each as
 /// [`Effect::json`] writes it plus its devctl name, its title and a
 /// one-line summary, and every mode ([`MODES`]) with its title, a
 /// description and each effect's switch and look.
@@ -775,7 +781,7 @@ pub fn shader_looks_json() -> String {
             v
         })
         .collect();
-    serde_json::to_string_pretty(&serde_json::json!({ "effects": effects, "mode_env": MODE_ENV, "modes": modes }))
+    serde_json::to_string_pretty(&serde_json::json!({ "available": true, "effects": effects, "mode_env": MODE_ENV, "modes": modes }))
         .expect("a JSON value always serialises")
 }
 

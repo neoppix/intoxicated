@@ -25,6 +25,8 @@
 //!   same words for the depth of field, the bloom, the lens effects and the
 //!   sharpening; `shaders mode <name>` sets every effect's switch and look
 //!   from a mode (off, competitive, cinematic) and `shaders` reports them.
+//!   A client built without the `shaders` feature answers all six with
+//!   `err not built: ...`.
 //! - `bussub`, `buslast` and `deeplink` reach the engine's message bus through
 //!   `deeplink::dev_request`, which blocks this thread for at most 5 s.
 //!
