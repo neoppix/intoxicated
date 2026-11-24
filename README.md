@@ -42,6 +42,10 @@ the resulting `SIGILL`, routing each through `bionic_syscall`, so the anticheat
 stops seeing the thing it was killing the client for. That fix is what makes any
 of the rest matter.
 
+On top of that it can draw its own [visual effects](#visual-effects) under the
+HUD: reflections, depth of field, bloom, lens effects and sharpening, with a
+competitive and a cinematic mode, all optional.
+
 ## Get it running
 
 This is a **build-from-source hobby port** on FreeBSD, tested on FreeBSD
@@ -218,6 +222,25 @@ client no longer runs `nvidia-settings` to force NVIDIA's PowerMizer to maximum
 performance (the setting did not hold on FreeBSD's driver and cost about 0.1 s
 of every start), so `INTOXICATED_GPU_MAXPERF` is gone, and the early client
 settings are always sent, so `INTOXICATED_EARLY_SETTINGS` is no longer needed.
+
+## Visual effects
+
+Intoxicated can draw its own effects into the game's picture, before the HUD is
+drawn, so menus, chat and the leaderboard are never blurred, reflected or tinted
+(a ReShade-style overlay cannot do that). All of them are off by default and
+switched on one by one, or all at once with a mode:
+
+| Effect | Switch | What it does |
+|---|---|---|
+| Reflections | `INTOXICATED_SSR=1` | wet, glossy floors reflecting what is on screen |
+| Depth of field | `INTOXICATED_DOF=1` | a camera-lens blur of the far background, or of everything but your character for clips |
+| Bloom | `INTOXICATED_BLOOM=1` | a glow around bright lights and neon |
+| Lens | `INTOXICATED_LENS=1` | chromatic aberration, a vignette, a halo round bright areas |
+| Sharpen | `INTOXICATED_SHARPEN=1` | contrast adaptive sharpening |
+| Modes | `INTOXICATED_SHADERS_MODE=competitive` or `cinematic` | every effect at once, from a playable or a clip look |
+
+The settings app's Shaders page sets all of this. Each effect is described in
+detail below.
 
 Screen-space reflections are an experimental extra, off by default:
 `INTOXICATED_SSR=1` (in the environment or in `settings.conf`) makes surfaces
