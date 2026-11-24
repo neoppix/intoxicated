@@ -32,6 +32,7 @@ layout(local_size_x = 512) in;
 layout(local_size_x = 256) in;
 #endif
 
+// Per captured vertex: the clip-space position, then the colour.
 layout(std430, binding = 0) readonly buffer Xfb { vec4 xfb[]; };
 layout(std430, binding = 1) readonly buffer Counter { uint counter_bytes; };
 layout(std430, binding = 2) buffer Sorted { uvec2 sorted[]; };
@@ -58,6 +59,10 @@ layout(push_constant) uniform Params {
 
 vec3 to_view(vec4 c) {
     return vec3(c.x * pc.tan_half.x, -c.y * pc.tan_half.y, c.w) / c.z;
+}
+
+vec4 position(uint v) {
+    return xfb[2u * v];
 }
 
 bool usable(vec4 c) {
@@ -87,10 +92,10 @@ void main() {
     if (i >= pc.n) {
         return;
     }
-    uint total = min(counter_bytes / 48u, min(pc.cap, pc.n));
+    uint total = min(counter_bytes / 96u, min(pc.cap, pc.n));
     uint key = 0xffffffffu;
     if (i < total) {
-        vec4 a = xfb[3u * i], b = xfb[3u * i + 1u], c = xfb[3u * i + 2u];
+        vec4 a = position(3u * i), b = position(3u * i + 1u), c = position(3u * i + 2u);
         if (usable(a) && usable(b) && usable(c)) {
             vec3 A = to_view(a), B = to_view(b), C = to_view(c);
             vec3 n = cross(B - A, C - A);
@@ -255,7 +260,7 @@ void main() {
         return;
     }
     uint tri = sorted[leaf].y;
-    vec3 A = to_view(xfb[3u * tri]), B = to_view(xfb[3u * tri + 1u]), C = to_view(xfb[3u * tri + 2u]);
+    vec3 A = to_view(position(3u * tri)), B = to_view(position(3u * tri + 1u)), C = to_view(position(3u * tri + 2u));
     vec3 lo = min(A, min(B, C)), hi = max(A, max(B, C));
     int child = ~leaf;
     int p = parents[int(pc.n) + leaf];

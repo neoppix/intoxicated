@@ -526,11 +526,12 @@ env:
                                      engine draws them and the reflections'
                                      rays are traced against them, so they
                                      show what is off screen or hidden too.
-                                     Needs INTOXICATED_SSR=1 (their look
-                                     knobs apply). Off by default. devctl rt
-                                     on|off|stats
+                                     Turns the reflections on (their look
+                                     knobs apply) unless INTOXICATED_SSR
+                                     says otherwise. Off by default. devctl
+                                     rt on|off|stats
   INTOXICATED_RT_TRIANGLES=<n>       triangles captured per frame at most
-                                     (2097152)
+                                     (524288)
   INTOXICATED_RT_DUMP=<dir>          research: the engine's shader modules and
                                      pipelines to <dir>; devctl rt draws and
                                      rt dump <path> write a frame's draws and

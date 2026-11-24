@@ -714,8 +714,30 @@ pub(crate) fn requested_at_start() -> bool {
         for fx in EFFECTS {
             any |= fx.start_from(|name| std::env::var(name).ok());
         }
+        // The ray-traced reflections are recorded in place of the march of
+        // these, so they need these on: `INTOXICATED_RT=1` turns them on
+        // unless `INTOXICATED_SSR` says otherwise in so many words.
+        if super::rt::requested() && !SSR.is_on() && std::env::var(SSR.env).is_err() {
+            SSR.on.store(true, Relaxed);
+            println!("[android] vulkan: ssr: on ({}=1 traces the reflections): {}", super::rt::ENV, SSR.values_line());
+            any = true;
+        }
         any
     })
+}
+
+/// Whether the reflections are on, which the ray-traced ones need.
+pub(crate) fn reflections_on() -> bool {
+    SSR.is_on()
+}
+
+/// devctl `rt on`: the reflections on too, as `ssr on` would.
+pub(crate) fn reflections_on_for_rt() -> Result<(), String> {
+    if !passes::wanted() {
+        return Err(format!("the pass hooks are not handed out in this run (set {}=1 or dev control)", SSR.env));
+    }
+    set_on(&SSR, true);
+    Ok(())
 }
 
 /// Turn an effect on or off for the frames recorded from now on; the
@@ -3300,7 +3322,7 @@ mod tests {
                 .collect()
         };
         // The same list as build.rs's `SHADERS`.
-        let shaders: [(&str, &str, &[&str]); 20] = [
+        let shaders: [(&str, &str, &[&str]); 21] = [
             ("depth_capture/resolve.comp", "depth_capture/resolve_ms", &[]),
             ("depth_capture/resolve.comp", "depth_capture/resolve_1x", &["-DSINGLE_SAMPLE"]),
             ("ssr/depth.comp", "ssr/depth_ms", &[]),
@@ -3316,6 +3338,7 @@ mod tests {
             ("ssr/post.comp", "ssr/post_bloom_up", &["-DBLOOM_UP"]),
             ("ssr/post.comp", "ssr/post_bloom_compose", &["-DBLOOM_COMPOSE"]),
             ("ssr/ssr.comp", "ssr/rt_trace", &["-DRT"]),
+            ("ssr/ssr.comp", "ssr/rt_upsample", &["-DRT", "-DUPSAMPLE"]),
             ("rt/build.comp", "rt/build_prep", &["-DPREP"]),
             ("rt/build.comp", "rt/build_sort_local", &["-DSORT_LOCAL"]),
             ("rt/build.comp", "rt/build_sort_global", &["-DSORT_GLOBAL"]),

@@ -9,7 +9,9 @@
 //! shaders of ours (`build.comp`, and `ssr/ssr.comp` with `RT`): a linear
 //! BVH (Morton codes of the triangle centres, a bitonic sort, the hierarchy
 //! from the sorted codes and the boxes from the leaves up), rebuilt from
-//! nothing every frame, and a stack traversal of it per pixel.
+//! nothing every frame, and a stack traversal of it for one pixel of every
+//! 2 by 2 block, spread back over the pixels of the same surface by a
+//! depth-aware upsample.
 //!
 //! What it reflects is what the engine drew in the scene passes this frame,
 //! and nothing else: the triangles it rasterised with colour writes. What
@@ -17,9 +19,10 @@
 //! be hit.
 //!
 //! The work is recorded by `ssr::record` when the reflections are on and
-//! these are (`INTOXICATED_RT=1`, devctl `rt on|off`): after the depth copy,
-//! the build, then the trace into the reflections' trace image, which their
-//! compose blends in as it does the march's.
+//! these are (`INTOXICATED_RT=1`, which turns the reflections on as well,
+//! devctl `rt on|off`): after the depth copy, the build, then the trace into
+//! a buffer of ours and the upsample into the reflections' trace image,
+//! which their compose blends in as it does the march's.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -65,8 +68,9 @@ const SPIRV_SORT_LOCAL: &[u32] = include!(concat!(env!("OUT_DIR"), "/rt_build_so
 const SPIRV_SORT_GLOBAL: &[u32] = include!(concat!(env!("OUT_DIR"), "/rt_build_sort_global.spv.rs"));
 const SPIRV_BUILD: &[u32] = include!(concat!(env!("OUT_DIR"), "/rt_build_build.spv.rs"));
 const SPIRV_BOUNDS: &[u32] = include!(concat!(env!("OUT_DIR"), "/rt_build_bounds.spv.rs"));
-/// `ssr/ssr.comp` with `RT`.
+/// `ssr/ssr.comp` with `RT`, and with `RT` and `UPSAMPLE`.
 const SPIRV_TRACE: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_trace.spv.rs"));
+const SPIRV_UPSAMPLE: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_upsample.spv.rs"));
 
 const PREP: usize = 0;
 const SORT_LOCAL: usize = 1;
@@ -74,6 +78,20 @@ const SORT_GLOBAL: usize = 2;
 const BUILD: usize = 3;
 const BOUNDS: usize = 4;
 const TRACE: usize = 5;
+const UPSAMPLE: usize = 6;
+const PIPELINES: usize = 7;
+/// The bindings of our set: the capture, its counter, the sorted keys, the
+/// nodes, the parents, the flags, the globals and the traced blocks.
+const BINDINGS: u32 = 8;
+/// Bytes per traced 2 by 2 block.
+const BLOCK_BYTES: u64 = 16;
+/// The blocks buffer has room for at least this extent's.
+const ROOM_FOR: [u32; 2] = [3840, 2160];
+
+/// The 2 by 2 blocks of an extent.
+pub(crate) fn blocks_of(extent: [u32; 2]) -> u64 {
+    extent[0].div_ceil(2) as u64 * extent[1].div_ceil(2) as u64
+}
 
 /// Keys one local sort dispatch handles.
 const BLOCK: u32 = 1024;
@@ -206,8 +224,8 @@ struct Gpu {
     set_layout: u64,
     build_layout: u64,
     trace_layout: u64,
-    shaders: [u64; 6],
-    pipelines: [u64; 6],
+    shaders: [u64; PIPELINES],
+    pipelines: [u64; PIPELINES],
     pool: u64,
     set: u64,
     /// The capture buffers the set names.
@@ -217,6 +235,9 @@ struct Gpu {
     parents: Owned,
     flags: Owned,
     globals: Owned,
+    blocks: Owned,
+    /// Blocks `blocks` has room for.
+    block_room: u64,
     /// Keys the buffers have room for.
     keys: u32,
     query_pool: u64,
@@ -260,7 +281,7 @@ impl Gpu {
         if self.query_pool != 0 {
             (f.destroy_query_pool)(d, self.query_pool, none);
         }
-        for o in [self.sorted, self.nodes, self.parents, self.flags, self.globals] {
+        for o in [self.sorted, self.nodes, self.parents, self.flags, self.globals, self.blocks] {
             if o.buffer != 0 {
                 (self.buffers.destroy_buffer)(d, o.buffer, none);
             }
@@ -318,9 +339,9 @@ fn shader(f: &Fns, d: Dev, code: &[u32]) -> Result<u64, String> {
     Ok(m)
 }
 
-fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool) -> Result<Gpu, String> {
+fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool, extent: [u32; 2]) -> Result<Gpu, String> {
     let d = device as Dev;
-    let (xfb, counter, capacity) = capture::frame_captured(device).ok_or("the scene was not captured")?;
+    let (xfb, counter, capacity, _) = capture::frame_captured(device).ok_or("the scene was not captured")?;
     let keys = sort_size(capacity / capture::TRIANGLE_BYTES, capacity / capture::TRIANGLE_BYTES);
     let mut g = Gpu {
         device,
@@ -329,8 +350,8 @@ fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool) -> Result<Gpu, Stri
         set_layout: 0,
         build_layout: 0,
         trace_layout: 0,
-        shaders: [0; 6],
-        pipelines: [0; 6],
+        shaders: [0; PIPELINES],
+        pipelines: [0; PIPELINES],
         pool: 0,
         set: 0,
         xfb,
@@ -339,6 +360,8 @@ fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool) -> Result<Gpu, Stri
         parents: Owned::default(),
         flags: Owned::default(),
         globals: Owned::default(),
+        blocks: Owned::default(),
+        block_room: blocks_of([extent[0].max(ROOM_FOR[0]), extent[1].max(ROOM_FOR[1])]),
         keys,
         query_pool: 0,
         pending: [false; RING],
@@ -364,8 +387,9 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, counter: u64, capacity: u64, timed
     g.parents = make_buffer(&g.buffers, d, &types, 4 * 2 * n, usage, false)?;
     g.flags = make_buffer(&g.buffers, d, &types, 4 * n, usage, false)?;
     g.globals = make_buffer(&g.buffers, d, &types, 256, usage, false)?;
+    g.blocks = make_buffer(&g.buffers, d, &types, BLOCK_BYTES * g.block_room, usage, false)?;
     let f = &g.fns;
-    let bindings: Vec<DescriptorSetLayoutBinding> = (0..7)
+    let bindings: Vec<DescriptorSetLayoutBinding> = (0..BINDINGS)
         .map(|b| DescriptorSetLayoutBinding {
             binding: b,
             kind: DESCRIPTOR_STORAGE_BUFFER,
@@ -410,7 +434,8 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, counter: u64, capacity: u64, timed
         push_constants: &trace_push,
     };
     check((f.create_pipeline_layout)(d, &info, none, &mut g.trace_layout), "vkCreatePipelineLayout")?;
-    let codes: [&[u32]; 6] = [SPIRV_PREP, SPIRV_SORT_LOCAL, SPIRV_SORT_GLOBAL, SPIRV_BUILD, SPIRV_BOUNDS, SPIRV_TRACE];
+    let codes: [&[u32]; PIPELINES] =
+        [SPIRV_PREP, SPIRV_SORT_LOCAL, SPIRV_SORT_GLOBAL, SPIRV_BUILD, SPIRV_BOUNDS, SPIRV_TRACE, SPIRV_UPSAMPLE];
     for (i, code) in codes.into_iter().enumerate() {
         g.shaders[i] = shader(f, d, code)?;
         let pipeline = ComputePipelineCreateInfo {
@@ -426,13 +451,13 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, counter: u64, capacity: u64, timed
                 name: c"main".as_ptr(),
                 specialization: none,
             },
-            layout: if i == TRACE { g.trace_layout } else { g.build_layout },
+            layout: if i >= TRACE { g.trace_layout } else { g.build_layout },
             base_pipeline: 0,
             base_pipeline_index: -1,
         };
         check((f.create_compute_pipelines)(d, 0, 1, &pipeline, none, &mut g.pipelines[i]), "vkCreateComputePipelines")?;
     }
-    let size = DescriptorPoolSize { kind: DESCRIPTOR_STORAGE_BUFFER, count: 7 };
+    let size = DescriptorPoolSize { kind: DESCRIPTOR_STORAGE_BUFFER, count: BINDINGS };
     let pool = DescriptorPoolCreateInfo { s_type: ST_DESCRIPTOR_POOL_CREATE_INFO, p_next: none, flags: 0, max_sets: 1, count: 1, sizes: &size };
     check((f.create_descriptor_pool)(d, &pool, none, &mut g.pool), "vkCreateDescriptorPool")?;
     let alloc = DescriptorSetAllocateInfo {
@@ -451,6 +476,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, counter: u64, capacity: u64, timed
         DescriptorBufferInfo { buffer: g.parents.buffer, offset: 0, range: 8 * n },
         DescriptorBufferInfo { buffer: g.flags.buffer, offset: 0, range: 4 * n },
         DescriptorBufferInfo { buffer: g.globals.buffer, offset: 0, range: 256 },
+        DescriptorBufferInfo { buffer: g.blocks.buffer, offset: 0, range: BLOCK_BYTES * g.block_room },
     ];
     let writes: Vec<WriteDescriptorSet> = infos
         .iter()
@@ -499,7 +525,7 @@ pub(crate) fn record(
     if !is_on() {
         return Ok(false);
     }
-    let Some((xfb, _, capacity)) = capture::frame_captured(device) else {
+    let Some((xfb, counter, capacity, bytes)) = capture::frame_captured(device) else {
         let mut st = state();
         st.stats.skipped += 1;
         st.stats.last_skip = Some("the scene was not captured this frame".into());
@@ -510,7 +536,7 @@ pub(crate) fn record(
         return Err(why.clone());
     }
     if !st.gpus.iter().any(|g| g.device == device) {
-        match make_gpu(device, ssr_set_layout, mask != 0) {
+        match make_gpu(device, ssr_set_layout, mask != 0, extent) {
             Ok(g) => {
                 let line = format!("ray tracing on device 0x{device:x}: up to {} triangles sorted", g.keys);
                 if st.reported.insert(line.clone()) {
@@ -524,11 +550,14 @@ pub(crate) fn record(
             }
         }
     }
-    let triangles = capture::last_bytes() / capture::TRIANGLE_BYTES;
+    let triangles = bytes / capture::TRIANGLE_BYTES;
     let st = &mut *st;
     let g = st.gpus.iter_mut().find(|g| g.device == device).expect("made above");
     if g.xfb != xfb {
         return Err("the capture buffer changed".into());
+    }
+    if blocks_of(extent) > g.block_room {
+        return Err(format!("the scene ({}x{}) is larger than the trace has room for", extent[0], extent[1]));
     }
     let n = sort_size(triangles, g.keys as u64);
     let slot = g.next_slot;
@@ -558,6 +587,8 @@ pub(crate) fn record(
     (g.buffers.pipeline_barrier)(cmd, STAGE_COMPUTE, STAGE_TRANSFER | STAGE_COMPUTE, 0, 0, std::ptr::null(), 0, std::ptr::null(), 0, std::ptr::null());
     (f.cmd_fill_buffer)(cmd, g.globals.buffer, 0, 256, 0);
     (f.cmd_fill_buffer)(cmd, g.flags.buffer, 0, 4 * n as u64, 0);
+    // What this frame's draws wrote, as counted when they were recorded.
+    (f.cmd_fill_buffer)(cmd, counter, 0, 4, bytes as u32);
     g.barrier(cmd, STAGE_TRANSFER | STAGE_COMPUTE, ACCESS_TRANSFER_WRITE | ACCESS_SHADER_WRITE);
     let mut bp = BuildParams {
         n,
@@ -602,11 +633,16 @@ pub(crate) fn record(
         std::mem::size_of::<super::super::ssr::Params>() as u32,
         (params as *const super::super::ssr::Params).cast(),
     );
+    // One ray per 2 by 2 block, then every pixel from the blocks around it.
+    (f.cmd_dispatch)(cmd, extent[0].div_ceil(2).div_ceil(8), extent[1].div_ceil(2).div_ceil(8), 1);
+    g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
+    (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[UPSAMPLE]);
     (f.cmd_dispatch)(cmd, extent[0].div_ceil(8), extent[1].div_ceil(8), 1);
     stamp(2);
     if timed {
         g.pending[slot] = true;
     }
+    capture::traced();
     Ok(true)
 }
 
@@ -642,8 +678,9 @@ pub(crate) fn stats_line() -> String {
     let st = state();
     let s = &st.stats;
     format!(
-        "on={} traced={} skipped={} keys={} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} gpu_samples={}{}",
+        "on={} reflections={} traced={} skipped={} keys={} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} gpu_samples={}{}",
         is_on(),
+        if super::super::ssr::reflections_on() { "on" } else { "off" },
         s.frames,
         s.skipped,
         s.keys,
@@ -685,6 +722,13 @@ mod tests {
         // k = 2048: j 1024 then local; k = 4096: j 2048, 1024, local; k = 8192: three and local.
         assert_eq!(plan.len(), 1 + (1 + 1) + (2 + 1) + (3 + 1));
         assert!(plan.iter().all(|&(p, k, j, _)| (p == SORT_GLOBAL) == (j >= BLOCK) && (p == SORT_LOCAL || k > j)));
+    }
+
+    #[test]
+    fn one_ray_per_two_by_two_block() {
+        assert_eq!(blocks_of([1667, 1349]), 834 * 675);
+        assert_eq!(blocks_of([2, 2]), 1);
+        assert!(blocks_of([1667, 1349]) <= blocks_of(ROOM_FOR));
     }
 
     #[test]

@@ -28,6 +28,10 @@
 //         -> ssr.spv.rs
 //     glslc -O --target-env=vulkan1.0 -mfmt=num -DCOMPOSE ssr.comp -o -
 //         -> compose.spv.rs
+//     glslc -O --target-env=vulkan1.0 -mfmt=num -DRT ssr.comp -o -
+//         -> rt_trace.spv.rs
+//     glslc -O --target-env=vulkan1.0 -mfmt=num -DRT -DUPSAMPLE ssr.comp -o -
+//         -> rt_upsample.spv.rs
 //
 // A test compiles this file again and compares, whenever glslc is there.
 //
@@ -412,32 +416,49 @@ vec4 reflection(ivec2 p, vec3 P, vec3 N, float wet) {
 // too: the front of the character seen from behind, the far side of a
 // pillar, what the ray meets coming back towards the camera.
 //
+// Two dispatches. The trace (`-DRT`): one ray per 2 by 2 block of pixels,
+// from the block's first pixel that is not sky, into `blocks`. The
+// upsample (`-DRT -DUPSAMPLE`): every pixel takes the rays of the 3 by 3
+// blocks around it that left from its own surface (their starting point on
+// its plane), weighted by how near they are, into `trace_img`, which the
+// compose then reads as it reads the march's.
+//
 // The colour of a hit: the scene colour where the hit is what the screen
-// shows there; the scene colour, shaded by the hit's own normal, where the
-// screen shows something just in front of it (the back of the same object,
-// whose colour is the best there is for its front); otherwise, off screen
-// or deep behind something, a neutral grey lit from above.
+// shows there; otherwise (off screen, or behind what the screen shows) the
+// colour the hit triangle's vertex shader passed on, the engine's base
+// colour of the part without its textures, lit by a light from above, or a
+// neutral grey where the shader passes on no colour.
 
 layout(std430, set = 1, binding = 0) readonly buffer Xfb { vec4 xfb[]; };
 layout(std430, set = 1, binding = 2) readonly buffer Sorted { uvec2 sorted[]; };
 layout(std430, set = 1, binding = 3) readonly buffer Nodes { vec4 nodes[]; };
 layout(std430, set = 1, binding = 6) readonly buffer Globals { uint leaves; uint captured; };
+// Per block: the premultiplied colour and strength as four halves, the
+// pixel the ray left from (x | y << 16, or ~0 for none).
+layout(std430, set = 1, binding = 7) buffer Blocks { uvec4 blocks[]; };
 
 const int STACK = 48;
 const vec3 LIGHT = vec3(0.32, 0.87, -0.37);
+const uint NO_PIXEL = 0xffffffffu;
+
+uvec2 half_size() {
+    return (pc.size + 1u) / 2u;
+}
+
+#ifndef UPSAMPLE
 
 vec3 tri_view(uint v) {
-    vec4 c = xfb[v];
+    vec4 c = xfb[2u * v];
     return vec3(c.x * pc.tan_half.x, -c.y * pc.tan_half.y, c.w) / c.z;
 }
 
-// Moller-Trumbore, both faces; t or -1.
-float hit_triangle(vec3 O, vec3 D, uint tri, float t_min, out vec3 n) {
+// Moller-Trumbore, both faces: t (or -1) and the barycentrics of B and C.
+float hit_triangle(vec3 O, vec3 D, uint tri, float t_min, out vec2 uv) {
     vec3 A = tri_view(3u * tri), B = tri_view(3u * tri + 1u), C = tri_view(3u * tri + 2u);
     vec3 e1 = B - A, e2 = C - A;
-    n = cross(e1, e2);
     vec3 q = cross(D, e2);
     float det = dot(e1, q);
+    uv = vec2(0.0);
     if (abs(det) < 1e-20) {
         return -1.0;
     }
@@ -452,6 +473,7 @@ float hit_triangle(vec3 O, vec3 D, uint tri, float t_min, out vec3 n) {
     if (v < 0.0 || u + v > 1.0) {
         return -1.0;
     }
+    uv = vec2(u, v);
     float t = dot(e2, r) * inv;
     return t > t_min ? t : -1.0;
 }
@@ -465,24 +487,22 @@ float hit_box(vec3 O, vec3 inv_d, vec3 lo, vec3 hi, float best) {
     return t0 <= t1 && t0 < best ? t0 : 3.4e38;
 }
 
-// The nearest hit along O + t D for t in (t_min, t_max): t and the
-// triangle's normal, or t = -1.
-float trace_ray(vec3 O, vec3 D, float t_min, float t_max, out vec3 n_hit) {
-    n_hit = vec3(0.0);
+// The nearest hit along O + t D for t in (t_min, t_max): t, the triangle
+// and the barycentrics there, or t = -1.
+float trace_ray(vec3 O, vec3 D, float t_min, float t_max, out uint tri_hit, out vec2 uv_hit) {
+    tri_hit = 0u;
+    uv_hit = vec2(0.0);
     uint m = leaves;
     float best = t_max;
     bool found = false;
-    vec3 n;
+    vec2 uv;
     if (m == 0u) {
         return -1.0;
     }
     if (m == 1u) {
-        float t = hit_triangle(O, D, sorted[0].y, t_min, n);
-        if (t > 0.0 && t < best) {
-            n_hit = n;
-            return t;
-        }
-        return -1.0;
+        tri_hit = sorted[0].y;
+        float t = hit_triangle(O, D, tri_hit, t_min, uv_hit);
+        return t > 0.0 && t < best ? t : -1.0;
     }
     vec3 inv_d = 1.0 / mix(D, vec3(1e-30), equal(D, vec3(0.0)));
     int stack[STACK];
@@ -497,19 +517,23 @@ float trace_ray(vec3 O, vec3 D, float t_min, float t_max, out vec3 n_hit) {
         int next_node = -1;
         // Leaves are tested at once; nodes are visited nearer first.
         if (tl < best && left < 0) {
-            float t = hit_triangle(O, D, sorted[~left].y, t_min, n);
+            uint tri = sorted[~left].y;
+            float t = hit_triangle(O, D, tri, t_min, uv);
             if (t > 0.0 && t < best) {
                 best = t;
-                n_hit = n;
+                tri_hit = tri;
+                uv_hit = uv;
                 found = true;
             }
             tl = 3.4e38;
         }
         if (tr < best && right < 0) {
-            float t = hit_triangle(O, D, sorted[~right].y, t_min, n);
+            uint tri = sorted[~right].y;
+            float t = hit_triangle(O, D, tri, t_min, uv);
             if (t > 0.0 && t < best) {
                 best = t;
-                n_hit = n;
+                tri_hit = tri;
+                uv_hit = uv;
                 found = true;
             }
             tr = 3.4e38;
@@ -537,6 +561,22 @@ float trace_ray(vec3 O, vec3 D, float t_min, float t_max, out vec3 n_hit) {
     return found ? best : -1.0;
 }
 
+// The hit triangle's own colour at the hit, lit: the colour its vertex
+// shader passed on (gamma-encoded, as the engine's fragment shaders take
+// it, so the light goes in by its square root), grey without one.
+vec3 hit_colour(uint tri, vec2 uv, vec3 R) {
+    vec3 A = tri_view(3u * tri), B = tri_view(3u * tri + 1u), C = tri_view(3u * tri + 2u);
+    vec3 n = normalize(cross(B - A, C - A));
+    n = dot(n, R) > 0.0 ? -n : n;
+    float lit = 0.35 + 0.65 * max(dot(n, LIGHT), 0.0);
+    vec4 ca = xfb[2u * (3u * tri) + 1u], cb = xfb[2u * (3u * tri + 1u) + 1u], cc = xfb[2u * (3u * tri + 2u) + 1u];
+    vec3 albedo = vec3(0.5);
+    if (min(ca.a, min(cb.a, cc.a)) >= 0.0 && !any(isnan(ca + cb + cc))) {
+        albedo = clamp(ca.rgb * (1.0 - uv.x - uv.y) + cb.rgb * uv.x + cc.rgb * uv.y, 0.0, 1.0);
+    }
+    return albedo * sqrt(lit);
+}
+
 vec4 reflection_rt(ivec2 p, vec3 P, vec3 N, float wet) {
     vec3 V = normalize(P);
     float cos_v = clamp(dot(-V, N), 0.0, 1.0);
@@ -550,8 +590,9 @@ vec4 reflection_rt(ivec2 p, vec3 P, vec3 N, float wet) {
     // pixel lies on; the depth it came from is only so precise.
     vec3 O = P + N * (0.002 * P.z);
     float t_max = pc.max_distance > 0.0 ? pc.max_distance * length(P) : 3.0e38;
-    vec3 n_hit;
-    float t = trace_ray(O, R, 0.002 * P.z, t_max, n_hit);
+    uint tri;
+    vec2 uv;
+    float t = trace_ray(O, R, 0.002 * P.z, t_max, tri, uv);
     int k = cell(p);
     if (t < 0.0) {
         // Nothing in the way: the sky, where its vanishing point is on the
@@ -565,25 +606,23 @@ vec4 reflection_rt(ivec2 p, vec3 P, vec3 N, float wet) {
         return vec4(0.0);
     }
     vec3 H = O + R * t;
-    vec3 nh = normalize(n_hit);
-    nh = dot(nh, R) > 0.0 ? -nh : nh;
-    float lit = 0.45 + 0.55 * max(dot(nh, LIGHT), 0.0);
-    vec3 c = vec3(0.5) * lit;
-    float sure = 1.0;
+    vec3 c;
+    bool on_screen = false;
     if (H.z > 1e-3) {
         vec2 at = to_pixel(H);
         if (all(greaterThanEqual(at, vec2(0.5))) && all(lessThan(at, vec2(pc.size) - 0.5))) {
             float ds = depth_at(ivec2(at));
             float zs = ds > 0.0 ? 1.0 / ds : 3.0e38;
-            float gap = (H.z - zs) / H.z;
-            vec3 screen = reflected_color(at, length(at - vec2(p)), k);
-            if (abs(gap) < 0.02) {
-                c = screen;
-            } else if (gap > 0.0 && gap < 0.15) {
-                c = screen * lit;
+            if (abs(H.z - zs) < 0.02 * H.z) {
+                c = reflected_color(at, length(at - vec2(p)), k);
+                on_screen = true;
             }
         }
     }
+    if (!on_screen) {
+        c = hit_colour(tri, uv, R);
+    }
+    float sure = 1.0;
     // A ray that ends somewhere fades out over the last 40% of it.
     if (pc.max_distance > 0.0) {
         sure *= 1.0 - smoothstep(0.6, 1.0, t / t_max);
@@ -593,6 +632,45 @@ vec4 reflection_rt(ivec2 p, vec3 P, vec3 N, float wet) {
 }
 
 #endif
+
+// The pixel of block `b` its ray leaves from: the first of (0, 0), (1, 1),
+// (1, 0), (0, 1) in it that is on the screen and not sky.
+uint leader(ivec2 b) {
+    const ivec2 order[4] = ivec2[4](ivec2(0, 0), ivec2(1, 1), ivec2(1, 0), ivec2(0, 1));
+    for (int i = 0; i < 4; ++i) {
+        ivec2 q = 2 * b + order[i];
+        if (all(lessThan(uvec2(q), pc.size)) && depth_at(q) > 0.0) {
+            return uint(q.x) | (uint(q.y) << 16);
+        }
+    }
+    return NO_PIXEL;
+}
+
+#endif
+
+#if defined(RT) && !defined(UPSAMPLE)
+
+void main() {
+    ivec2 b = ivec2(gl_GlobalInvocationID.xy);
+    uvec2 hs = half_size();
+    if (any(greaterThanEqual(uvec2(b), hs))) {
+        return;
+    }
+    vec4 r = vec4(0.0);
+    uint from = leader(b);
+    if (from != NO_PIXEL) {
+        ivec2 p = ivec2(from & 0xffffu, from >> 16);
+        vec3 P = view_pos(vec2(p) + 0.5, depth_at(p));
+        vec3 N = surface_at(p, P).n;
+        float wet = N == vec3(0.0) ? 0.0 : wetness(N);
+        if (wet > 0.0) {
+            r = reflection_rt(p, P, N, wet);
+        }
+    }
+    blocks[uint(b.y) * hs.x + uint(b.x)] = uvec4(packHalf2x16(r.rg), packHalf2x16(r.ba), from, 0u);
+}
+
+#else
 
 void main() {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
@@ -606,8 +684,36 @@ void main() {
         vec3 N = surface_at(p, P).n;
         float wet = N == vec3(0.0) ? 0.0 : wetness(N);
         if (wet > 0.0) {
-#ifdef RT
-            r = reflection_rt(p, P, N, wet);
+#ifdef UPSAMPLE
+            // The rays of the blocks around that left from this pixel's
+            // plane, by a tent over three pixels of distance.
+            uvec2 hs = half_size();
+            ivec2 b0 = p / 2;
+            vec4 sum = vec4(0.0);
+            float weights = 0.0;
+            for (int j = -1; j <= 1; ++j) {
+                for (int i = -1; i <= 1; ++i) {
+                    ivec2 b = b0 + ivec2(i, j);
+                    if (any(greaterThanEqual(uvec2(b), hs))) {
+                        continue;
+                    }
+                    uvec4 e = blocks[uint(b.y) * hs.x + uint(b.x)];
+                    if (e.z == NO_PIXEL) {
+                        continue;
+                    }
+                    ivec2 q = ivec2(e.z & 0xffffu, e.z >> 16);
+                    vec3 Q = view_pos(vec2(q) + 0.5, depth_at(q));
+                    float off_plane = abs(dot(N, Q - P)) / P.z;
+                    float k = (1.0 - smoothstep(0.004, 0.02, off_plane)) * max(1.0 - length(vec2(q - p)) / 3.0, 0.0);
+                    if (k > 0.0) {
+                        sum += k * vec4(unpackHalf2x16(e.x), unpackHalf2x16(e.y));
+                        weights += k;
+                    }
+                }
+            }
+            if (weights > 1e-3) {
+                r = sum / weights;
+            }
 #else
             r = reflection(p, P, N, wet);
 #endif
@@ -615,5 +721,7 @@ void main() {
     }
     imageStore(trace_img, p, r);
 }
+
+#endif
 
 #endif

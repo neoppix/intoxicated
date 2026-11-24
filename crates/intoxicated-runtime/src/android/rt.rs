@@ -440,6 +440,11 @@ pub fn control(args: &[&str]) -> Result<String, String> {
             if !requested() {
                 return Err(format!("the ray-traced reflections are off ({ENV}=1 at start turns them on)"));
             }
+            // The trace replaces the reflections' march, so `rt on` turns
+            // them on as well; `rt off` leaves them as they are.
+            if *w == "on" {
+                super::ssr::reflections_on_for_rt()?;
+            }
             trace::set_on(*w == "on");
             Ok(trace::stats_line())
         }

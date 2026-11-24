@@ -4,29 +4,46 @@
 //! # What is captured
 //!
 //! Every vertex shader the engine creates on a device with transform
-//! feedback (see `rt`) has its clip-space position decorated for capture
-//! ([`super::spirv`]); nothing else of it changes. A graphics pipeline counts
-//! as drawing visible scene geometry, and is captured, when its vertex
-//! shader was instrumented, it has no tessellation or geometry stage, it
-//! draws triangles (a list, strip or fan, not set dynamically), it does not
-//! discard its primitives before rasterisation, and it writes colour (at
-//! least one blend attachment with a non-zero write mask, not set
-//! dynamically). So depth-only and shadow pipelines are never captured.
+//! feedback (see `rt`) has its clip-space position and its colour output
+//! decorated for capture ([`super::spirv`]); nothing it computes changes.
+//! A graphics pipeline counts as drawing visible scene geometry, and is
+//! captured, when its vertex shader was instrumented, it has no
+//! tessellation or geometry stage, it draws triangles (a list, strip or
+//! fan, not set dynamically; strips and fans without primitive restart), it
+//! does not discard its primitives before
+//! rasterisation, and it writes colour (at least one blend attachment with
+//! a non-zero write mask, not set dynamically). So depth-only and shadow
+//! pipelines are never captured.
 //!
 //! Transform feedback is active only inside the scene passes (a depth
-//! attachment the size of a swapchain image, the same test the reflections
-//! use), and only while such a pipeline is bound: Vulkan does not allow a
-//! pipeline to be bound while it is active, so it is ended before each bind
-//! of the engine's and begun again after it, resuming where it stopped
-//! through a counter buffer. A frame starts at the scene pass that clears
-//! the depth: the first begin after it writes from the start of our buffer.
+//! attachment the size of a swapchain image, no swapchain image among the
+//! colour attachments; Timebomb Duels has two a frame, the 3D scene and a
+//! second one that loads its depth), and only around the draws of such a
+//! pipeline. Vulkan does not allow a pipeline to be bound while it is
+//! active, so it is ended before each bind of the engine's and begun again
+//! at the next draw to capture. Each begin writes at the offset our own
+//! count of the frame's vertices has reached, which the client works out
+//! from each draw's vertex or index count, instance count and topology as
+//! it is recorded; the frame starts at 0 with the first scene pass after a
+//! present, and the trace is told the total. Resuming through the
+//! extension's counter buffer instead did not work: inside a render pass
+//! there is no barrier between an end that writes the counter and the next
+//! begin that reads it, and in game the begins read stale counters, so
+//! draws overwrote each other (a frame of about 100000 triangles came out as
+//! 2400) or frames ran on into each other until the buffer was full.
+//! Indirect draws, whose counts only the GPU knows, are not captured (the
+//! lobby has none), nor is a draw for which the buffer has no room left.
 //! Shadow maps, the swapchain pass and anything else outside the scene
 //! passes are never captured, whatever pipeline they use.
 //!
-//! Every triangle, of every instance, lands in our buffer as three clip-space
-//! positions in the order drawn, strips and fans already split into separate
-//! triangles: post-transform, post-skinning geometry, the player's own
-//! character included, and only what the engine actually drew this frame.
+//! Every triangle, of every instance, lands in our buffer as three vertices
+//! (clip-space position, then the colour the vertex shader passes on, or
+//! (-1, -1, -1, -1) where it has none) in the order drawn, strips and fans
+//! already split into separate triangles: post-transform, post-skinning
+//! geometry, the player's own character included, and only what the engine
+//! actually drew this frame. Pipelines that draw strips or fans with
+//! primitive restart are not captured: how many triangles they write is
+//! not known when they are recorded.
 //!
 //! # The research switch
 //!
@@ -62,10 +79,10 @@ const STAGE_GEOMETRY: u32 = 0x8;
 
 const DYNAMIC_PRIMITIVE_TOPOLOGY: u32 = 1_000_267_002;
 const DYNAMIC_RASTERIZER_DISCARD_ENABLE: u32 = 1_000_377_001;
+const DYNAMIC_PRIMITIVE_RESTART_ENABLE: u32 = 1_000_377_004;
 const DYNAMIC_COLOR_WRITE_ENABLE: u32 = 1_000_381_000;
 const DYNAMIC_COLOR_WRITE_MASK: u32 = 1_000_455_011;
 
-const PIPELINE_STAGE_DRAW_INDIRECT: u32 = 0x2;
 const PIPELINE_STAGE_COMPUTE: u32 = 0x800;
 const PIPELINE_STAGE_TRANSFER: u32 = 0x1000;
 const PIPELINE_STAGE_HOST: u32 = 0x4000;
@@ -75,8 +92,6 @@ const ACCESS_TRANSFER_READ: u32 = 0x800;
 const ACCESS_TRANSFER_WRITE: u32 = 0x1000;
 const ACCESS_HOST_READ: u32 = 0x2000;
 const ACCESS_XFB_WRITE: u32 = 0x0200_0000;
-const ACCESS_XFB_COUNTER_READ: u32 = 0x0400_0000;
-const ACCESS_XFB_COUNTER_WRITE: u32 = 0x0800_0000;
 
 const USAGE_TRANSFER_SRC: u32 = 0x1;
 const USAGE_TRANSFER_DST: u32 = 0x2;
@@ -86,15 +101,15 @@ const USAGE_XFB_COUNTER: u32 = 0x1000;
 
 const MEMORY_DEVICE_LOCAL: u32 = 0x1;
 
-const LOAD_OP_CLEAR: u32 = 1;
 const CONTENTS_SECONDARY: u32 = 1;
 const BIND_POINT_GRAPHICS: u32 = 0;
 
 /// Bytes per captured triangle.
 pub(crate) const TRIANGLE_BYTES: u64 = 3 * spirv::STRIDE as u64;
 
-/// The triangles our buffer holds, unless `INTOXICATED_RT_TRIANGLES` says.
-const DEFAULT_TRIANGLES: u64 = 2 << 20;
+/// The triangles our buffer holds, unless `INTOXICATED_RT_TRIANGLES` says
+/// (48 MiB; Timebomb Duels draws about 30000 a frame in its lobby).
+const DEFAULT_TRIANGLES: u64 = 1 << 19;
 
 pub const DUMP_ENV: &str = "INTOXICATED_RT_DUMP";
 pub const TRIANGLES_ENV: &str = "INTOXICATED_RT_TRIANGLES";
@@ -180,8 +195,12 @@ struct Gpu {
     readback_ptr: usize,
     readback_size: u64,
     capacity: u64,
-    /// A begin since the frame started, so the next resumes.
+    /// Anything was captured since the buffer was made.
     started: bool,
+    /// The present count when the current frame started.
+    frame: u64,
+    /// The bytes this frame's draws write, as counted when recorded.
+    bytes: u64,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -198,7 +217,11 @@ pub(crate) struct Stats {
     pub binds_skipped: u64,
     pub draws_captured: u64,
     pub draws_skipped: u64,
+    /// Skipped because the buffer was full.
+    pub draws_overflowed: u64,
     pub modules_instrumented: u64,
+    /// Of those, the ones with a colour output of their own.
+    pub modules_coloured: u64,
     pub modules_left: u64,
     pub pipelines_captured: u64,
     pub pipelines_skipped: u64,
@@ -214,6 +237,11 @@ struct State {
     stats: Stats,
     /// Lines of the current `rt draws` listing.
     listing: Vec<String>,
+    /// What happened in this frame and the last, in recording order: scene
+    /// passes (the depth's load op, the colour attachments, the triangles
+    /// before and after) and the trace.
+    frame_log: Vec<String>,
+    last_log: String,
     reported: std::collections::HashSet<String>,
 }
 
@@ -237,8 +265,10 @@ static DUMP_NEXT: AtomicBool = AtomicBool::new(false);
 /// The present count when the dump's frame was recorded, 0 for none yet.
 static DUMPED_AT: AtomicU64 = AtomicU64::new(0);
 static PRESENTS: AtomicU64 = AtomicU64::new(0);
-/// The last frame's captured bytes, as last read back.
+/// The last frame's captured bytes.
 static LAST_BYTES: AtomicU64 = AtomicU64::new(0);
+/// The bytes the dump's frame copied out.
+static DUMPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
 // ------------------------------------------------------------ hooks
 
@@ -330,6 +360,7 @@ extern "C" fn create_shader_module(device: *mut c_void, info: *const c_void, all
         if vertex && xfb {
             if done {
                 st.stats.modules_instrumented += 1;
+                st.stats.modules_coloured += u64::from(spirv::has_colour(words));
             } else {
                 st.stats.modules_left += 1;
                 let why = match &instrumented {
@@ -411,6 +442,10 @@ unsafe fn describe_pipeline(info: *const c_void, device: usize, modules: &HashMa
         p.topology = get(ia, 20);
         if !(3..=5).contains(&p.topology) {
             fail(&mut p, "it does not draw triangles");
+        }
+        // Restarts would make what a strip writes unknown when recorded.
+        if p.topology != 3 && (get::<u32>(ia, 24) != 0 || is_dynamic(dynamic, &[DYNAMIC_PRIMITIVE_RESTART_ENABLE])) {
+            fail(&mut p, "it draws strips or fans with primitive restart");
         }
     }
     if is_dynamic(dynamic, &[DYNAMIC_PRIMITIVE_TOPOLOGY]) {
@@ -500,19 +535,22 @@ pub(crate) fn cmd_begun(cmd: *mut c_void) {
     state().cmds.insert(cmd as usize, Cmd::default());
 }
 
-/// A pass begins, before the begin is forwarded. A scene pass that clears
-/// the depth starts a frame: the barrier that keeps this frame's capture
-/// from overwriting what the last one's readers still use is recorded here,
-/// outside the pass.
+/// A pass begins, before the begin is forwarded. The first scene pass after
+/// a present starts a frame: our buffer is written from its start again.
+/// Before every scene pass, outside it: the barrier that keeps this frame's
+/// capture from overwriting what the last one's readers still use.
 pub(crate) fn pass_beginning(pass: &Pass) {
-    let (depth, full) = {
+    let (depth, full, to_swapchain, colours) = {
         let reg = super::super::vk_layer::passes::registry();
         let d = super::super::ssr::describe(pass, &reg);
-        (d.depth, reg.swapchain_extents())
+        let to_swapchain = d.colors.iter().chain(&d.resolves).any(|a| a.swapchain);
+        (d.depth, reg.swapchain_extents(), to_swapchain, d.colors.len())
     };
     let mut st = state();
     let cmd = pass.cmd;
-    let Some(z) = depth.filter(|d| registry::is_depth_format(d.format) && full.contains(&d.extent)) else {
+    // A pass that draws into a swapchain image is the frame's last, the
+    // interface over the finished scene, not the scene.
+    let Some(z) = depth.filter(|d| registry::is_depth_format(d.format) && full.contains(&d.extent) && !to_swapchain) else {
         if let Some(c) = st.cmds.get_mut(&cmd) {
             c.scene = false;
             c.capturing = false;
@@ -522,7 +560,11 @@ pub(crate) fn pass_beginning(pass: &Pass) {
     let secondary = matches!(pass.target, Target::RenderPass { contents, .. } if contents == CONTENTS_SECONDARY);
     let device = z.device;
     let xfb = super::enabled(device).transform_feedback;
-    let starts = z.load == LOAD_OP_CLEAR;
+    let presents = PRESENTS.load(Relaxed);
+    let starts = match st.gpus.iter().find(|g| g.device == device) {
+        Some(g) => g.frame != presents,
+        None => true,
+    };
     if starts && LIST_NEXT.swap(false, Relaxed) {
         st.listing.clear();
         if let Some(c) = st.cmds.get_mut(&cmd) {
@@ -552,61 +594,40 @@ pub(crate) fn pass_beginning(pass: &Pass) {
     }
     let g = st.gpus.iter_mut().find(|g| g.device == device).expect("made above");
     if starts {
-        g.started = false;
-        // The last frame's readers of our buffers (the trace's compute, the
-        // readback's copies) finish before this frame writes them.
-        g.barrier(
-            cmd as *mut c_void,
-            PIPELINE_STAGE_COMPUTE | PIPELINE_STAGE_TRANSFER,
-            PIPELINE_STAGE_TRANSFORM_FEEDBACK | PIPELINE_STAGE_DRAW_INDIRECT,
-            ACCESS_SHADER_READ | ACCESS_TRANSFER_READ,
-            ACCESS_XFB_WRITE | ACCESS_XFB_COUNTER_READ | ACCESS_XFB_COUNTER_WRITE,
-        );
+        g.bytes = 0;
+        g.frame = presents;
         st.stats.frames += 1;
+        st.frame_log.clear();
     }
+    let g = st.gpus.iter().find(|g| g.device == device).expect("made above");
+    // The last frame's readers of our buffer (the trace's compute, the
+    // dump's copy) finish before this pass writes it.
+    g.barrier(
+        cmd as *mut c_void,
+        PIPELINE_STAGE_COMPUTE | PIPELINE_STAGE_TRANSFER,
+        PIPELINE_STAGE_TRANSFORM_FEEDBACK,
+        ACCESS_SHADER_READ | ACCESS_TRANSFER_READ,
+        ACCESS_XFB_WRITE,
+    );
+    let at = g.bytes;
+    let k = st.frame_log.len();
+    st.frame_log.push(format!("scene{k}(load={},colours={colours},from={})", z.load, at / TRIANGLE_BYTES));
     if let Some(c) = st.cmds.get_mut(&cmd) {
         c.capturing = true;
     }
 }
 
-/// After a pass's begin was forwarded: inside a scene pass, our buffer is
-/// bound and capture begins if the bound pipeline is one to capture.
-pub(crate) fn pass_started(cmd: *mut c_void) {
-    let mut st = state();
-    let Some(c) = st.cmds.get(&(cmd as usize)) else { return };
-    if !c.capturing {
-        return;
-    }
-    let (device, bound) = (c.device, c.bound);
-    let Some(g) = st.gpus.iter().find(|g| g.device == device) else { return };
-    let sizes = [g.capacity];
-    (g.fns.bind_xfb)(cmd, 0, 1, &g.xfb.buffer, &0u64, sizes.as_ptr());
-    begin_if_captured(&mut st, cmd, device, bound);
-}
-
-fn begin_if_captured(st: &mut State, cmd: *mut c_void, device: usize, pipeline: u64) {
-    let captured = st.pipelines.get(&(device, pipeline)).is_some_and(|p| p.capture.is_ok());
-    if pipeline != 0 {
-        if captured {
-            st.stats.binds_captured += 1;
-        } else {
-            st.stats.binds_skipped += 1;
-        }
-    }
-    if !captured {
-        return;
-    }
-    let Some(g) = st.gpus.iter_mut().find(|g| g.device == device) else { return };
-    if g.started {
-        (g.fns.begin_xfb)(cmd, 0, 1, &g.counter.buffer, &0u64);
-    } else {
-        (g.fns.begin_xfb)(cmd, 0, 0, std::ptr::null(), std::ptr::null());
-        g.started = true;
-    }
-    st.stats.begins += 1;
-    if let Some(c) = st.cmds.get_mut(&(cmd as usize)) {
-        c.active = true;
-    }
+/// How many vertices a draw of `count` vertices or indices of `instances`
+/// instances writes to transform feedback with `topology`: whole triangles
+/// only, three vertices each, strips and fans split (never with primitive
+/// restart, see `describe_pipeline`).
+pub(crate) fn xfb_vertices(topology: u32, count: u32, instances: u32) -> u64 {
+    let triangles = match topology {
+        3 => count / 3,
+        4 | 5 => count.saturating_sub(2),
+        _ => 0,
+    } as u64;
+    3 * triangles * instances as u64
 }
 
 fn end_if_active(st: &mut State, cmd: *mut c_void) {
@@ -617,11 +638,12 @@ fn end_if_active(st: &mut State, cmd: *mut c_void) {
     c.active = false;
     let device = c.device;
     if let Some(g) = st.gpus.iter().find(|g| g.device == device) {
-        (g.fns.end_xfb)(cmd, 0, 1, &g.counter.buffer, &0u64);
+        (g.fns.end_xfb)(cmd, 0, 0, std::ptr::null(), std::ptr::null());
     }
 }
 
-/// Before the engine's `vkCmdBindPipeline` is forwarded.
+/// Before the engine's `vkCmdBindPipeline` is forwarded: no pipeline may be
+/// bound while transform feedback is active.
 pub(crate) fn binding(cmd: *mut c_void, bind_point: u32) {
     if bind_point != BIND_POINT_GRAPHICS {
         return;
@@ -637,11 +659,15 @@ pub(crate) fn bound(cmd: *mut c_void, bind_point: u32, pipeline: u64) {
     let mut st = state();
     let Some(c) = st.cmds.get_mut(&(cmd as usize)) else { return };
     c.bound = pipeline;
-    if !c.capturing {
+    if !c.capturing || pipeline == 0 {
         return;
     }
     let device = c.device;
-    begin_if_captured(&mut st, cmd, device, pipeline);
+    if st.pipelines.get(&(device, pipeline)).is_some_and(|p| p.capture.is_ok()) {
+        st.stats.binds_captured += 1;
+    } else {
+        st.stats.binds_skipped += 1;
+    }
 }
 
 /// Before `vkCmdNextSubpass` or `vkCmdExecuteCommands`: capture stops for
@@ -660,8 +686,8 @@ pub(crate) fn pass_ending(cmd: *mut c_void) {
 }
 
 /// After it was forwarded, outside the pass: what was written is made
-/// visible to the next scene pass and to the compute that reads it, and the
-/// counter (and for a dump, everything) is copied where the host reads it.
+/// visible to the compute that reads it, and for a dump copied where the
+/// host reads it.
 pub(crate) fn pass_ended(cmd: *mut c_void) {
     let mut st = state();
     let Some(c) = st.cmds.get_mut(&(cmd as usize)) else { return };
@@ -674,43 +700,78 @@ pub(crate) fn pass_ended(cmd: *mut c_void) {
     let (device, dumping) = (c.device, c.dumping);
     let presents = PRESENTS.load(Relaxed);
     let Some(g) = st.gpus.iter().find(|g| g.device == device) else { return };
-    let cmd_ = cmd;
     g.barrier(
-        cmd_,
+        cmd,
         PIPELINE_STAGE_TRANSFORM_FEEDBACK,
-        PIPELINE_STAGE_TRANSFORM_FEEDBACK | PIPELINE_STAGE_DRAW_INDIRECT | PIPELINE_STAGE_TRANSFER | PIPELINE_STAGE_COMPUTE,
-        ACCESS_XFB_WRITE | ACCESS_XFB_COUNTER_WRITE,
-        ACCESS_XFB_WRITE | ACCESS_XFB_COUNTER_READ | ACCESS_XFB_COUNTER_WRITE | ACCESS_TRANSFER_READ | ACCESS_SHADER_READ,
+        PIPELINE_STAGE_TRANSFER | PIPELINE_STAGE_COMPUTE,
+        ACCESS_XFB_WRITE,
+        ACCESS_TRANSFER_READ | ACCESS_SHADER_READ,
     );
-    let mut regions = vec![[0u64, 0, 16]];
-    if dumping && g.readback_size >= 256 + g.capacity {
-        regions.push([0, 256, g.capacity]);
-    }
-    (g.fns.copy_buffer)(cmd_, g.counter.buffer, g.readback.buffer, 1, regions[0].as_ptr());
-    if regions.len() > 1 {
-        (g.fns.copy_buffer)(cmd_, g.xfb.buffer, g.readback.buffer, 1, regions[1].as_ptr());
+    let bytes = g.bytes;
+    if dumping && g.readback_size >= 256 + g.capacity && bytes > 0 {
+        let region = [0u64, 256, bytes];
+        (g.fns.copy_buffer)(cmd, g.xfb.buffer, g.readback.buffer, 1, region.as_ptr());
+        g.barrier(cmd, PIPELINE_STAGE_TRANSFER, PIPELINE_STAGE_HOST, ACCESS_TRANSFER_WRITE, ACCESS_HOST_READ);
+        DUMPED_BYTES.store(bytes, Relaxed);
         DUMPED_AT.store(presents.max(1), Relaxed);
     }
-    g.barrier(cmd_, PIPELINE_STAGE_TRANSFER, PIPELINE_STAGE_HOST, ACCESS_TRANSFER_WRITE, ACCESS_HOST_READ);
+    if let Some(last) = st.frame_log.last_mut() {
+        last.push_str(&format!("..{}", bytes / TRIANGLE_BYTES));
+    }
 }
 
-/// A draw in `cmd`, for the counts and `rt draws`.
+/// A draw in `cmd`, before it is forwarded: inside a scene pass, with a
+/// pipeline to capture bound, transform feedback is begun if it is not
+/// active, at the offset our count of what this frame wrote has reached
+/// (there is no waiting on the GPU's own counter, whose end-to-begin
+/// round trip inside a render pass Vulkan gives no barrier for), and the
+/// count grows by what the draw writes. An indirect draw, whose size only
+/// the GPU knows, is not captured. Also the counts and `rt draws`.
 pub(crate) fn drew(cmd: *mut c_void, kind: &'static str, count: u32, instances: u32) {
     let mut st = state();
     let Some(c) = st.cmds.get(&(cmd as usize)) else { return };
     if !c.scene && !c.listing {
         return;
     }
-    let (active, listing, bound, device, scene) = (c.active, c.listing, c.bound, c.device, c.scene);
-    if c.capturing {
-        if active {
-            st.stats.draws_captured += 1;
-        } else {
-            st.stats.draws_skipped += 1;
+    let (listing, bound, device, scene, capturing) = (c.listing, c.bound, c.device, c.scene, c.capturing);
+    let p = st.pipelines.get(&(device, bound)).cloned();
+    if capturing {
+        let take = p.as_ref().filter(|p| p.capture.is_ok() && kind != "indirect").map(|p| xfb_vertices(p.topology, count, instances));
+        let room = st.gpus.iter().find(|g| g.device == device).map(|g| (g.capacity, g.bytes));
+        match (take, room) {
+            (Some(vertices), Some((capacity, at))) if at + vertices * spirv::STRIDE as u64 <= capacity => {
+                let bytes = vertices * spirv::STRIDE as u64;
+                let active = st.cmds.get(&(cmd as usize)).is_some_and(|c| c.active);
+                let g = st.gpus.iter_mut().find(|g| g.device == device).expect("found above");
+                if !active && bytes > 0 {
+                    let size = capacity - at;
+                    (g.fns.bind_xfb)(cmd, 0, 1, &g.xfb.buffer, &at, &size);
+                    (g.fns.begin_xfb)(cmd, 0, 0, std::ptr::null(), std::ptr::null());
+                    g.started = true;
+                    st.stats.begins += 1;
+                    if let Some(c) = st.cmds.get_mut(&(cmd as usize)) {
+                        c.active = true;
+                    }
+                }
+                let g = st.gpus.iter_mut().find(|g| g.device == device).expect("found above");
+                g.bytes += bytes;
+                st.stats.draws_captured += 1;
+            }
+            (Some(_), Some(_)) => {
+                // No room left this frame.
+                end_if_active(&mut st, cmd);
+                st.stats.draws_skipped += 1;
+                st.stats.draws_overflowed += 1;
+            }
+            _ => {
+                // An indirect draw, or a pipeline not to capture (already
+                // ended at its bind).
+                end_if_active(&mut st, cmd);
+                st.stats.draws_skipped += 1;
+            }
         }
     }
     if listing && scene {
-        let p = st.pipelines.get(&(device, bound)).cloned();
         let line = format!(
             "0x{:x}\t0x{bound:x}\t{kind}\t{count}\t{instances}\t{}\tvs-{:016x}\tfs-{:016x}\n",
             cmd as usize,
@@ -730,6 +791,9 @@ pub(crate) fn drew(cmd: *mut c_void, kind: &'static str, count: u32, instances: 
 pub(crate) fn frame_end(presents: u64) {
     PRESENTS.store(presents, Relaxed);
     let mut st = state();
+    if !st.frame_log.is_empty() {
+        st.last_log = st.frame_log.join(",");
+    }
     let mut finished_listing = false;
     for c in st.cmds.values_mut() {
         if c.listing {
@@ -751,12 +815,7 @@ pub(crate) fn frame_end(presents: u64) {
         st.listing.clear();
     }
     if let Some(g) = st.gpus.first() {
-        if g.readback_ptr != 0 {
-            // SAFETY: our mapping, at least 16 bytes; the GPU writes it
-            // through a copy, and a torn or old value only skews a count.
-            let bytes = unsafe { std::ptr::read_volatile(g.readback_ptr as *const u32) } as u64;
-            LAST_BYTES.store(bytes, Relaxed);
-        }
+        LAST_BYTES.store(g.bytes, Relaxed);
     }
 }
 
@@ -777,17 +836,18 @@ pub(crate) fn device_destroying(device: *mut c_void) {
     st.cmds.clear();
 }
 
-/// The capture buffers of `device` when this frame's scene was captured
-/// (transform feedback began at least once since its depth was cleared):
-/// the triangles, the counter of bytes written and the capacity in bytes.
-pub(crate) fn frame_captured(device: usize) -> Option<(u64, u64, u64)> {
+/// This frame's capture on `device`, when anything was captured since our
+/// buffer was made: the buffer of triangles, the buffer whose first word
+/// the trace sets to the bytes written, the capacity in bytes, and the
+/// bytes this frame wrote so far.
+pub(crate) fn frame_captured(device: usize) -> Option<(u64, u64, u64, u64)> {
     let st = state();
-    st.gpus.iter().find(|g| g.device == device && g.started).map(|g| (g.xfb.buffer, g.counter.buffer, g.capacity))
+    st.gpus.iter().find(|g| g.device == device && g.started).map(|g| (g.xfb.buffer, g.counter.buffer, g.capacity, g.bytes))
 }
 
-/// The bytes the last frames captured, as last read back.
-pub(crate) fn last_bytes() -> u64 {
-    LAST_BYTES.load(Relaxed)
+/// The trace was recorded, for the frame's report.
+pub(crate) fn traced() {
+    state().frame_log.push("trace".into());
 }
 
 // ------------------------------------------------------------ devctl
@@ -798,7 +858,7 @@ pub(crate) fn stats_line() -> String {
     let bytes = LAST_BYTES.load(Relaxed);
     format!(
         "triangles={} capacity={} frames={} begins={} binds_captured={} binds_skipped={} draws_captured={} draws_skipped={} \
-         vs_instrumented={} vs_left={} pipelines_captured={} pipelines_skipped={}",
+         draws_overflowed={} vs_instrumented={} vs_coloured={} vs_left={} pipelines_captured={} pipelines_skipped={} frame={}",
         bytes / TRIANGLE_BYTES,
         capacity_triangles(),
         s.frames,
@@ -807,10 +867,13 @@ pub(crate) fn stats_line() -> String {
         s.binds_skipped,
         s.draws_captured,
         s.draws_skipped,
+        s.draws_overflowed,
         s.modules_instrumented,
+        s.modules_coloured,
         s.modules_left,
         s.pipelines_captured,
-        s.pipelines_skipped
+        s.pipelines_skipped,
+        st.last_log,
     )
 }
 
@@ -822,8 +885,9 @@ pub(crate) fn request_draws() -> Result<String, String> {
 }
 
 /// devctl `rt dump <path>`: the next frame's captured triangles, as a
-/// little-endian `u32` byte count and then that many bytes of clip-space
-/// positions (`vec4` per vertex, three per triangle).
+/// little-endian `u32` byte count and then that many bytes of vertices,
+/// three per triangle, each a clip-space position and a colour (`vec4`
+/// each; the colour (-1, -1, -1, -1) where the shader has none).
 pub(crate) fn dump(path: &str) -> Result<String, String> {
     if dump_dir().is_none() {
         return Err(format!("{DUMP_ENV}=<dir> at start is needed"));
@@ -844,13 +908,10 @@ pub(crate) fn dump(path: &str) -> Result<String, String> {
     }
     let st = state();
     let g = st.gpus.first().ok_or("no capture on any device")?;
-    // SAFETY: our mapping of `readback_size` bytes; the copies into it are
-    // done (six presents later), and a later frame's counter copy only
-    // changes the first word, read here first.
-    let (bytes, data) = unsafe {
-        let bytes = (std::ptr::read_volatile(g.readback_ptr as *const u32) as u64).min(g.capacity);
-        (bytes, std::slice::from_raw_parts((g.readback_ptr + 256) as *const u8, bytes as usize).to_vec())
-    };
+    let bytes = DUMPED_BYTES.load(Relaxed).min(g.capacity);
+    // SAFETY: our mapping of `readback_size` bytes; the copy into it is done
+    // (six presents later).
+    let data = unsafe { std::slice::from_raw_parts((g.readback_ptr + 256) as *const u8, bytes as usize).to_vec() };
     drop(st);
     let mut out = (bytes as u32).to_le_bytes().to_vec();
     out.extend_from_slice(&data);
@@ -1019,6 +1080,8 @@ fn make_gpu(device: usize) -> Result<Gpu, String> {
         readback_size,
         capacity,
         started: false,
+        frame: u64::MAX,
+        bytes: 0,
     };
     let made = (|| {
         g.xfb = make_buffer(&g.fns, d, &types, capacity, USAGE_XFB | USAGE_STORAGE | USAGE_TRANSFER_SRC | USAGE_TRANSFER_DST, false)?;
@@ -1057,3 +1120,23 @@ impl Gpu {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn what_a_draw_writes_is_counted_in_whole_triangles() {
+        // A list: whole triangles only.
+        assert_eq!(xfb_vertices(3, 36, 1), 36);
+        assert_eq!(xfb_vertices(3, 37, 2), 72);
+        // A strip and a fan: one triangle per vertex after the second.
+        assert_eq!(xfb_vertices(4, 4, 1), 6);
+        assert_eq!(xfb_vertices(5, 5, 3), 27);
+        assert_eq!(xfb_vertices(4, 1, 1), 0);
+        // Not triangles.
+        assert_eq!(xfb_vertices(1, 100, 1), 0);
+        // A vertex is a position and a colour.
+        assert_eq!(TRIANGLE_BYTES, 96);
+    }
+}

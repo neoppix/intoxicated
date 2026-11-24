@@ -919,13 +919,6 @@ fn pass_begun(watch: u32, pass: Pass) {
     }
 }
 
-/// After the begin of a pass has been forwarded.
-fn pass_started(watch: u32, cmd: *mut c_void) {
-    if watch & WATCH_RT != 0 {
-        crate::android::rt::capture::pass_started(cmd);
-    }
-}
-
 /// Before the end of a pass is forwarded.
 fn pass_ending(watch: u32, cmd: *mut c_void) {
     if watch & WATCH_RT != 0 {
@@ -954,9 +947,6 @@ extern "C" fn cmd_begin_render_pass(cmd: *mut c_void, begin: *const c_void, cont
     if let Some(f) = next::<extern "C" fn(*mut c_void, *const c_void, u32)>(&BEGIN_RENDER_PASS) {
         f(cmd, begin, contents);
     }
-    if w != 0 && !begin.is_null() {
-        pass_started(w, cmd);
-    }
 }
 
 extern "C" fn cmd_begin_render_pass2(cmd: *mut c_void, begin: *const c_void, subpass: *const c_void) {
@@ -969,9 +959,6 @@ extern "C" fn cmd_begin_render_pass2(cmd: *mut c_void, begin: *const c_void, sub
     }
     if let Some(f) = next::<extern "C" fn(*mut c_void, *const c_void, *const c_void)>(&BEGIN_RENDER_PASS2) {
         f(cmd, begin, subpass);
-    }
-    if w != 0 && !begin.is_null() {
-        pass_started(w, cmd);
     }
 }
 
@@ -1029,9 +1016,6 @@ extern "C" fn cmd_begin_rendering(cmd: *mut c_void, info: *const c_void) {
     }
     if let Some(f) = next::<extern "C" fn(*mut c_void, *const c_void)>(&BEGIN_RENDERING) {
         f(cmd, info);
-    }
-    if w != 0 && !info.is_null() {
-        pass_started(w, cmd);
     }
 }
 
