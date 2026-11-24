@@ -393,9 +393,11 @@ installer asks for the password through the app's own dialog (`sudo -A` with
 `SUDO_ASKPASS`). `ctest --test-dir settings/build` runs the app's self-test
 of its file handling, against scratch directories.
 
-## Status: early, but it plays
+## Status: playable
 
-Reason-304 is solved, so the client stays in the game. Sign-in, loading a game,
+Intoxicated is used for everyday play: full matches, long sessions and fast
+competitive games run start to finish. Reason-304 is solved, so the client
+stays in the game. Sign-in, loading a game,
 moving around, mouse and keyboard (including shift-lock, Ctrl+A/C/X/V and real
 clipboard), uncapped framerate, held-key input, and audio all work. Keys reach
 the game by their position on any keyboard layout, with any modifiers held
