@@ -316,16 +316,20 @@ such as the ceiling in a floor or players off screen in a wall. The screen-space
 What to know before turning it on:
 
 - While on it replaces the screen-space reflections entirely.
-- Off-screen hits have no textures yet: players and textured walls reflect
-  grey or in flat colours (the engine's base colour of each part, at the
-  brightness the screen shows such colours at on average).
+- A hit takes its own colour, as the engine's shader makes it: the part's
+  colour times its texture where the shader samples the texture at the
+  coordinates it is given (clothing and faces), else the part's flat colour,
+  at the brightness the screen shows such colours at on average.
+  `INTOXICATED_RT_SHADE=mix` blends in a quarter of the screen's colour where
+  the screen shows the hit, `screen` takes the screen's colour there (the
+  first way); devctl `rt shade own|mix|screen`.
 - Interface drawn in the world, such as leaderboards, name tags and trophy
   icons, does not reflect, nor do particles or transparent parts.
 - Reflections can flicker while the camera moves.
 - Objects the game has never drawn cannot appear; a static part that moved
   while out of view stays in the reflections at its old place until the view
   shows that place again, and players only come from the current frame.
-- It costs about 260 MB more video memory and about 1 ms more GPU time a
+- It costs about 400 MB more video memory and about 1 ms more GPU time a
   frame. Measured in Timebomb Duels at 1667x1349 on an RTX 4070 Ti: 0.2 to
   0.3 ms for the hierarchy and 0.5 to 0.7 ms for the rays (all of the
   reflections' work 0.9 to 1.3 ms, against 0.6 ms for the screen-space
@@ -339,8 +343,11 @@ What to know before turning it on:
   an RTX 4070 Ti with NVIDIA 620.70.06, in Timebomb Duels.
 
 devctl `rt on` and `rt off` switch it while the game runs (with
-`INTOXICATED_RT=1` at start), and `rt stats` reports the triangles, the
-measured camera, the cache and the GPU time.
+`INTOXICATED_RT=1` at start), `rt stats` reports the triangles, the textures,
+the measured camera, the cache and the GPU time, and `rt dump-cache <path>`
+writes the cached triangles out. A cached part is dropped only once the view
+has shown its place empty, with nothing drawn in front of it, for 8 frames in
+a row while the frame did not draw it.
 
 ## Intoxicated Settings
 

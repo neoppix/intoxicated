@@ -1142,12 +1142,12 @@ void setRtOn(SettingsConf &conf, bool on) { setEffectOn(kRtSetting, conf, on); }
 QStringList rtWarnings() {
     return {
         QStringLiteral("While on it replaces the screen-space reflections; their look and fine tuning still apply."),
-        QStringLiteral("Off-screen hits have no textures yet: players and textured walls reflect grey or in flat "
-                       "colours."),
+        QStringLiteral("Off-screen hits show textures only where the game samples them plainly (clothing); other "
+                       "textured walls and parts reflect in flat colours."),
         QStringLiteral("Interface drawn in the world, such as leaderboards and name tags, does not reflect."),
         QStringLiteral("Reflections can flicker while the camera moves."),
         QStringLiteral("Objects the game has never drawn cannot appear in a reflection."),
-        QStringLiteral("Uses about 260 MB more video memory and about 1 ms more GPU time a frame."),
+        QStringLiteral("Uses about 400 MB more video memory and about 1 ms more GPU time a frame."),
         QStringLiteral("Runs as compute on the shader cores, because NVIDIA's FreeBSD driver has no hardware ray "
                        "tracing."),
         QStringLiteral("May crash or misbehave on other GPUs and drivers: only tested on an RTX 4070 Ti with NVIDIA "

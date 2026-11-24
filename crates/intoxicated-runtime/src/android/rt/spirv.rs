@@ -87,15 +87,21 @@ const CAPABILITY_TRANSFORM_FEEDBACK: u32 = 53;
 const STORAGE_INPUT: u32 = 1;
 const STORAGE_OUTPUT: u32 = 3;
 pub(crate) const MODEL_VERTEX: u32 = 0;
+const MODEL_FRAGMENT: u32 = 4;
 
 /// Bytes per captured vertex: the clip-space position, the colour, the
 /// camera vector, the world position.
-pub(crate) const STRIDE: u32 = 64;
+pub(crate) const STRIDE: u32 = 80;
 /// Where the colour, the camera vector and the world position are in a
 /// captured vertex.
 pub(crate) const COLOUR_OFFSET: u32 = 16;
 pub(crate) const CAMERA_OFFSET: u32 = 32;
 pub(crate) const WORLD_OFFSET: u32 = 48;
+/// Where the texture coordinates are (when the shader has them).
+pub(crate) const UV_OFFSET: u32 = 64;
+/// The vertex input the engine's shaders take their texture coordinates
+/// from.
+const UV_INPUT_LOCATION: u32 = 4;
 /// Output locations a vertex shader can use on the GPUs this runs on
 /// (`maxVertexOutputComponents` 128 on NVIDIA).
 const OUTPUT_LOCATIONS: u32 = 32;
@@ -265,7 +271,11 @@ pub(crate) fn instrument_vertex(words: &[u32]) -> Result<Vec<u32>, &'static str>
     globals.push(op(OP_VARIABLE, &[pointer, world_out, STORAGE_OUTPUT]));
     let world4 = new_id();
     decorations.push(op(OP_DECORATE, &[world_out, DECORATION_LOCATION, location]));
-    for (v, offset) in [(colour, COLOUR_OFFSET), (camera.output, CAMERA_OFFSET), (world_out, WORLD_OFFSET)] {
+    let mut captured = vec![(colour, COLOUR_OFFSET), (camera.output, CAMERA_OFFSET), (world_out, WORLD_OFFSET)];
+    if let Some(uv) = uv_output(words, &list, &flow) {
+        captured.push((uv.1, UV_OFFSET));
+    }
+    for (v, offset) in captured {
         decorations.push(op(OP_DECORATE, &[v, DECORATION_XFB_BUFFER, 0]));
         decorations.push(op(OP_DECORATE, &[v, DECORATION_XFB_STRIDE, STRIDE]));
         decorations.push(op(OP_DECORATE, &[v, DECORATION_OFFSET, offset]));
@@ -486,6 +496,166 @@ fn colour_output(words: &[u32], list: &[Inst], flow: &Flow) -> Option<u32> {
         .into_iter()
         .find(|&(_, v)| flow.stores.get(&v).is_some_and(|s| s.iter().any(|&x| !flow.memories(x).is_disjoint(&inputs))))
         .map(|(_, v)| v)
+}
+
+/// The shader's texture coordinate output: the `vec2` float output of the
+/// lowest location whose value depends on the vertex input at
+/// [`UV_INPUT_LOCATION`]: (location, variable).
+fn uv_output(words: &[u32], list: &[Inst], flow: &Flow) -> Option<(u32, u32)> {
+    let (float, _, _) = float_types(words, list)?;
+    let vec2 = list
+        .iter()
+        .find(|i| i.op == OP_TYPE_VECTOR && i.len >= 4 && words[i.at + 2] == float && words[i.at + 3] == 2)
+        .map(|i| words[i.at + 1])?;
+    let inputs = flow.inputs_at(UV_INPUT_LOCATION);
+    if inputs.is_empty() {
+        return None;
+    }
+    flow.outputs_of(Some(vec2))
+        .into_iter()
+        .find(|&(_, v)| flow.stores.get(&v).is_some_and(|s| s.iter().any(|&x| !flow.memories(x).is_disjoint(&inputs))))
+}
+
+/// What the capture keeps of a vertex shader it instrumented: the locations
+/// of the outputs the fragment shader reads its colour and texture
+/// coordinates at.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct VertexInfo {
+    pub colour: u32,
+    pub uv: Option<u32>,
+}
+
+pub(crate) fn vertex_info(words: &[u32]) -> Option<VertexInfo> {
+    let list = instructions(words).ok()?;
+    let flow = Flow::new(words, &list);
+    let colour = colour_output(words, &list, &flow)?;
+    Some(VertexInfo { colour: *flow.loc.get(&colour)?, uv: uv_output(words, &list, &flow).map(|(l, _)| l) })
+}
+
+/// How a fragment shader takes its base colour: a texture (by descriptor set
+/// and binding) sampled at the texture coordinates of one input location,
+/// multiplied with the colour of another; `scalar` when only one channel of
+/// the texture is (a grey detail texture, applied twice over: the engine's
+/// parts take `colour * texture.x * 2`), else the colour times all three.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Albedo {
+    pub set: u32,
+    pub binding: u32,
+    pub uv: u32,
+    pub colour: u32,
+    pub scalar: bool,
+}
+
+const OP_SAMPLED_IMAGE: u16 = 86;
+const OP_IMAGE_SAMPLE_IMPLICIT_LOD: u16 = 87;
+const OP_IMAGE_SAMPLE_EXPLICIT_LOD: u16 = 88;
+const OP_VECTOR_TIMES_SCALAR: u16 = 142;
+const OP_F_MUL: u16 = 133;
+const DECORATION_BINDING: u32 = 33;
+const DECORATION_DESCRIPTOR_SET: u32 = 34;
+const STORAGE_UNIFORM_CONSTANT: u32 = 0;
+
+/// The base colour of a fragment shader, when it is a texture sampled at an
+/// input's coordinates as they come (not scaled or offset), times another
+/// input: see [`Albedo`]. The first such product in the module.
+pub(crate) fn fragment_albedo(words: &[u32]) -> Option<Albedo> {
+    let list = instructions(words).ok()?;
+    if !list.iter().any(|i| i.op == OP_ENTRY_POINT && i.len >= 3 && words[i.at + 1] == MODEL_FRAGMENT) {
+        return None;
+    }
+    let flow = Flow::new(words, &list);
+    let decoration = |id: u32, what: u32| {
+        list.iter()
+            .find(|i| i.op == OP_DECORATE && i.len >= 4 && words[i.at + 1] == id && words[i.at + 2] == what)
+            .map(|i| words[i.at + 3])
+    };
+    let type_of = |id: u32| list.iter().find(|i| i.len >= 3 && words[i.at + 2] == id).map(|i| (i.op, words[i.at + 1]));
+    let float = list.iter().find(|i| i.op == OP_TYPE_FLOAT && i.len >= 3 && words[i.at + 2] == 32).map(|i| words[i.at + 1])?;
+    let uniform_constant: HashSet<u32> = list
+        .iter()
+        .filter(|i| i.op == OP_VARIABLE && i.len >= 4 && words[i.at + 3] == STORAGE_UNIFORM_CONSTANT)
+        .map(|i| words[i.at + 2])
+        .collect();
+    // The input location a value is loaded straight from, or picked from
+    // such a load (a swizzle or one component of it).
+    let input_of = |id: u32| {
+        let mut id = id;
+        for _ in 0..4 {
+            match flow.defs.get(&id) {
+                Some((OP_VECTOR_SHUFFLE | OP_COMPOSITE_EXTRACT, x)) if !x.is_empty() => id = x[0],
+                Some((OP_LOAD, x)) if !x.is_empty() => {
+                    return flow
+                        .vars
+                        .iter()
+                        .find(|v| v.0 == x[0] && v.2 == STORAGE_INPUT)
+                        .and_then(|v| flow.loc.get(&v.0).copied());
+                }
+                _ => return None,
+            }
+        }
+        None
+    };
+    // The texture variable a sampled image comes from.
+    let texture_of = |id: u32| {
+        let load = match flow.defs.get(&id) {
+            Some((OP_SAMPLED_IMAGE, x)) if !x.is_empty() => x[0],
+            _ => id,
+        };
+        match flow.defs.get(&load) {
+            Some((OP_LOAD, x)) if !x.is_empty() && uniform_constant.contains(&x[0]) => Some(x[0]),
+            _ => None,
+        }
+    };
+    // Every value that depends on `start`, by walking forward is costly; so
+    // each product's operands are walked back instead.
+    let reaches = |from: u32, target: u32| {
+        let mut seen = HashSet::new();
+        let mut todo = vec![from];
+        while let Some(v) = todo.pop() {
+            if v == target {
+                return true;
+            }
+            if !seen.insert(v) || seen.len() > 64 {
+                continue;
+            }
+            if let Some(d) = flow.deps.get(&v) {
+                todo.extend(d.iter().filter_map(|s| match s {
+                    Source::Value(x) => Some(*x),
+                    Source::Memory(_) => None,
+                }));
+            }
+        }
+        false
+    };
+    let samples: Vec<(u32, u32, u32)> = list
+        .iter()
+        .filter(|i| matches!(i.op, OP_IMAGE_SAMPLE_IMPLICIT_LOD | OP_IMAGE_SAMPLE_EXPLICIT_LOD) && i.len >= 5)
+        .filter_map(|i| {
+            let (result, image, coord) = (words[i.at + 2], words[i.at + 3], words[i.at + 4]);
+            Some((result, texture_of(image)?, input_of(coord)?))
+        })
+        .collect();
+    for i in list.iter().filter(|i| matches!(i.op, OP_F_MUL | OP_VECTOR_TIMES_SCALAR) && i.len >= 5) {
+        let (a, b) = (words[i.at + 3], words[i.at + 4]);
+        for &(sample, texture, uv) in &samples {
+            for (tex_side, other) in [(a, b), (b, a)] {
+                if !reaches(tex_side, sample) {
+                    continue;
+                }
+                // The other side: an input's colour, as it comes.
+                let Some(colour) = input_of(other) else { continue };
+                let scalar = type_of(tex_side).is_some_and(|(_, t)| t == float);
+                return Some(Albedo {
+                    set: decoration(texture, DECORATION_DESCRIPTOR_SET).unwrap_or(0),
+                    binding: decoration(texture, DECORATION_BINDING)?,
+                    uv,
+                    colour,
+                    scalar,
+                });
+            }
+        }
+    }
+    None
 }
 
 /// The shader's camera vector output: a `vec3` output that is, or a `vec4`
@@ -733,6 +903,20 @@ mod tests {
             }
         }
         assert_eq!(instrument_vertex(&moved), Err("no camera vector output (not lit world geometry)"));
+    }
+
+    #[test]
+    fn a_fragment_shader_s_base_colour_texture_is_found() {
+        const FS: &[u32] = include!("test_fs.spv.rs");
+        const DETAIL: &[u32] = include!("test_fs_detail.spv.rs");
+        const SCALED: &[u32] = include!("test_fs_scaled.spv.rs");
+        assert_eq!(fragment_albedo(FS), Some(Albedo { set: 0, binding: 3, uv: 0, colour: 1, scalar: false }));
+        assert_eq!(fragment_albedo(DETAIL), Some(Albedo { set: 0, binding: 3, uv: 0, colour: 1, scalar: true }));
+        assert_eq!(fragment_albedo(SCALED), None, "scaled coordinates are not followed");
+        assert_eq!(fragment_albedo(VS), None, "a vertex shader has none");
+        // The test vertex shader passes its colour at 1 and has no texture
+        // coordinates.
+        assert_eq!(vertex_info(VS), Some(VertexInfo { colour: 1, uv: None }));
     }
 
     #[test]

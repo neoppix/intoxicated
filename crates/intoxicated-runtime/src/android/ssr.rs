@@ -2202,7 +2202,10 @@ fn record(
         // reflection at all, the march's pass run with no strength so that
         // it writes nothing but zeros. See `rt::trace`.
         let rt_only = super::rt::requested() && super::rt::trace::is_on();
-        let rt_params = Params { flags: p.flags | if g.opaque_at == presents { FLAG_OPAQUE } else { 0 }, ..*p };
+        let rt_params = Params {
+            flags: p.flags | if g.opaque_at == presents { FLAG_OPAQUE } else { 0 } | super::rt::trace::shade_flags(),
+            ..*p
+        };
         let traced = rt_only
             && super::rt::trace::record(cmd, g.device, g.set_layout, set, &rt_params, [w, h], g.period_ns, g.timestamp_mask)
                 .unwrap_or_else(|why| {

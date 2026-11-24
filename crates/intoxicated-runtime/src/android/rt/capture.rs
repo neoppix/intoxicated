@@ -111,11 +111,19 @@ const MEMORY_DEVICE_LOCAL: u32 = 0x1;
 const CONTENTS_SECONDARY: u32 = 1;
 const BIND_POINT_GRAPHICS: u32 = 0;
 
+/// Texture serials: the low 30 bits of a draw's code; its top two say how
+/// the texture combines with the colour (see `spirv::Albedo`).
+pub(crate) const SERIAL_MASK: u32 = (1 << 30) - 1;
+pub(crate) const MODE_COLOUR: u32 = 1 << 30;
+pub(crate) const MODE_DETAIL: u32 = 2 << 30;
+/// Base colour textures a frame can use.
+pub(crate) const MAX_TEXTURES: usize = 256;
+
 /// Bytes per captured triangle.
 pub(crate) const TRIANGLE_BYTES: u64 = 3 * spirv::STRIDE as u64;
 
 /// The triangles our buffer holds, unless `INTOXICATED_RT_TRIANGLES` says
-/// (96 MiB; Timebomb Duels draws 60000 to 180000 a frame in its lobby).
+/// (120 MiB; Timebomb Duels draws 30000 to 180000 a frame).
 const DEFAULT_TRIANGLES: u64 = 1 << 19;
 
 pub const DUMP_ENV: &str = "INTOXICATED_RT_DUMP";
@@ -163,6 +171,10 @@ struct Module {
     hash: u64,
     vertex: bool,
     instrumented: bool,
+    /// A vertex shader's colour and texture coordinate output locations.
+    outputs: Option<spirv::VertexInfo>,
+    /// A fragment shader's base colour texture.
+    albedo: Option<spirv::Albedo>,
 }
 
 #[derive(Clone, Debug)]
@@ -174,6 +186,12 @@ pub(crate) struct Pipeline {
     pub topology: u32,
     /// The scissor fixed in the pipeline, if it is not dynamic.
     pub scissor: Option<[i32; 4]>,
+    /// The base colour texture's descriptor set and binding, and whether it
+    /// is a grey detail texture (see `spirv::Albedo`), when the fragment
+    /// shader samples it at the texture coordinates the vertex shader
+    /// passes on and multiplies it with the colour it passes on, both of
+    /// which are captured.
+    pub albedo: Option<(u32, u32, bool)>,
 }
 
 /// One command buffer's recording, as far as capture goes.
@@ -196,6 +214,10 @@ struct Cmd {
     listing: bool,
     /// The scene passes of this frame copy our buffer out for `rt dump`.
     dumping: bool,
+    /// The graphics descriptor sets bound, by set number, and what was
+    /// pushed: (set, binding) to (image view, layout).
+    sets: [u64; 8],
+    pushed: HashMap<(u32, u32), (u64, u32)>,
 }
 
 /// Our objects on one device.
@@ -214,6 +236,10 @@ struct Gpu {
     frame: u64,
     /// The bytes this frame's draws write, as counted when recorded.
     bytes: u64,
+    /// This frame's base colour textures: (first triangle, serial and mode)
+    /// each time it changes, and the views (serial, view, layout).
+    draws: Vec<[u32; 2]>,
+    textures: Vec<(u32, u64, u32)>,
     /// A draw to capture found no room this frame.
     overflowed: bool,
 }
@@ -236,6 +262,8 @@ pub(crate) struct Stats {
     pub draws_overflowed: u64,
     /// Skipped because a scissor smaller than the pass cut them.
     pub draws_clipped: u64,
+    /// Captured with their base colour texture known.
+    pub draws_textured: u64,
     pub modules_instrumented: u64,
     pub modules_left: u64,
     pub pipelines_captured: u64,
@@ -258,6 +286,16 @@ struct State {
     frame_log: Vec<String>,
     last_log: String,
     reported: std::collections::HashSet<String>,
+    /// Descriptor sets the engine wrote: set to binding to (image view,
+    /// layout), for the images it samples.
+    set_views: HashMap<u64, HashMap<u32, (u64, u32)>>,
+    /// Its update templates: the image entries (binding, offset, stride),
+    /// and the set number of a push template.
+    templates: HashMap<u64, (Vec<(u32, usize)>, u32)>,
+    /// A number for each image view a captured draw used, kept while the
+    /// view lives, so cached triangles can name their texture.
+    view_serials: HashMap<u64, u32>,
+    next_serial: u32,
 }
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
@@ -292,6 +330,13 @@ static DESTROY_SHADER_MODULE: AtomicUsize = AtomicUsize::new(0);
 static CREATE_GRAPHICS_PIPELINES: AtomicUsize = AtomicUsize::new(0);
 static DESTROY_PIPELINE: AtomicUsize = AtomicUsize::new(0);
 static CMD_SET_SCISSOR: AtomicUsize = AtomicUsize::new(0);
+static UPDATE_SETS: AtomicUsize = AtomicUsize::new(0);
+static CREATE_TEMPLATE: AtomicUsize = AtomicUsize::new(0);
+static UPDATE_WITH_TEMPLATE: AtomicUsize = AtomicUsize::new(0);
+static CMD_BIND_SETS: AtomicUsize = AtomicUsize::new(0);
+static CMD_PUSH: AtomicUsize = AtomicUsize::new(0);
+static CMD_PUSH_TEMPLATE: AtomicUsize = AtomicUsize::new(0);
+static DESTROY_VIEW: AtomicUsize = AtomicUsize::new(0);
 
 fn next<F: Copy>(slot: &AtomicUsize) -> Option<F> {
     let p = slot.load(Relaxed);
@@ -313,6 +358,17 @@ pub(crate) fn hook(name: &[u8], next: *mut c_void) -> *mut c_void {
         b"vkCreateGraphicsPipelines" => (&CREATE_GRAPHICS_PIPELINES, create_graphics_pipelines as *const ()),
         b"vkDestroyPipeline" => (&DESTROY_PIPELINE, destroy_pipeline as *const ()),
         b"vkCmdSetScissor" => (&CMD_SET_SCISSOR, cmd_set_scissor as *const ()),
+        b"vkUpdateDescriptorSets" => (&UPDATE_SETS, update_sets as *const ()),
+        b"vkCreateDescriptorUpdateTemplate" | b"vkCreateDescriptorUpdateTemplateKHR" => {
+            (&CREATE_TEMPLATE, create_template as *const ())
+        }
+        b"vkUpdateDescriptorSetWithTemplate" | b"vkUpdateDescriptorSetWithTemplateKHR" => {
+            (&UPDATE_WITH_TEMPLATE, update_with_template as *const ())
+        }
+        b"vkCmdBindDescriptorSets" => (&CMD_BIND_SETS, cmd_bind_sets as *const ()),
+        b"vkCmdPushDescriptorSetKHR" => (&CMD_PUSH, cmd_push as *const ()),
+        b"vkCmdPushDescriptorSetWithTemplateKHR" => (&CMD_PUSH_TEMPLATE, cmd_push_template as *const ()),
+        b"vkDestroyImageView" => (&DESTROY_VIEW, destroy_view as *const ()),
         _ => return next,
     };
     slot.store(next as usize, Relaxed);
@@ -386,7 +442,9 @@ extern "C" fn create_shader_module(device: *mut c_void, info: *const c_void, all
                 st.once(format!("a vertex shader is not captured: {why} (said once per reason)"));
             }
         }
-        st.modules.insert((device as usize, handle), Module { hash, vertex, instrumented: done });
+        let outputs = if done { spirv::vertex_info(words) } else { None };
+        let albedo = if !vertex && xfb { spirv::fragment_albedo(words) } else { None };
+        st.modules.insert((device as usize, handle), Module { hash, vertex, instrumented: done, outputs, albedo });
     }
     rc
 }
@@ -415,7 +473,8 @@ unsafe fn is_dynamic(dynamic: *const c_void, which: &[u32]) -> bool {
 /// # Safety
 /// `info` must be a valid `VkGraphicsPipelineCreateInfo`.
 unsafe fn describe_pipeline(info: *const c_void, device: usize, modules: &HashMap<(usize, u64), Module>) -> Pipeline {
-    let mut p = Pipeline { vs: 0, fs: 0, capture: Ok(()), topology: u32::MAX, scissor: None };
+    let mut p = Pipeline { vs: 0, fs: 0, capture: Ok(()), topology: u32::MAX, scissor: None, albedo: None };
+    let mut fragment = None;
     let fail = |p: &mut Pipeline, why: &'static str| {
         if p.capture.is_ok() {
             p.capture = Err(why);
@@ -438,9 +497,19 @@ unsafe fn describe_pipeline(info: *const c_void, device: usize, modules: &HashMa
                 p.vs = m.map_or(0, |m| m.hash);
                 vertex = Some(m.copied());
             }
-            0x10 => p.fs = m.map_or(0, |m| m.hash),
+            0x10 => {
+                p.fs = m.map_or(0, |m| m.hash);
+                fragment = m.and_then(|m| m.albedo);
+            }
             s if s & (STAGE_TESSELLATION | STAGE_GEOMETRY) != 0 => fail(&mut p, "a tessellation or geometry stage"),
             _ => {}
+        }
+    }
+    if let (Some(Some(v)), Some(a)) = (vertex, fragment) {
+        if let Some(o) = v.outputs {
+            if o.colour == a.colour && o.uv == Some(a.uv) {
+                p.albedo = Some((a.set, a.binding, a.scalar));
+            }
         }
     }
     match vertex {
@@ -561,6 +630,204 @@ extern "C" fn create_graphics_pipelines(
     rc
 }
 
+// ------------------------------------------------------------ textures
+//
+// Which image each captured draw samples as its base colour: the engine's
+// descriptor writes (sets, update templates, pushed descriptors) are noted
+// as they pass, and at a draw the pipeline's base colour binding is looked
+// up in what is bound. Only combined image samplers and sampled images, and
+// only element 0 of a binding.
+
+const DESCRIPTOR_COMBINED_IMAGE_SAMPLER: u32 = 1;
+const DESCRIPTOR_SAMPLED_IMAGE: u32 = 2;
+
+/// The (binding, view, layout) of each image in `count` `VkWriteDescriptorSet`
+/// (72 bytes each) for a set.
+///
+/// # Safety
+/// `writes` must be `count` valid `VkWriteDescriptorSet`.
+unsafe fn image_writes(count: u32, writes: *const u8) -> Vec<(u64, u32, u64, u32)> {
+    let mut out = Vec::new();
+    if writes.is_null() {
+        return out;
+    }
+    for i in 0..count as usize {
+        let w = writes.add(i * 72) as *const c_void;
+        let (set, binding, element, n, kind, images): (u64, u32, u32, u32, u32, *const u8) =
+            (get(w, 16), get(w, 24), get(w, 28), get(w, 32), get(w, 36), get(w, 40));
+        if element != 0 || n == 0 || images.is_null() || !matches!(kind, DESCRIPTOR_COMBINED_IMAGE_SAMPLER | DESCRIPTOR_SAMPLED_IMAGE) {
+            continue;
+        }
+        // `VkDescriptorImageInfo`: sampler, view, layout.
+        let (view, layout): (u64, u32) = (get(images as *const c_void, 8), get(images as *const c_void, 16));
+        out.push((set, binding, view, layout));
+    }
+    out
+}
+
+/// The (binding, view, layout) a template writes from `data`.
+///
+/// # Safety
+/// `data` must be what the engine passes with this template.
+unsafe fn template_images(entries: &[(u32, usize)], data: *const u8) -> Vec<(u32, u64, u32)> {
+    if data.is_null() {
+        return Vec::new();
+    }
+    entries
+        .iter()
+        .map(|&(binding, offset)| {
+            let info = data.add(offset) as *const c_void;
+            (binding, get::<u64>(info, 8), get::<u32>(info, 16))
+        })
+        .collect()
+}
+
+extern "C" fn update_sets(device: *mut c_void, count: u32, writes: *const u8, copies: u32, copy_list: *const c_void) {
+    // SAFETY: the engine's own array, read during its call.
+    let found = unsafe { image_writes(count, writes) };
+    if !found.is_empty() {
+        let mut st = state();
+        for (set, binding, view, layout) in found {
+            st.set_views.entry(set).or_default().insert(binding, (view, layout));
+        }
+    }
+    if let Some(f) = next::<extern "C" fn(*mut c_void, u32, *const u8, u32, *const c_void)>(&UPDATE_SETS) {
+        f(device, count, writes, copies, copy_list);
+    }
+}
+
+extern "C" fn create_template(device: *mut c_void, info: *const c_void, alloc: *const c_void, out: *mut u64) -> i32 {
+    let Some(f) = next::<CreateFn>(&CREATE_TEMPLATE) else { return VK_ERROR_INITIALIZATION_FAILED };
+    let rc = f(device, info, alloc, out);
+    if rc == VK_SUCCESS && !info.is_null() && !out.is_null() {
+        // SAFETY: `VkDescriptorUpdateTemplateCreateInfo`: entryCount 20,
+        // pEntries 24, set 64; each entry (32 bytes) binding 0, arrayElement
+        // 4, count 8, type 12, offset 16, stride 24.
+        let (entries, set) = unsafe {
+            let (n, list, set): (u32, *const u8, u32) = (get(info, 20), get(info, 24), get(info, 64));
+            let mut e = Vec::new();
+            for i in 0..if list.is_null() { 0 } else { n as usize } {
+                let x = list.add(i * 32) as *const c_void;
+                let (binding, element, count, kind, offset): (u32, u32, u32, u32, usize) =
+                    (get(x, 0), get(x, 4), get(x, 8), get(x, 12), get(x, 16));
+                if element == 0 && count > 0 && matches!(kind, DESCRIPTOR_COMBINED_IMAGE_SAMPLER | DESCRIPTOR_SAMPLED_IMAGE) {
+                    e.push((binding, offset));
+                }
+            }
+            (e, set)
+        };
+        // SAFETY: success means the driver wrote the handle.
+        let handle = unsafe { *out };
+        state().templates.insert(handle, (entries, set));
+    }
+    rc
+}
+
+extern "C" fn update_with_template(device: *mut c_void, set: u64, template: u64, data: *const u8) {
+    {
+        let mut st = state();
+        if let Some((entries, _)) = st.templates.get(&template) {
+            // SAFETY: the engine's data for this template, read during its call.
+            let found = unsafe { template_images(entries, data) };
+            let views = st.set_views.entry(set).or_default();
+            for (binding, view, layout) in found {
+                views.insert(binding, (view, layout));
+            }
+        }
+    }
+    if let Some(f) = next::<extern "C" fn(*mut c_void, u64, u64, *const u8)>(&UPDATE_WITH_TEMPLATE) {
+        f(device, set, template, data);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+extern "C" fn cmd_bind_sets(
+    cmd: *mut c_void,
+    bind_point: u32,
+    layout: u64,
+    first: u32,
+    count: u32,
+    sets: *const u64,
+    dynamic_count: u32,
+    dynamic: *const u32,
+) {
+    if bind_point == BIND_POINT_GRAPHICS && !sets.is_null() {
+        let mut st = state();
+        if let Some(c) = st.cmds.get_mut(&(cmd as usize)) {
+            for i in 0..count {
+                if let Some(slot) = c.sets.get_mut((first + i) as usize) {
+                    // SAFETY: the engine's array of `count` sets.
+                    *slot = unsafe { *sets.add(i as usize) };
+                }
+            }
+        }
+    }
+    if let Some(f) = next::<extern "C" fn(*mut c_void, u32, u64, u32, u32, *const u64, u32, *const u32)>(&CMD_BIND_SETS) {
+        f(cmd, bind_point, layout, first, count, sets, dynamic_count, dynamic);
+    }
+}
+
+extern "C" fn cmd_push(cmd: *mut c_void, bind_point: u32, layout: u64, set: u32, count: u32, writes: *const u8) {
+    if bind_point == BIND_POINT_GRAPHICS {
+        // SAFETY: the engine's own array, read during its call.
+        let found = unsafe { image_writes(count, writes) };
+        let mut st = state();
+        if let Some(c) = st.cmds.get_mut(&(cmd as usize)) {
+            for (_, binding, view, layout) in found {
+                c.pushed.insert((set, binding), (view, layout));
+            }
+        }
+    }
+    if let Some(f) = next::<extern "C" fn(*mut c_void, u32, u64, u32, u32, *const u8)>(&CMD_PUSH) {
+        f(cmd, bind_point, layout, set, count, writes);
+    }
+}
+
+extern "C" fn cmd_push_template(cmd: *mut c_void, template: u64, layout: u64, set: u32, data: *const u8) {
+    {
+        let mut st = state();
+        if let Some((entries, _)) = st.templates.get(&template) {
+            // SAFETY: the engine's data for this template, read during its call.
+            let found = unsafe { template_images(entries, data) };
+            if let Some(c) = st.cmds.get_mut(&(cmd as usize)) {
+                for (binding, view, layout) in found {
+                    c.pushed.insert((set, binding), (view, layout));
+                }
+            }
+        }
+    }
+    if let Some(f) = next::<extern "C" fn(*mut c_void, u64, u64, u32, *const u8)>(&CMD_PUSH_TEMPLATE) {
+        f(cmd, template, layout, set, data);
+    }
+}
+
+extern "C" fn destroy_view(device: *mut c_void, view: u64, alloc: *const c_void) {
+    {
+        let mut st = state();
+        st.view_serials.remove(&view);
+        for views in st.set_views.values_mut() {
+            views.retain(|_, v| v.0 != view);
+        }
+        for c in st.cmds.values_mut() {
+            c.pushed.retain(|_, v| v.0 != view);
+        }
+    }
+    if let Some(f) = next::<DestroyFn>(&DESTROY_VIEW) {
+        f(device, view, alloc);
+    }
+}
+
+/// The base colour texture a draw in `c` with pipeline `p` samples:
+/// (view, layout, grey detail texture).
+fn draw_texture(st: &State, c: &Cmd, p: &Pipeline) -> Option<(u64, u32, bool)> {
+    let (set, binding, scalar) = p.albedo?;
+    let (view, layout) = match c.pushed.get(&(set, binding)) {
+        Some(&v) => v,
+        None => *st.set_views.get(c.sets.get(set as usize)?)?.get(&binding)?,
+    };
+    (view != 0).then_some((view, layout, scalar))
+}
+
 /// `vkCmdSetScissor`: the first rectangle, for the capture's test of a
 /// clipped draw.
 extern "C" fn cmd_set_scissor(cmd: *mut c_void, first: u32, count: u32, rects: *const [i32; 4]) {
@@ -659,6 +926,8 @@ pub(crate) fn pass_beginning(pass: &Pass) {
     if starts {
         g.bytes = 0;
         g.overflowed = false;
+        g.draws.clear();
+        g.textures.clear();
         g.frame = presents;
         st.stats.frames += 1;
         st.frame_log.clear();
@@ -845,9 +1114,37 @@ pub(crate) fn drew(cmd: *mut c_void, kind: &'static str, count: u32, instances: 
                         c.active = true;
                     }
                 }
+                // The draw's base colour texture, numbered, from its first
+                // triangle on.
+                let texture = st.cmds.get(&(cmd as usize)).zip(p.as_ref()).and_then(|(c, p)| draw_texture(&st, c, p));
+                let code = match texture {
+                    Some((view, layout, scalar)) => {
+                        let serial = match st.view_serials.get(&view) {
+                            Some(&n) => n,
+                            None => {
+                                st.next_serial = (st.next_serial + 1) & SERIAL_MASK;
+                                let n = st.next_serial.max(1);
+                                st.view_serials.insert(view, n);
+                                n
+                            }
+                        };
+                        let g = st.gpus.iter_mut().find(|g| g.device == device).expect("found above");
+                        if !g.textures.iter().any(|t| t.0 == serial) && g.textures.len() < MAX_TEXTURES {
+                            g.textures.push((serial, view, layout));
+                        }
+                        serial | if scalar { MODE_DETAIL } else { MODE_COLOUR }
+                    }
+                    None => 0,
+                };
                 let g = st.gpus.iter_mut().find(|g| g.device == device).expect("found above");
+                if g.draws.last().map_or(0, |d| d[1]) != code {
+                    g.draws.push([(g.bytes / TRIANGLE_BYTES) as u32, code]);
+                }
                 g.bytes += bytes;
                 st.stats.draws_captured += 1;
+                if code != 0 {
+                    st.stats.draws_textured += 1;
+                }
             }
             (Some(_), Some(_)) => {
                 // No room left this frame.
@@ -947,6 +1244,13 @@ pub(crate) fn frame_captured(device: usize) -> Option<Captured> {
     })
 }
 
+/// This frame's base colour textures on `device`: the draws' codes by first
+/// triangle and the views.
+pub(crate) fn frame_textures(device: usize) -> (Vec<[u32; 2]>, Vec<(u32, u64, u32)>) {
+    let st = state();
+    st.gpus.iter().find(|g| g.device == device).map_or((Vec::new(), Vec::new()), |g| (g.draws.clone(), g.textures.clone()))
+}
+
 /// This frame's capture on one device.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Captured {
@@ -971,7 +1275,7 @@ pub(crate) fn stats_line() -> String {
     let bytes = LAST_BYTES.load(Relaxed);
     format!(
         "triangles={} capacity={} frames={} begins={} binds_captured={} binds_skipped={} draws_captured={} draws_skipped={} \
-         draws_overflowed={} draws_clipped={} vs_instrumented={} vs_left={} pipelines_captured={} pipelines_skipped={} frame={}",
+         draws_overflowed={} draws_clipped={} draws_textured={} textures={} vs_instrumented={} vs_left={} pipelines_captured={} pipelines_skipped={} frame={}",
         bytes / TRIANGLE_BYTES,
         capacity_triangles(),
         s.frames,
@@ -982,6 +1286,8 @@ pub(crate) fn stats_line() -> String {
         s.draws_skipped,
         s.draws_overflowed,
         s.draws_clipped,
+        s.draws_textured,
+        st.gpus.first().map_or(0, |g| g.textures.len()),
         s.modules_instrumented,
         s.modules_left,
         s.pipelines_captured,
@@ -1195,6 +1501,8 @@ fn make_gpu(device: usize) -> Result<Gpu, String> {
         frame: u64::MAX,
         bytes: 0,
         overflowed: false,
+        draws: Vec::new(),
+        textures: Vec::new(),
     };
     let made = (|| {
         g.xfb = make_buffer(&g.fns, d, &types, capacity, USAGE_XFB | USAGE_STORAGE | USAGE_TRANSFER_SRC | USAGE_TRANSFER_DST, false)?;
@@ -1253,8 +1561,8 @@ mod tests {
         assert!(covers([-10, 0, 4000, 4000], [1667, 1349]));
         assert!(!covers([100, 0, 1567, 1349], [1667, 1349]));
         assert!(!covers([0, 0, 1667, 1000], [1667, 1349]));
-        // A vertex is a position, a colour, a camera vector and a world
-        // position.
-        assert_eq!(TRIANGLE_BYTES, 192);
+        // A vertex is a position, a colour, a camera vector, a world
+        // position and texture coordinates.
+        assert_eq!(TRIANGLE_BYTES, 240);
     }
 }

@@ -40,8 +40,8 @@ pub const ENV: &str = "INTOXICATED_RT";
 
 /// What is said once when the switch is on, and in `rt stats`.
 pub const WARNING: &str = "ray-traced reflections are experimental: they replace the screen-space ones, \
-off-screen hits have no textures, in-world interface does not reflect, they can flicker while the camera moves, \
-they cost about 260 MB of video memory and about 1 ms of GPU time (compute on the shader cores; NVIDIA's FreeBSD \
+off-screen hits show textures only where the game's shader samples them plainly (clothing) and flat colours elsewhere, in-world interface does not reflect, they can flicker while the camera moves, \
+they cost about 400 MB of video memory and about 1 ms of GPU time (compute on the shader cores; NVIDIA's FreeBSD \
 driver has no hardware ray tracing), and they were only tried on an RTX 4070 Ti with NVIDIA 620.70.06";
 
 /// Whether the switch was on at start, read once; the first time it is on
@@ -77,6 +77,14 @@ const ST_TRANSFORM_FEEDBACK_FEATURES: u32 = 1_000_028_000;
 
 /// Byte offsets of the one feature bit wanted in each structure.
 const AT_VULKAN_1_2_BUFFER_DEVICE_ADDRESS: usize = 16 + 38 * 4;
+/// shaderSampledImageArrayNonUniformIndexing in the Vulkan 1.2 features and
+/// in the descriptor indexing ones; shaderSampledImageArrayDynamicIndexing
+/// in `VkPhysicalDeviceFeatures` and where that sits in its Features2.
+const AT_VULKAN_1_2_SAMPLED_ARRAY_NON_UNIFORM: usize = 16 + 14 * 4;
+const AT_DESCRIPTOR_INDEXING_SAMPLED_ARRAY_NON_UNIFORM: usize = 16 + 4 * 4;
+const AT_FEATURES_SAMPLED_ARRAY_DYNAMIC: usize = 34 * 4;
+const AT_FEATURES_2_SAMPLED_ARRAY_DYNAMIC: usize = 16 + AT_FEATURES_SAMPLED_ARRAY_DYNAMIC;
+const ST_DESCRIPTOR_INDEXING_FEATURES: u32 = 1_000_161_001;
 const AT_FIRST_FEATURE: usize = 16;
 
 /// The API version the engine asked its instance for, 0 before it made one.
@@ -144,6 +152,9 @@ pub(crate) struct Enabled {
     pub ray_query: bool,
     /// Transform feedback, for capturing the scene's geometry.
     pub transform_feedback: bool,
+    /// Arrays of sampled images indexed per invocation, for the textures of
+    /// what a ray hits.
+    pub textures: bool,
 }
 
 static DEVICES: Mutex<Vec<(usize, Enabled)>> = Mutex::new(Vec::new());
@@ -161,6 +172,8 @@ pub(crate) struct ExtendedDeviceInfo {
     info: Box<[u8; 72]>,
     _names: Vec<*const c_char>,
     _structs: Vec<Box<[u64; 8]>>,
+    /// `VkPhysicalDeviceFeatures` of ours, when the engine passed none.
+    _features: Option<Box<[u64; 32]>>,
     restore: Vec<(usize, u32)>,
     added: Vec<String>,
     pub(crate) enabled: Enabled,
@@ -222,6 +235,9 @@ struct Supported {
     ray_query: bool,
     buffer_device_address: bool,
     transform_feedback: bool,
+    /// shaderSampledImageArrayDynamicIndexing and
+    /// shaderSampledImageArrayNonUniformIndexing.
+    textures: bool,
 }
 
 fn supported_features(pd: *mut c_void) -> Supported {
@@ -249,15 +265,24 @@ fn supported_features(pd: *mut c_void) -> Supported {
     link(&mut bda, ST_BUFFER_DEVICE_ADDRESS_FEATURES, xfb.as_mut_ptr());
     link(&mut rq, ST_RAY_QUERY_FEATURES, bda.as_mut_ptr());
     link(&mut acc, ST_ACCELERATION_STRUCTURE_FEATURES, rq.as_mut_ptr());
+    let mut v12 = [0u64; 32];
+    v12[0] = ST_VULKAN_1_2_FEATURES as u64;
+    v12[1] = acc.as_mut_ptr() as u64;
     f2[0] = ST_PHYSICAL_DEVICE_FEATURES_2 as u64;
-    f2[1] = acc.as_mut_ptr() as u64;
+    f2[1] = v12.as_mut_ptr() as u64;
     f(pd, f2.as_mut_ptr());
     let first = |s: &[u64; 8]| s[2] as u32 != 0;
+    let bit = |s: &[u64], at: usize| {
+        // SAFETY: `at` is within the buffer, which is larger than the
+        // structure it holds.
+        unsafe { std::ptr::read_unaligned((s.as_ptr() as *const u8).add(at) as *const u32) != 0 }
+    };
     Supported {
         acceleration_structure: first(&acc),
         ray_query: first(&rq),
         buffer_device_address: first(&bda),
         transform_feedback: first(&xfb),
+        textures: bit(&f2, AT_FEATURES_2_SAMPLED_ARRAY_DYNAMIC) && bit(&v12, AT_VULKAN_1_2_SAMPLED_ARRAY_NON_UNIFORM),
     }
 }
 
@@ -363,7 +388,10 @@ pub(crate) unsafe fn extend_device(pd: *mut c_void, info: *const c_void) -> Opti
     if p.extensions.is_empty() {
         return None;
     }
-    let enabled = Enabled { ray_query: p.ray_query, transform_feedback: p.transform_feedback };
+    let enabled = Enabled { ray_query: p.ray_query, transform_feedback: p.transform_feedback, textures: p.transform_feedback && sup.textures };
+    if p.transform_feedback && !sup.textures {
+        println!("[android] vulkan: rt: the driver does not offer arrays of sampled images indexed per invocation; reflections show no textures");
+    }
     let ext = apply(info, &p.extensions, enabled);
     println!(
         "[android] vulkan: rt: device extensions added: {} ({} feature bit(s) set in the engine's structures, {} structure(s) chained)",
@@ -383,6 +411,7 @@ unsafe fn apply(info: *const c_void, extensions: &[&'static CStr], enabled: Enab
         info: Box::new(get(info, 0)),
         _names: Vec::new(),
         _structs: Vec::new(),
+        _features: None,
         restore: Vec::new(),
         added: Vec::new(),
         enabled,
@@ -441,6 +470,38 @@ unsafe fn apply(info: *const c_void, extensions: &[&'static CStr], enabled: Enab
             want(ST_BUFFER_DEVICE_ADDRESS_FEATURES, AT_FIRST_FEATURE, ST_BUFFER_DEVICE_ADDRESS_FEATURES, &mut ext);
         }
     }
+    if enabled.textures {
+        // Dynamic indexing: in the engine's Features2, else in its
+        // pEnabledFeatures, else in a copy of none.
+        if !want(ST_PHYSICAL_DEVICE_FEATURES_2, AT_FEATURES_2_SAMPLED_ARRAY_DYNAMIC, 0, &mut ext) {
+            let features: *const c_void = get(info, 64);
+            if features.is_null() {
+                let mut f: Box<[u64; 32]> = Box::new([0; 32]);
+                put(f.as_mut_ptr() as *mut c_void, AT_FEATURES_SAMPLED_ARRAY_DYNAMIC, 1u32);
+                put(base, 64, f.as_ptr());
+                ext._features = Some(f);
+            } else {
+                let addr = features as usize + AT_FEATURES_SAMPLED_ARRAY_DYNAMIC;
+                let old = std::ptr::read_unaligned(addr as *const u32);
+                if old == 0 {
+                    ext.restore.push((addr, old));
+                    std::ptr::write_unaligned(addr as *mut u32, 1);
+                }
+            }
+        }
+        // Non-uniform indexing: in the engine's Vulkan 1.2 structure, else in
+        // its descriptor indexing one, else in one of ours.
+        if !want(ST_VULKAN_1_2_FEATURES, AT_VULKAN_1_2_SAMPLED_ARRAY_NON_UNIFORM, 0, &mut ext)
+            && !want(ST_DESCRIPTOR_INDEXING_FEATURES, AT_DESCRIPTOR_INDEXING_SAMPLED_ARRAY_NON_UNIFORM, 0, &mut ext)
+        {
+            let mut s: Box<[u64; 8]> = Box::new([0; 8]);
+            s[0] = ST_DESCRIPTOR_INDEXING_FEATURES as u64;
+            s[1] = head as u64;
+            put(s.as_mut_ptr() as *mut c_void, AT_DESCRIPTOR_INDEXING_SAMPLED_ARRAY_NON_UNIFORM, 1u32);
+            head = s.as_ptr() as *const c_void;
+            ext._structs.push(s);
+        }
+    }
     put(base, 8, head);
     ext
 }
@@ -462,6 +523,11 @@ pub fn control(args: &[&str]) -> Result<String, String> {
             Ok(trace::stats_line())
         }
         ["dump", path] => capture::dump(path),
+        ["dump-cache", path] => trace::dump_cache(path),
+        ["shade", name] => {
+            trace::set_shade(name)?;
+            Ok(trace::stats_line())
+        }
         [] | ["stats"] => {
             if !requested() {
                 return Err(format!("the ray-traced reflections are off ({ENV}=1 at start turns them on)"));
@@ -483,7 +549,7 @@ pub fn control(args: &[&str]) -> Result<String, String> {
                 trace::stats_line()
             ))
         }
-        _ => Err("rt [stats] | on | off | draws | dump <path>".into()),
+        _ => Err("rt [stats] | on | off | shade own|mix|screen | draws | dump <path> | dump-cache <path>".into()),
     }
 }
 
@@ -528,7 +594,8 @@ mod tests {
 
     #[test]
     fn hardware_ray_queries_only_with_every_extension_and_feature() {
-        let full = Supported { acceleration_structure: true, ray_query: true, buffer_device_address: true, transform_feedback: true };
+        let full =
+            Supported { acceleration_structure: true, ray_query: true, buffer_device_address: true, transform_feedback: true, textures: true };
         let p = plan(&names(&ALL_RT), &full, API_1_2);
         assert!(p.ray_query && p.transform_feedback);
         assert_eq!(p.extensions.len(), 4);
@@ -563,7 +630,7 @@ mod tests {
         info[7] = engine_names.as_ptr() as u64;
         let wanted: [&CStr; 4] =
             [c"VK_KHR_acceleration_structure", c"VK_KHR_ray_query", c"VK_KHR_deferred_host_operations", c"VK_EXT_transform_feedback"];
-        let both = Enabled { ray_query: true, transform_feedback: true };
+        let both = Enabled { ray_query: true, transform_feedback: true, textures: false };
         unsafe {
             let ext = apply(info.as_ptr() as *const c_void, &wanted, both);
             let out = ext.as_ptr();

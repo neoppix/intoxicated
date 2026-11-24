@@ -46,6 +46,9 @@
 // is how an edge is told from a surface.
 
 #version 450
+#ifdef RT
+#extension GL_EXT_nonuniform_qualifier : require
+#endif
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
@@ -492,7 +495,13 @@ layout(std430, set = 1, binding = 6) buffer Globals {
     vec4 up;
     vec4 forward;
 };
+// Five vec4 a triangle (see `rt/build.comp`).
 layout(std430, set = 1, binding = 8) readonly buffer Tris { vec4 tris[]; };
+// This frame's base colour textures, and from a texture's serial to its
+// place among them: 1024 entries (serial, place + 1), by serial.
+layout(set = 2, binding = 0) uniform sampler2D textures[256];
+layout(std430, set = 1, binding = 11) readonly buffer TexMap { uvec2 tex_map[]; };
+const uint TRI_VEC4 = 5u;
 // Per block: the premultiplied colour and strength as four halves, the
 // pixel the ray left from (x | y << 16, or ~0 for none).
 layout(std430, set = 1, binding = 7) buffer Blocks { uvec4 blocks[]; };
@@ -528,7 +537,7 @@ vec3 to_view_space(vec3 W) {
 }
 
 vec3 tri_world(uint v) {
-    return tris[v].xyz;
+    return tris[TRI_VEC4 * (v / 3u) + v % 3u].xyz;
 }
 
 // The scene colour of the opaque world around `at`, as `reflected_color`
@@ -657,16 +666,47 @@ float trace_ray(vec3 O, vec3 D, float t_min, float t_max, out uint tri_hit, out 
     return found ? best : -1.0;
 }
 
-// The hit triangle's own colour at the hit: the colour its vertex shader
-// passed on, interpolated. The engine's fragment shaders take it as
-// gamma-encoded (they square it, light in linear and take the square root
-// at the end), so as it is, it is the part's colour under a light of 1; no
-// light of ours is added.
-vec3 hit_colour(uint tri, vec2 uv) {
-    vec3 ca = unpackUnorm4x8(floatBitsToUint(tris[3u * tri].w)).rgb;
-    vec3 cb = unpackUnorm4x8(floatBitsToUint(tris[3u * tri + 1u].w)).rgb;
-    vec3 cc = unpackUnorm4x8(floatBitsToUint(tris[3u * tri + 2u].w)).rgb;
-    vec3 c = ca * (1.0 - uv.x - uv.y) + cb * uv.x + cc * uv.y;
+// The place of texture `serial` among this frame's, or -1.
+int texture_place(uint serial) {
+    for (uint i = 0u; i < 4u; ++i) {
+        uvec2 e = tex_map[(serial + i) & 1023u];
+        if (e.x == serial) {
+            return int(e.y) - 1;
+        }
+        if (e.x == 0u) {
+            break;
+        }
+    }
+    return -1;
+}
+
+// The hit triangle's own colour at the hit, as the engine's fragment shader
+// makes its base colour: the colour its vertex shader passed on,
+// interpolated, times its texture where it has one this frame (all three
+// channels, or a grey detail texture's one twice over). The engine's
+// fragment shaders take it as gamma-encoded (they square it, light in
+// linear and take the square root at the end), so as it is, it is the
+// part's colour under a light of 1. `t` is the ray's length, in studs, for
+// the texture's level of detail.
+vec3 hit_colour(uint tri, vec2 uv, float t) {
+    uint at = TRI_VEC4 * tri;
+    vec3 ca = unpackUnorm4x8(floatBitsToUint(tris[at].w)).rgb;
+    vec3 cb = unpackUnorm4x8(floatBitsToUint(tris[at + 1u].w)).rgb;
+    vec3 cc = unpackUnorm4x8(floatBitsToUint(tris[at + 2u].w)).rgb;
+    vec3 bary = vec3(1.0 - uv.x - uv.y, uv.x, uv.y);
+    vec3 c = ca * bary.x + cb * bary.y + cc * bary.z;
+    vec4 t01 = tris[at + 3u], t2 = tris[at + 4u];
+    uint code = floatBitsToUint(t2.z);
+    uint mode = code >> 30;
+    if (mode != 0u) {
+        int place = texture_place(code & 0x3fffffffu);
+        vec2 st = t01.xy * bary.x + t01.zw * bary.y + t2.xy * bary.z;
+        if (place >= 0 && !any(isnan(st)) && !any(isinf(st))) {
+            float lod = clamp(log2(max(t, 1.0)) - 1.0, 0.0, 8.0);
+            vec4 tex = textureLod(textures[nonuniformEXT(place)], st, lod);
+            c *= mode == 1u ? tex.rgb : vec3(2.0 * tex.x);
+        }
+    }
     return any(isnan(c)) ? vec3(0.5) : clamp(c, 0.0, 1.0);
 }
 
@@ -703,30 +743,40 @@ vec4 reflection_rt(ivec2 p, vec3 P, vec3 N, float wet) {
         return vec4(0.0);
     }
     vec3 H = to_view_space(O + Rw * t);
-    vec3 c;
-    bool on_screen = false;
+    vec3 own = hit_colour(tri, uv, t);
+    // The screen's colour of the hit, where the screen shows it, and how
+    // sure that is: fading out over the last 4% of the screen towards its
+    // edges and as the depth there moves away from the hit's, so the two
+    // colours meet without a seam.
+    vec3 screen = vec3(0.0);
+    float on_screen = 0.0;
     if (opaque && H.z > 1e-3) {
         vec2 at = to_pixel(H);
         if (all(greaterThanEqual(at, vec2(0.5))) && all(lessThan(at, vec2(pc.size) - 0.5))) {
             float ds = depth_at(ivec2(at));
             float zs = ds > 0.0 ? 1.0 / ds : 3.0e38;
-            if (abs(H.z - zs) < 0.02 * H.z) {
-                c = opaque_color(at, length(at - vec2(p)), k);
-                on_screen = true;
+            float gap = abs(H.z - zs) / H.z;
+            vec2 margin = min(at, vec2(pc.size) - at) / (0.04 * float(min(pc.size.x, pc.size.y)));
+            on_screen = (1.0 - smoothstep(0.01, 0.03, gap)) * smoothstep(0.0, 1.0, clamp(min(margin.x, margin.y), 0.0, 1.0));
+            if (on_screen > 0.0) {
+                screen = opaque_color(at, length(at - vec2(p)), k);
             }
         }
     }
-    vec3 own = hit_colour(tri, uv);
-    if (on_screen) {
+    if (on_screen > 0.99) {
         // A sample of what the engine's light makes of the bare colour.
         if ((((p.x >> 1) ^ (p.y >> 1)) & 7) == 0) {
             const vec3 L = vec3(0.2126, 0.7152, 0.0722);
-            atomicAdd(lit_screen, uint(dot(clamp(c, 0.0, 1.0), L) * 256.0));
+            atomicAdd(lit_screen, uint(dot(clamp(screen, 0.0, 1.0), L) * 256.0));
             atomicAdd(lit_colour, uint(dot(own, L) * 256.0));
         }
-    } else {
-        c = own * (exposure > 0.0 ? exposure : 1.0);
     }
+    own *= exposure > 0.0 ? exposure : 1.0;
+    // Flags bit 3: the screen's colour wherever it shows the hit (the first
+    // way, kept to compare); bit 4: a quarter of it; neither: the hit's own
+    // colour only, so a reflection shows the side of a thing it faces.
+    float screen_share = (pc.flags & 8u) != 0u ? 1.0 : (pc.flags & 16u) != 0u ? 0.25 : 0.0;
+    vec3 c = mix(own, screen, screen_share * on_screen);
     float sure = 1.0;
     // A ray that ends somewhere fades out over the last 40% of it.
     if (pc.max_distance > 0.0) {

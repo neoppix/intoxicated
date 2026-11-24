@@ -53,16 +53,26 @@ layout(local_size_x = 128) in;
 layout(local_size_x = 256) in;
 #endif
 
+// GATHER runs with the reflections' set as set 0 (for their copy of the
+// depth) and ours as set 1; every other stage with ours alone.
+#ifdef GATHER
+#define BUFSET 1
+layout(set = 0, binding = 2, r32f) uniform readonly image2D depth_copy;
+#else
+#define BUFSET 0
+#endif
+
 // Per captured vertex: the clip-space position, the colour, the vector to
-// the camera (xyz) and the world position (xyz, w 1 when static).
-layout(std430, binding = 0) readonly buffer Xfb { vec4 xfb[]; };
-layout(std430, binding = 2) buffer Sorted { uvec2 sorted[]; };
-layout(std430, binding = 3) coherent buffer Nodes { vec4 nodes[]; };
-layout(std430, binding = 4) buffer Parents { int parents[]; };
-layout(std430, binding = 5) buffer Flags { uint flags[]; };
+// the camera (xyz), the world position (xyz, w 1 when static) and the
+// texture coordinates (xy).
+layout(std430, set = BUFSET, binding = 0) readonly buffer Xfb { vec4 xfb[]; };
+layout(std430, set = BUFSET, binding = 2) buffer Sorted { uvec2 sorted[]; };
+layout(std430, set = BUFSET, binding = 3) coherent buffer Nodes { vec4 nodes[]; };
+layout(std430, set = BUFSET, binding = 4) buffer Parents { int parents[]; };
+layout(std430, set = BUFSET, binding = 5) buffer Flags { uint flags[]; };
 // `trace::GLOBALS_*` names the offsets; the first 16 bytes and `dropped`,
 // `full` and `inserted` are cleared every frame, the rest is kept.
-layout(std430, binding = 6) buffer Globals {
+layout(std430, set = BUFSET, binding = 6) buffer Globals {
     // Listed triangles that are leaves (real geometry); FIT's vertices and
     // whether it found the camera; cached triangles listed this frame.
     uint leaves;
@@ -93,12 +103,21 @@ layout(std430, binding = 6) buffer Globals {
     uint full;
     uint inserted;
     vec4 last_cam;
+    // Listed triangles the sort had no room for this frame, and frames FIT
+    // could not measure the camera in, since the start.
+    uint cut;
+    uint fit_failures;
 };
-// Triangles to trace: three vertices, world xyz and the colour packed in w.
-layout(std430, binding = 8) buffer Tris { vec4 tris[]; };
-// The cache: 16 words a slot: tag, second key, frame last seen, colour A;
-// A xyz, colour B; B xyz, colour C; C xyz, spare.
-layout(std430, binding = 9) buffer Slots { uint slots[]; };
+// Triangles to trace, five vec4 each: three vertices (world xyz, the colour
+// packed in w), the texture coordinates of A and B, then those of C, the
+// texture code (see `capture::MODE_*`) and the source (the low bits of the
+// vertex shader's hash, for dumps).
+layout(std430, set = BUFSET, binding = 8) buffer Tris { vec4 tris[]; };
+// The cache: `SLOT_WORDS` words a slot, at the `S_*` offsets.
+layout(std430, set = BUFSET, binding = 9) buffer Slots { uint slots[]; };
+// This frame's draws: first triangle, texture code, source; by first
+// triangle.
+layout(std430, set = BUFSET, binding = 10) readonly buffer Draws { uvec4 draws[]; };
 
 // std430; `trace::BuildParams` mirrors it.
 layout(push_constant) uniform Params {
@@ -115,14 +134,38 @@ layout(push_constant) uniform Params {
     uint flags_;
     // Slots in the cache, a power of two.
     uint slot_count;
-    uint pad;
+    // The screen, width | height << 16 (GATHER).
+    uint size;
+    // Entries in `draws`.
+    uint draw_count;
+    uint pad0;
+    uint pad1;
+    uint pad2;
 } pc;
 
 const float JUMP = 64.0;
 const uint MIN_AGE = 240u;
+// Unseen for this long (about two minutes at 240 fps) and this far from the
+// camera, a cached triangle is dropped; nearer ones are kept.
 const uint MAX_AGE = 240u * 120u;
+const float FAR = 512.0;
+// Frames in a row the view must show a cached triangle's place empty before
+// it is dropped, so one frame the engine skips does not drop it.
+const uint MISSES = 8u;
 const uint PROBES = 16u;
-const uint SLOT_WORDS = 16u;
+const uint VERTEX_VEC4 = 5u;
+const uint TRI_VEC4 = 5u;
+const uint SLOT_WORDS = 32u;
+const uint S_TAG = 0u;
+const uint S_KEY = 1u;
+const uint S_SEEN = 2u;
+const uint S_MISSES = 3u;
+const uint S_CODE = 4u;
+const uint S_SOURCE = 5u;
+const uint S_BORN = 6u;
+const uint S_POS = 8u;
+const uint S_COL = 17u;
+const uint S_UV = 20u;
 
 bool usable(vec4 c) {
     return c.z > 0.0 && c.w > 0.0 && !any(isnan(c)) && !any(isinf(c));
@@ -151,9 +194,9 @@ void main() {
     }
     for (uint k = t; k < FIT_SAMPLES && k * step_ < vertices; k += FIT_THREADS) {
         uint v = k * step_;
-        vec4 c = xfb[4u * v];
-        vec3 V = xfb[4u * v + 2u].xyz;
-        vec3 W = xfb[4u * v + 3u].xyz;
+        vec4 c = xfb[VERTEX_VEC4 * v];
+        vec3 V = xfb[VERTEX_VEC4 * v + 2u].xyz;
+        vec3 W = xfb[VERTEX_VEC4 * v + 3u].xyz;
         vec3 p = -V;
         float l = length(p);
         if (!usable(c) || !(l > 1e-3) || isinf(l) || any(isnan(W)) || any(isinf(W))) {
@@ -200,6 +243,8 @@ void main() {
     float n = red[16][0];
     fit_samples = uint(n);
     fit_ok = 0u;
+    // Counted as failed until it succeeds below.
+    fit_failures += 1u;
     if (n < 64.0) {
         return;
     }
@@ -237,6 +282,7 @@ void main() {
     }
     last_cam = vec4(cam, 1.0);
     fit_ok = 1u;
+    fit_failures -= 1u;
 }
 
 #endif
@@ -249,6 +295,23 @@ uint mix_bits(uint h, uint v) {
     return h * 5u + 0xe6546b64u;
 }
 
+// The draw triangle `i` came from: the last entry starting at or before it.
+uvec4 draw_of(uint i) {
+    if (pc.draw_count == 0u || draws[0].x > i) {
+        return uvec4(0u);
+    }
+    uint lo = 0u, hi = pc.draw_count - 1u;
+    while (lo < hi) {
+        uint mid = (lo + hi + 1u) / 2u;
+        if (draws[mid].x <= i) {
+            lo = mid;
+        } else {
+            hi = mid - 1u;
+        }
+    }
+    return draws[lo];
+}
+
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.current || i >= pc.cap) {
@@ -256,14 +319,19 @@ void main() {
     }
     vec4 W[3];
     uint col[3];
+    vec2 uv[3];
     bool fixed_ = true;
     for (uint k = 0u; k < 3u; ++k) {
-        uint v = 4u * (3u * i + k);
+        uint v = VERTEX_VEC4 * (3u * i + k);
         W[k] = xfb[v + 3u];
         col[k] = pack_colour(xfb[v + 1u]);
+        uv[k] = xfb[v + 4u].xy;
         fixed_ = fixed_ && W[k].w > 0.5 && usable(xfb[v]);
-        tris[3u * i + k] = vec4(W[k].xyz, uintBitsToFloat(col[k]));
+        tris[TRI_VEC4 * i + k] = vec4(W[k].xyz, uintBitsToFloat(col[k]));
     }
+    uvec4 d = draw_of(i);
+    tris[TRI_VEC4 * i + 3u] = vec4(uv[0], uv[1]);
+    tris[TRI_VEC4 * i + 4u] = vec4(uv[2], uintBitsToFloat(d.y), uintBitsToFloat(d.z));
     if (!fixed_ || fit_ok == 0u) {
         return;
     }
@@ -285,18 +353,20 @@ void main() {
     uint free_at = 0xffffffffu, old_at = 0xffffffffu, old_seen = 0xffffffffu;
     for (uint p = 0u; p < PROBES; ++p) {
         uint base = ((h2 + p) & mask) * SLOT_WORDS;
-        uint t = slots[base];
-        if (t == tag && slots[base + 1u] == h2) {
-            slots[base + 2u] = frame;
+        uint t = slots[base + S_TAG];
+        if (t == tag && slots[base + S_KEY] == h2) {
+            slots[base + S_SEEN] = frame;
+            slots[base + S_MISSES] = 0u;
+            slots[base + S_CODE] = d.y;
             for (uint k = 0u; k < 3u; ++k) {
-                slots[base + 3u + 4u * k] = col[k];
+                slots[base + S_COL + k] = col[k];
             }
             return;
         }
         if (t == 0u || (t >> 24) != (gen & 0xffu)) {
             free_at = min(free_at, p);
         } else {
-            uint seen = slots[base + 2u];
+            uint seen = slots[base + S_SEEN];
             if (frame - seen > MIN_AGE && seen < old_seen) {
                 old_seen = seen;
                 old_at = p;
@@ -310,9 +380,9 @@ void main() {
             continue;
         }
         uint base = ((h2 + p) & mask) * SLOT_WORDS;
-        uint t = slots[base];
-        bool takeable = t == 0u || (t >> 24) != (gen & 0xffu) || frame - slots[base + 2u] > MIN_AGE;
-        if (takeable && atomicCompSwap(slots[base], t, tag) == t) {
+        uint t = slots[base + S_TAG];
+        bool takeable = t == 0u || (t >> 24) != (gen & 0xffu) || frame - slots[base + S_SEEN] > MIN_AGE;
+        if (takeable && atomicCompSwap(slots[base + S_TAG], t, tag) == t) {
             best = base;
         }
     }
@@ -321,14 +391,21 @@ void main() {
         return;
     }
     atomicAdd(inserted, 1u);
-    slots[best + 1u] = h2;
-    slots[best + 2u] = frame;
+    slots[best + S_KEY] = h2;
+    slots[best + S_SEEN] = frame;
+    slots[best + S_MISSES] = 0u;
+    slots[best + S_CODE] = d.y;
+    slots[best + S_SOURCE] = d.z;
+    slots[best + S_BORN] = frame;
     for (uint k = 0u; k < 3u; ++k) {
-        slots[best + 3u + 4u * k] = col[k];
         uvec3 b = floatBitsToUint(W[k].xyz);
-        slots[best + 4u + 4u * k] = b.x;
-        slots[best + 5u + 4u * k] = b.y;
-        slots[best + 6u + 4u * k] = b.z;
+        slots[best + S_POS + 3u * k] = b.x;
+        slots[best + S_POS + 3u * k + 1u] = b.y;
+        slots[best + S_POS + 3u * k + 2u] = b.z;
+        slots[best + S_COL + k] = col[k];
+        uvec2 u = floatBitsToUint(uv[k]);
+        slots[best + S_UV + 2u * k] = u.x;
+        slots[best + S_UV + 2u * k + 1u] = u.y;
     }
 }
 
@@ -336,13 +413,31 @@ void main() {
 
 #ifdef GATHER
 
-// Whether the view shows `w` (inside the frustum, a little in from its
-// edges, past the near plane).
-bool in_view(vec3 w) {
+vec3 view_of(vec3 w) {
     vec3 r = w - cam_pos.xyz;
-    vec3 v = vec3(dot(r, right.xyz), dot(r, up.xyz), dot(r, forward.xyz));
-    float near = camera.z;
-    return v.z > 2.0 * near && abs(v.x) < 0.97 * v.z * camera.x && abs(v.y) < 0.97 * v.z * camera.y;
+    return vec3(dot(r, right.xyz), dot(r, up.xyz), dot(r, forward.xyz));
+}
+
+// Whether a view-space point lies inside the frustum, a little in from its
+// edges, past the near plane.
+bool inside(vec3 v) {
+    return v.z > 2.0 * camera.z && abs(v.x) < 0.97 * v.z * camera.x && abs(v.y) < 0.97 * v.z * camera.y;
+}
+
+// Whether the screen shows the place of the triangle whose centre is `v`:
+// nothing drawn in front of it there (the depth there is sky or behind it).
+// Hidden behind something, it is kept.
+bool place_shown(vec3 v) {
+    uvec2 size = uvec2(pc.size & 0xffffu, pc.size >> 16);
+    vec2 ndc = vec2(v.x / (v.z * camera.x), -v.y / (v.z * camera.y));
+    ivec2 p = ivec2((ndc * 0.5 + 0.5) * vec2(size));
+    if (any(lessThan(p, ivec2(0))) || any(greaterThanEqual(p, ivec2(size)))) {
+        return false;
+    }
+    float d = imageLoad(depth_copy, p).r;
+    // Depth is near / distance; the triangle's distance in near units.
+    float z = v.z / camera.z;
+    return d <= 0.0 || 1.0 / d > z * 1.02;
 }
 
 void main() {
@@ -351,24 +446,34 @@ void main() {
         return;
     }
     uint base = s * SLOT_WORDS;
-    uint t = slots[base];
+    uint t = slots[base + S_TAG];
     if (t == 0u || (t >> 24) != (gen & 0xffu)) {
         return;
     }
-    uint seen = slots[base + 2u];
+    uint seen = slots[base + S_SEEN];
     if (seen == frame) {
         return;
     }
     vec3 W[3];
     for (uint k = 0u; k < 3u; ++k) {
-        W[k] = uintBitsToFloat(uvec3(slots[base + 4u + 4u * k], slots[base + 5u + 4u * k], slots[base + 6u + 4u * k]));
+        W[k] = uintBitsToFloat(uvec3(slots[base + S_POS + 3u * k], slots[base + S_POS + 3u * k + 1u], slots[base + S_POS + 3u * k + 2u]));
     }
-    bool shown = in_view(W[0]) && in_view(W[1]) && in_view(W[2]);
-    if ((shown && (pc.flags_ & 1u) != 0u) || frame - seen > MAX_AGE) {
-        slots[base] = 0u;
-        if (shown) {
+    vec3 a = view_of(W[0]), b = view_of(W[1]), c = view_of(W[2]);
+    // Gone: the view showed its place empty for several frames in a row
+    // while the frame (captured whole) did not draw it.
+    if (inside(a) && inside(b) && inside(c) && (pc.flags_ & 1u) != 0u && place_shown((a + b + c) / 3.0)) {
+        uint misses = slots[base + S_MISSES] + 1u;
+        slots[base + S_MISSES] = misses;
+        if (misses >= MISSES) {
+            slots[base + S_TAG] = 0u;
             atomicAdd(dropped, 1u);
+            return;
         }
+    } else {
+        slots[base + S_MISSES] = 0u;
+    }
+    if (frame - seen > MAX_AGE && length(a) > FAR) {
+        slots[base + S_TAG] = 0u;
         return;
     }
     uint k = atomicAdd(cached, 1u);
@@ -377,8 +482,13 @@ void main() {
         return;
     }
     for (uint q = 0u; q < 3u; ++q) {
-        tris[3u * at + q] = vec4(W[q], uintBitsToFloat(slots[base + 3u + 4u * q]));
+        tris[TRI_VEC4 * at + q] = vec4(W[q], uintBitsToFloat(slots[base + S_COL + q]));
     }
+    vec2 u0 = uintBitsToFloat(uvec2(slots[base + S_UV], slots[base + S_UV + 1u]));
+    vec2 u1 = uintBitsToFloat(uvec2(slots[base + S_UV + 2u], slots[base + S_UV + 3u]));
+    vec2 u2 = uintBitsToFloat(uvec2(slots[base + S_UV + 4u], slots[base + S_UV + 5u]));
+    tris[TRI_VEC4 * at + 3u] = vec4(u0, u1);
+    tris[TRI_VEC4 * at + 4u] = vec4(u2, uintBitsToFloat(slots[base + S_CODE]), uintBitsToFloat(slots[base + S_SOURCE]));
 }
 
 #endif
@@ -406,10 +516,14 @@ void main() {
     if (i >= pc.n) {
         return;
     }
-    uint total = min(pc.current + cached, min(pc.cap, pc.n));
+    uint listed = min(pc.current + cached, pc.cap);
+    uint total = min(listed, pc.n);
+    if (i == 0u) {
+        cut = listed - total;
+    }
     uint key = 0xffffffffu;
     if (i < total && fit_ok != 0u) {
-        vec3 A = tris[3u * i].xyz, B = tris[3u * i + 1u].xyz, C = tris[3u * i + 2u].xyz;
+        vec3 A = tris[TRI_VEC4 * i].xyz, B = tris[TRI_VEC4 * i + 1u].xyz, C = tris[TRI_VEC4 * i + 2u].xyz;
         vec3 n = cross(B - A, C - A);
         if (dot(n, n) > 0.0 && !any(isinf(n)) && !any(isnan(n))) {
             vec3 m = (A + B + C) / 3.0 - cam_pos.xyz;
@@ -568,7 +682,7 @@ void main() {
         return;
     }
     uint tri = sorted[leaf].y;
-    vec3 A = tris[3u * tri].xyz, B = tris[3u * tri + 1u].xyz, C = tris[3u * tri + 2u].xyz;
+    vec3 A = tris[TRI_VEC4 * tri].xyz, B = tris[TRI_VEC4 * tri + 1u].xyz, C = tris[TRI_VEC4 * tri + 2u].xyz;
     vec3 lo = min(A, min(B, C)), hi = max(A, max(B, C));
     int child = ~leaf;
     int p = parents[int(pc.n) + leaf];

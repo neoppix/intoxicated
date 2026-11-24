@@ -29,10 +29,10 @@ use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{Mutex, OnceLock};
 
 use super::super::depth_capture::{
-    ComputePipelineCreateInfo, CreateFn, DescriptorBufferInfo, DescriptorPoolCreateInfo, DescriptorPoolSize,
-    DescriptorSetAllocateInfo, DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo, DestroyFn,
-    PipelineLayoutCreateInfo, PipelineShaderStageCreateInfo, PushConstantRange, ShaderModuleCreateInfo,
-    WriteDescriptorSet,
+    ComputePipelineCreateInfo, CreateFn, DescriptorBufferInfo, DescriptorImageInfo, DescriptorPoolCreateInfo,
+    DescriptorPoolSize, DescriptorSetAllocateInfo, DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo,
+    DestroyFn, ImageViewCreateInfo, PipelineLayoutCreateInfo, PipelineShaderStageCreateInfo, PushConstantRange,
+    SamplerCreateInfo, ShaderModuleCreateInfo, WriteDescriptorSet,
 };
 use super::super::frame_capture::{device_fn, Dev, MemoryBarrier};
 use super::capture::{self, check, make_buffer, memory_types, Owned};
@@ -47,6 +47,15 @@ const ST_DESCRIPTOR_SET_ALLOCATE_INFO: i32 = 34;
 const ST_WRITE_DESCRIPTOR_SET: i32 = 35;
 const ST_MEMORY_BARRIER: i32 = 46;
 const ST_QUERY_POOL_CREATE_INFO: i32 = 11;
+const ST_IMAGE_CREATE_INFO: u32 = 14;
+const ST_IMAGE_VIEW_CREATE_INFO: i32 = 15;
+const ST_SAMPLER_CREATE_INFO: i32 = 31;
+const ST_MEMORY_ALLOCATE_INFO: i32 = 5;
+const ST_IMAGE_MEMORY_BARRIER: i32 = 45;
+const FORMAT_RGBA8: u32 = 37;
+const USAGE_SAMPLED: u32 = 0x4;
+const DESCRIPTOR_COMBINED_IMAGE_SAMPLER: u32 = 1;
+const LAYOUT_SHADER_READ_ONLY: i32 = 5;
 
 const SHADER_STAGE_COMPUTE: u32 = 0x20;
 const BIND_POINT_COMPUTE: u32 = 1;
@@ -89,16 +98,26 @@ const GATHER: usize = 9;
 const PIPELINES: usize = 10;
 /// The bindings of our set: 0 the capture, 2 the sorted keys, 3 the nodes,
 /// 4 the parents, 5 the flags, 6 the globals, 7 the traced blocks, 8 the
-/// triangles to trace, 9 the cache.
-const BINDINGS: [u32; 9] = [0, 2, 3, 4, 5, 6, 7, 8, 9];
-/// Slots in the cache of static triangles (64 bytes each).
+/// triangles to trace, 9 the cache, 10 this frame's draws, 11 its textures
+/// by serial.
+const BINDINGS: [u32; 11] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+/// Slots in the cache of static triangles (128 bytes each).
 const SLOTS: u32 = 1 << 19;
-/// Triangles the list to trace holds: this frame's and the cache's.
-const LISTED: u64 = 1 << 20;
+const SLOT_BYTES: u64 = 128;
+/// Triangles the list to trace holds (80 bytes each): this frame's and the
+/// cache's.
+const LISTED: u64 = 1 << 19;
+const TRI_BYTES: u64 = 80;
+/// Draws a frame can tell the build about (16 bytes each), and the entries
+/// of the serial-to-texture table (8 bytes each).
+const MAX_DRAWS: usize = 4096;
+const TEX_MAP: usize = 1024;
+/// Textures in the trace's set 2.
+const TEXTURES: u32 = capture::MAX_TEXTURES as u32;
 /// Bytes of the globals (`build.comp`'s `Globals`) and of what `rt stats`
 /// reads back of them.
 const GLOBALS_BYTES: u64 = 256;
-const GLOBALS_READ: usize = 40;
+const GLOBALS_READ: usize = 42;
 /// Bytes per traced 2 by 2 block.
 const BLOCK_BYTES: u64 = 16;
 /// The blocks buffer has room for at least this extent's.
@@ -123,7 +142,9 @@ pub(crate) struct BuildParams {
     pub current: u32,
     pub flags: u32,
     pub slot_count: u32,
-    pub pad: u32,
+    pub size: u32,
+    pub draw_count: u32,
+    pub pad: [u32; 3],
 }
 
 /// Whether the trace replaces the march, while the reflections are on.
@@ -140,6 +161,44 @@ pub(crate) fn is_on() -> bool {
 pub(crate) fn set_on(v: bool) {
     on().store(v, Relaxed);
 }
+
+/// Where a hit's colour comes from: its own (texture times colour, times the
+/// exposure), mixed with a quarter of the screen's where the screen shows
+/// it, or the screen's wherever it shows it (the first way, to compare).
+/// `INTOXICATED_RT_SHADE`, devctl `rt shade`.
+pub const SHADE_ENV: &str = "INTOXICATED_RT_SHADE";
+pub(crate) const SHADES: [&str; 3] = ["own", "mix", "screen"];
+static SHADE: OnceLock<std::sync::atomic::AtomicUsize> = OnceLock::new();
+
+fn shade() -> &'static std::sync::atomic::AtomicUsize {
+    SHADE.get_or_init(|| {
+        let v = std::env::var(SHADE_ENV).ok();
+        let i = v.as_deref().and_then(|v| SHADES.iter().position(|s| *s == v.trim())).unwrap_or(0);
+        if let Some(v) = v.filter(|v| !SHADES.contains(&v.trim())) {
+            println!("[android] vulkan: rt: {SHADE_ENV}={v} is not one of {}; own", SHADES.join(", "));
+        }
+        std::sync::atomic::AtomicUsize::new(i)
+    })
+}
+
+pub(crate) fn set_shade(name: &str) -> Result<(), String> {
+    let i = SHADES.iter().position(|s| *s == name).ok_or_else(|| format!("rt shade {}", SHADES.join("|")))?;
+    shade().store(i, Relaxed);
+    Ok(())
+}
+
+/// The trace's push constant flags for the shade (`ssr.comp`: bit 3 the
+/// screen's colour, bit 4 a quarter of it).
+pub(crate) fn shade_flags() -> u32 {
+    match shade().load(Relaxed) {
+        1 => 16,
+        2 => 8,
+        _ => 0,
+    }
+}
+
+/// devctl `rt dump-cache <path>`: armed for the next frame, then written.
+static CACHE_DUMP_NEXT: AtomicBool = AtomicBool::new(false);
 
 /// How many keys to sort for `triangles`: a power of two with room to grow,
 /// at least one block and at most the capacity's power of two.
@@ -190,6 +249,15 @@ struct Fns {
     cmd_fill_buffer: extern "C" fn(*mut c_void, u64, u64, u64, u32),
     cmd_reset_query_pool: extern "C" fn(*mut c_void, u64, u32, u32),
     cmd_write_timestamp: extern "C" fn(*mut c_void, u32, u64, u32),
+    cmd_update_buffer: extern "C" fn(*mut c_void, u64, u64, u64, *const c_void),
+    create_image: CreateFn<[u32; 22]>,
+    destroy_image: DestroyFn,
+    image_requirements: extern "C" fn(Dev, u64, *mut super::super::frame_capture::MemoryRequirements),
+    bind_image_memory: extern "C" fn(Dev, u64, u64, u64) -> i32,
+    create_image_view: CreateFn<ImageViewCreateInfo>,
+    destroy_image_view: DestroyFn,
+    create_sampler: CreateFn<SamplerCreateInfo>,
+    destroy_sampler: DestroyFn,
 }
 
 impl Fns {
@@ -217,6 +285,15 @@ impl Fns {
             cmd_fill_buffer: device_fn(d, c"vkCmdFillBuffer")?,
             cmd_reset_query_pool: device_fn(d, c"vkCmdResetQueryPool")?,
             cmd_write_timestamp: device_fn(d, c"vkCmdWriteTimestamp")?,
+            cmd_update_buffer: device_fn(d, c"vkCmdUpdateBuffer")?,
+            create_image: device_fn(d, c"vkCreateImage")?,
+            destroy_image: device_fn(d, c"vkDestroyImage")?,
+            image_requirements: device_fn(d, c"vkGetImageMemoryRequirements")?,
+            bind_image_memory: device_fn(d, c"vkBindImageMemory")?,
+            create_image_view: device_fn(d, c"vkCreateImageView")?,
+            destroy_image_view: device_fn(d, c"vkDestroyImageView")?,
+            create_sampler: device_fn(d, c"vkCreateSampler")?,
+            destroy_sampler: device_fn(d, c"vkDestroySampler")?,
         })
     }
 }
@@ -236,6 +313,8 @@ pub(crate) struct Stats {
     pub keys: u32,
     /// The globals as last read back (`build.comp`'s `Globals`).
     pub fit: Option<[u32; GLOBALS_READ]>,
+    /// The frame the cache was last copied out at, for `rt dump-cache`.
+    pub cache_dumped_at: u64,
 }
 
 struct Gpu {
@@ -259,6 +338,21 @@ struct Gpu {
     blocks: Owned,
     tris: Owned,
     slots: Owned,
+    draws: Owned,
+    tex_map: Owned,
+    /// Set 2 of the trace: the frame's textures, one set per ring slot, and
+    /// its layout; a 1 by 1 image of ours fills the places no texture takes.
+    /// Host-visible: a copy of the cache, made for `rt dump-cache`.
+    cache_copy: Owned,
+    cache_copy_ptr: usize,
+    tex_layout: u64,
+    tex_pool: u64,
+    tex_sets: [u64; RING],
+    sampler: u64,
+    dummy: u64,
+    dummy_memory: u64,
+    dummy_view: u64,
+    dummy_ready: bool,
     /// The blocks were cleared once (they carry the last frame's results).
     blocks_cleared: bool,
     /// Host-visible: a copy of the globals (the camera FIT measured).
@@ -309,7 +403,38 @@ impl Gpu {
         if self.query_pool != 0 {
             (f.destroy_query_pool)(d, self.query_pool, none);
         }
-        for o in [self.sorted, self.nodes, self.parents, self.flags, self.globals, self.blocks, self.tris, self.slots, self.readback] {
+        if self.tex_pool != 0 {
+            (f.destroy_descriptor_pool)(d, self.tex_pool, none);
+        }
+        if self.tex_layout != 0 {
+            (f.destroy_set_layout)(d, self.tex_layout, none);
+        }
+        if self.sampler != 0 {
+            (f.destroy_sampler)(d, self.sampler, none);
+        }
+        if self.dummy_view != 0 {
+            (f.destroy_image_view)(d, self.dummy_view, none);
+        }
+        if self.dummy != 0 {
+            (f.destroy_image)(d, self.dummy, none);
+        }
+        if self.dummy_memory != 0 {
+            (self.buffers.free_memory)(d, self.dummy_memory, none);
+        }
+        for o in [
+            self.sorted,
+            self.nodes,
+            self.parents,
+            self.flags,
+            self.globals,
+            self.blocks,
+            self.tris,
+            self.slots,
+            self.draws,
+            self.tex_map,
+            self.readback,
+            self.cache_copy,
+        ] {
             if o.buffer != 0 {
                 (self.buffers.destroy_buffer)(d, o.buffer, none);
             }
@@ -392,6 +517,18 @@ fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool, extent: [u32; 2]) -
         blocks: Owned::default(),
         tris: Owned::default(),
         slots: Owned::default(),
+        draws: Owned::default(),
+        tex_map: Owned::default(),
+        cache_copy: Owned::default(),
+        cache_copy_ptr: 0,
+        tex_layout: 0,
+        tex_pool: 0,
+        tex_sets: [0; RING],
+        sampler: 0,
+        dummy: 0,
+        dummy_memory: 0,
+        dummy_view: 0,
+        dummy_ready: false,
         blocks_cleared: false,
         readback: Owned::default(),
         readback_ptr: 0,
@@ -410,6 +547,106 @@ fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool, extent: [u32; 2]) -
     }
 }
 
+/// Set 2 of the trace (the frame's textures): its layout, a pool with one
+/// set per ring slot, our sampler and the 1 by 1 image that fills the places
+/// no texture takes.
+fn make_textures(g: &mut Gpu, types: &[u32]) -> Result<(), String> {
+    let d = g.device as Dev;
+    let none: *const c_void = std::ptr::null();
+    let f = &g.fns;
+    let binding = DescriptorSetLayoutBinding {
+        binding: 0,
+        kind: DESCRIPTOR_COMBINED_IMAGE_SAMPLER,
+        count: TEXTURES,
+        stages: SHADER_STAGE_COMPUTE,
+        immutable_samplers: none.cast(),
+    };
+    let layout = DescriptorSetLayoutCreateInfo {
+        s_type: ST_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        p_next: none,
+        flags: 0,
+        count: 1,
+        bindings: &binding,
+    };
+    check((f.create_set_layout)(d, &layout, none, &mut g.tex_layout), "vkCreateDescriptorSetLayout")?;
+    let size = DescriptorPoolSize { kind: DESCRIPTOR_COMBINED_IMAGE_SAMPLER, count: TEXTURES * RING as u32 };
+    let pool =
+        DescriptorPoolCreateInfo { s_type: ST_DESCRIPTOR_POOL_CREATE_INFO, p_next: none, flags: 0, max_sets: RING as u32, count: 1, sizes: &size };
+    check((f.create_descriptor_pool)(d, &pool, none, &mut g.tex_pool), "vkCreateDescriptorPool")?;
+    let layouts = [g.tex_layout; RING];
+    let alloc = DescriptorSetAllocateInfo {
+        s_type: ST_DESCRIPTOR_SET_ALLOCATE_INFO,
+        p_next: none,
+        pool: g.tex_pool,
+        count: RING as u32,
+        layouts: layouts.as_ptr(),
+    };
+    check((f.allocate_descriptor_sets)(d, &alloc, g.tex_sets.as_mut_ptr()), "vkAllocateDescriptorSets")?;
+    let sampler = SamplerCreateInfo {
+        s_type: ST_SAMPLER_CREATE_INFO,
+        p_next: none,
+        flags: 0,
+        mag_filter: 1,
+        min_filter: 1,
+        mipmap_mode: 1,
+        address: [0; 3],
+        mip_lod_bias: 0.0,
+        anisotropy_enable: 0,
+        max_anisotropy: 1.0,
+        compare_enable: 0,
+        compare_op: 0,
+        min_lod: 0.0,
+        max_lod: 16.0,
+        border_color: 0,
+        unnormalized: 0,
+    };
+    check((f.create_sampler)(d, &sampler, none, &mut g.sampler), "vkCreateSampler")?;
+    // `VkImageCreateInfo` as words: sType, 2D, R8G8B8A8_UNORM, 1x1x1, one
+    // level and layer, one sample, optimal tiling, sampled, undefined.
+    let mut image = [0u32; 22];
+    image[0] = ST_IMAGE_CREATE_INFO;
+    image[5] = 1;
+    image[6] = FORMAT_RGBA8;
+    image[7] = 1;
+    image[8] = 1;
+    image[9] = 1;
+    image[10] = 1;
+    image[11] = 1;
+    image[12] = 1;
+    image[14] = USAGE_SAMPLED;
+    check((f.create_image)(d, &image, none, &mut g.dummy), "vkCreateImage")?;
+    let mut req = super::super::frame_capture::MemoryRequirements::default();
+    (f.image_requirements)(d, g.dummy, &mut req);
+    let index = (0..types.len())
+        .find(|&i| req.memory_type_bits & (1 << i) != 0 && types[i] & 1 != 0)
+        .ok_or("no device-local memory type fits the image")?;
+    let alloc = super::super::frame_capture::MemoryAllocateInfo {
+        s_type: ST_MEMORY_ALLOCATE_INFO,
+        p_next: none,
+        allocation_size: req.size,
+        memory_type_index: index as u32,
+    };
+    check((g.buffers.allocate_memory)(d, &alloc, none, &mut g.dummy_memory), "vkAllocateMemory")?;
+    check((f.bind_image_memory)(d, g.dummy, g.dummy_memory, 0), "vkBindImageMemory")?;
+    let view = ImageViewCreateInfo {
+        s_type: ST_IMAGE_VIEW_CREATE_INFO,
+        p_next: none,
+        flags: 0,
+        image: g.dummy,
+        view_type: 1,
+        format: FORMAT_RGBA8,
+        components: [0; 4],
+        range: super::super::frame_capture::ImageSubresourceRange {
+            aspect_mask: 1,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+    };
+    check((f.create_image_view)(d, &view, none, &mut g.dummy_view), "vkCreateImageView")
+}
+
 fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Result<(), String> {
     let d = g.device as Dev;
     let none: *const c_void = std::ptr::null();
@@ -422,8 +659,11 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
     g.flags = make_buffer(&g.buffers, d, &types, 4 * n, usage, false)?;
     g.globals = make_buffer(&g.buffers, d, &types, GLOBALS_BYTES, usage, false)?;
     g.blocks = make_buffer(&g.buffers, d, &types, BLOCK_BYTES * g.block_room, usage, false)?;
-    g.tris = make_buffer(&g.buffers, d, &types, 48 * LISTED, usage, false)?;
-    g.slots = make_buffer(&g.buffers, d, &types, 64 * SLOTS as u64, usage, false)?;
+    g.tris = make_buffer(&g.buffers, d, &types, TRI_BYTES * LISTED, usage, false)?;
+    g.slots = make_buffer(&g.buffers, d, &types, SLOT_BYTES * SLOTS as u64, usage, false)?;
+    g.draws = make_buffer(&g.buffers, d, &types, 16 * MAX_DRAWS as u64, usage, false)?;
+    g.tex_map = make_buffer(&g.buffers, d, &types, 8 * TEX_MAP as u64, usage, false)?;
+    make_textures(g, &types)?;
     g.readback = make_buffer(&g.buffers, d, &types, 256, USAGE_TRANSFER_DST, true)?;
     let mut mapped = std::ptr::null_mut();
     check((g.buffers.map_memory)(d, g.readback.memory, 0, 256, 0, &mut mapped), "vkMapMemory")?;
@@ -458,8 +698,9 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         push_constants: &build_push,
     };
     check((f.create_pipeline_layout)(d, &info, none, &mut g.build_layout), "vkCreatePipelineLayout")?;
-    // The trace: the reflections' own set and push constants, then ours.
-    let trace_sets = [ssr_set_layout, g.set_layout];
+    // The trace: the reflections' own set and push constants, then ours,
+    // then the textures.
+    let trace_sets = [ssr_set_layout, g.set_layout, g.tex_layout];
     let trace_push = PushConstantRange {
         stages: SHADER_STAGE_COMPUTE,
         offset: 0,
@@ -469,7 +710,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         s_type: ST_PIPELINE_LAYOUT_CREATE_INFO,
         p_next: none,
         flags: 0,
-        set_layout_count: 2,
+        set_layout_count: 3,
         set_layouts: trace_sets.as_ptr(),
         push_constant_count: 1,
         push_constants: &trace_push,
@@ -502,7 +743,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
                 name: c"main".as_ptr(),
                 specialization: none,
             },
-            layout: if i == TRACE || i == UPSAMPLE { g.trace_layout } else { g.build_layout },
+            layout: if matches!(i, TRACE | UPSAMPLE | GATHER) { g.trace_layout } else { g.build_layout },
             base_pipeline: 0,
             base_pipeline_index: -1,
         };
@@ -527,8 +768,10 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         DescriptorBufferInfo { buffer: g.flags.buffer, offset: 0, range: 4 * n },
         DescriptorBufferInfo { buffer: g.globals.buffer, offset: 0, range: GLOBALS_BYTES },
         DescriptorBufferInfo { buffer: g.blocks.buffer, offset: 0, range: BLOCK_BYTES * g.block_room },
-        DescriptorBufferInfo { buffer: g.tris.buffer, offset: 0, range: 48 * LISTED },
-        DescriptorBufferInfo { buffer: g.slots.buffer, offset: 0, range: 64 * SLOTS as u64 },
+        DescriptorBufferInfo { buffer: g.tris.buffer, offset: 0, range: TRI_BYTES * LISTED },
+        DescriptorBufferInfo { buffer: g.slots.buffer, offset: 0, range: SLOT_BYTES * SLOTS as u64 },
+        DescriptorBufferInfo { buffer: g.draws.buffer, offset: 0, range: 16 * MAX_DRAWS as u64 },
+        DescriptorBufferInfo { buffer: g.tex_map.buffer, offset: 0, range: 8 * TEX_MAP as u64 },
     ];
     let writes: Vec<WriteDescriptorSet> = infos
         .iter()
@@ -628,8 +871,18 @@ pub(crate) fn record(
     }
     st.stats.keys = n;
     st.stats.frames += 1;
+    let dump_cache = CACHE_DUMP_NEXT.swap(false, Relaxed);
+    if dump_cache && g.cache_copy.buffer == 0 {
+        let types = memory_types()?;
+        g.cache_copy = make_buffer(&g.buffers, g.device as Dev, &types, SLOT_BYTES * SLOTS as u64, USAGE_TRANSFER_DST, true)?;
+        let mut mapped = std::ptr::null_mut();
+        check((g.buffers.map_memory)(g.device as Dev, g.cache_copy.memory, 0, SLOT_BYTES * SLOTS as u64, 0, &mut mapped), "vkMapMemory")?;
+        g.cache_copy_ptr = mapped as usize;
+    }
     let clear_blocks = !g.blocks_cleared;
     g.blocks_cleared = true;
+    let dummy_was_ready = g.dummy_ready;
+    g.dummy_ready = true;
     if g.readback_ptr != 0 {
         // SAFETY: our mapping of 256 bytes, written by an earlier frame's
         // copy; a torn or old value only skews the report.
@@ -654,14 +907,71 @@ pub(crate) fn record(
     // cache and the blocks.
     (f.cmd_fill_buffer)(cmd, g.globals.buffer, 0, 16, 0);
     (f.cmd_fill_buffer)(cmd, g.globals.buffer, 132, 12, 0);
+    (f.cmd_fill_buffer)(cmd, g.globals.buffer, 160, 4, 0);
     (f.cmd_fill_buffer)(cmd, g.flags.buffer, 0, 4 * n as u64, 0);
     if clear_blocks {
         (f.cmd_fill_buffer)(cmd, g.blocks.buffer, 0, BLOCK_BYTES * g.block_room, 0);
         (f.cmd_fill_buffer)(cmd, g.globals.buffer, 16, GLOBALS_BYTES - 16, 0);
-        (f.cmd_fill_buffer)(cmd, g.slots.buffer, 0, 64 * SLOTS as u64, 0);
+        (f.cmd_fill_buffer)(cmd, g.slots.buffer, 0, SLOT_BYTES * SLOTS as u64, 0);
     }
     g.barrier(cmd, STAGE_TRANSFER | STAGE_COMPUTE, ACCESS_TRANSFER_WRITE | ACCESS_SHADER_WRITE);
     let current = (triangles.min(capacity / capture::TRIANGLE_BYTES)) as u32;
+    // This frame's draws and textures: the draws' codes by first triangle,
+    // the views into set 2 (our image where there is none) and the table
+    // from serial to place.
+    let (draws, textures) = capture::frame_textures(device);
+    let draws: Vec<[u32; 4]> = draws.iter().take(MAX_DRAWS).map(|d| [d[0], d[1], 0, 0]).collect();
+    let mut map = vec![[0u32; 2]; TEX_MAP];
+    for (place, &(serial, _, _)) in textures.iter().enumerate() {
+        if let Some(e) = (0..4).map(|i| (serial as usize + i) % TEX_MAP).find(|&e| map[e][0] == 0) {
+            map[e] = [serial, place as u32 + 1];
+        }
+    }
+    let mut infos: Vec<DescriptorImageInfo> = textures
+        .iter()
+        .map(|&(_, view, layout)| DescriptorImageInfo { sampler: g.sampler, view, layout: layout as i32 })
+        .collect();
+    infos.resize_with(TEXTURES as usize, || DescriptorImageInfo { sampler: g.sampler, view: g.dummy_view, layout: LAYOUT_SHADER_READ_ONLY });
+    let write = WriteDescriptorSet {
+        s_type: ST_WRITE_DESCRIPTOR_SET,
+        p_next: std::ptr::null(),
+        set: g.tex_sets[slot],
+        binding: 0,
+        element: 0,
+        count: TEXTURES,
+        kind: DESCRIPTOR_COMBINED_IMAGE_SAMPLER,
+        image: infos.as_ptr(),
+        buffer: std::ptr::null(),
+        texel_views: std::ptr::null(),
+    };
+    (f.update_descriptor_sets)(g.device as Dev, 1, &write, 0, std::ptr::null());
+    if !draws.is_empty() {
+        (f.cmd_update_buffer)(cmd, g.draws.buffer, 0, 16 * draws.len() as u64, draws.as_ptr().cast());
+    }
+    (f.cmd_update_buffer)(cmd, g.tex_map.buffer, 0, 8 * TEX_MAP as u64, map.as_ptr().cast());
+    if !dummy_was_ready {
+        // Our image, never written, in the layout its descriptors name.
+        let b = super::super::frame_capture::ImageMemoryBarrier {
+            s_type: ST_IMAGE_MEMORY_BARRIER,
+            p_next: std::ptr::null(),
+            src_access_mask: 0,
+            dst_access_mask: ACCESS_SHADER_READ,
+            old_layout: 0,
+            new_layout: LAYOUT_SHADER_READ_ONLY,
+            src_queue_family_index: !0,
+            dst_queue_family_index: !0,
+            image: g.dummy,
+            subresource_range: super::super::frame_capture::ImageSubresourceRange {
+                aspect_mask: 1,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+        };
+        (g.buffers.pipeline_barrier)(cmd, STAGE_TRANSFER, STAGE_COMPUTE, 0, 0, std::ptr::null(), 0, std::ptr::null(), 1, (&b as *const super::super::frame_capture::ImageMemoryBarrier).cast());
+    }
+    g.barrier(cmd, STAGE_TRANSFER | STAGE_COMPUTE, ACCESS_TRANSFER_WRITE | ACCESS_SHADER_WRITE);
     let mut bp = BuildParams {
         n,
         cap: LISTED as u32,
@@ -670,13 +980,15 @@ pub(crate) fn record(
         current,
         flags: u32::from(cap.whole),
         slot_count: SLOTS,
-        pad: 0,
+        size: extent[0] | (extent[1] << 16),
+        draw_count: draws.len() as u32,
+        pad: [0; 3],
     };
-    let dispatch = |pipeline: usize, bp: &BuildParams, groups: u32| {
+    let dispatch = |pipeline: usize, bp: &BuildParams, groups: u32, layout: u64| {
         (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[pipeline]);
         (f.cmd_push_constants)(
             cmd,
-            g.build_layout,
+            layout,
             SHADER_STAGE_COMPUTE,
             0,
             std::mem::size_of::<BuildParams>() as u32,
@@ -685,20 +997,33 @@ pub(crate) fn record(
         (f.cmd_dispatch)(cmd, groups.max(1), 1, 1);
         g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
     };
+    let all_sets = [ssr_set, g.set, g.tex_sets[slot]];
     (f.cmd_bind_descriptor_sets)(cmd, BIND_POINT_COMPUTE, g.build_layout, 0, 1, &g.set, 0, std::ptr::null());
-    dispatch(FIT, &bp, 1);
-    dispatch(INSERT, &bp, current.div_ceil(256));
-    dispatch(GATHER, &bp, SLOTS.div_ceil(256));
-    dispatch(PREP, &bp, n.div_ceil(256));
+    dispatch(FIT, &bp, 1, g.build_layout);
+    dispatch(INSERT, &bp, current.div_ceil(256), g.build_layout);
+    // GATHER reads the reflections' copy of the depth too.
+    (f.cmd_bind_descriptor_sets)(cmd, BIND_POINT_COMPUTE, g.trace_layout, 0, 3, all_sets.as_ptr(), 0, std::ptr::null());
+    dispatch(GATHER, &bp, SLOTS.div_ceil(256), g.trace_layout);
+    if dump_cache {
+        // The cache as GATHER left it, for `rt dump-cache`.
+        let to_copy = MemoryBarrier { s_type: ST_MEMORY_BARRIER, p_next: std::ptr::null(), src_access_mask: ACCESS_SHADER_WRITE, dst_access_mask: ACCESS_TRANSFER_READ };
+        (g.buffers.pipeline_barrier)(cmd, STAGE_COMPUTE, STAGE_TRANSFER, 0, 1, &to_copy, 0, std::ptr::null(), 0, std::ptr::null());
+        let region = [0u64, 0, SLOT_BYTES * SLOTS as u64];
+        (g.buffers.copy_buffer)(cmd, g.slots.buffer, g.cache_copy.buffer, 1, region.as_ptr());
+        st.stats.cache_dumped_at = st.stats.frames;
+    }
+    (f.cmd_bind_descriptor_sets)(cmd, BIND_POINT_COMPUTE, g.build_layout, 0, 1, &g.set, 0, std::ptr::null());
+    let b = g.build_layout;
+    dispatch(PREP, &bp, n.div_ceil(256), b);
     for (pipeline, k, j, groups) in sort_plan(n) {
         bp.k = k;
         bp.j = j;
-        dispatch(pipeline, &bp, groups);
+        dispatch(pipeline, &bp, groups, b);
     }
     bp.k = 0;
     bp.j = 0;
-    dispatch(BUILD, &bp, n.div_ceil(256));
-    dispatch(BOUNDS, &bp, n.div_ceil(256));
+    dispatch(BUILD, &bp, n.div_ceil(256), b);
+    dispatch(BOUNDS, &bp, n.div_ceil(256), b);
     // The camera FIT measured, for `rt stats`.
     let to_host = MemoryBarrier { s_type: ST_MEMORY_BARRIER, p_next: std::ptr::null(), src_access_mask: ACCESS_SHADER_WRITE, dst_access_mask: ACCESS_TRANSFER_READ };
     (g.buffers.pipeline_barrier)(cmd, STAGE_COMPUTE, STAGE_TRANSFER, 0, 1, &to_host, 0, std::ptr::null(), 0, std::ptr::null());
@@ -706,8 +1031,7 @@ pub(crate) fn record(
     (g.buffers.copy_buffer)(cmd, g.globals.buffer, g.readback.buffer, 1, region.as_ptr());
     stamp(1);
     (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[TRACE]);
-    let sets = [ssr_set, g.set];
-    (f.cmd_bind_descriptor_sets)(cmd, BIND_POINT_COMPUTE, g.trace_layout, 0, 2, sets.as_ptr(), 0, std::ptr::null());
+    (f.cmd_bind_descriptor_sets)(cmd, BIND_POINT_COMPUTE, g.trace_layout, 0, 3, all_sets.as_ptr(), 0, std::ptr::null());
     (f.cmd_push_constants)(
         cmd,
         g.trace_layout,
@@ -727,6 +1051,54 @@ pub(crate) fn record(
     }
     capture::traced();
     Ok(true)
+}
+
+/// devctl `rt dump-cache <path>`: the cache's live triangles after the next
+/// traced frame, one line each: frame first and last seen, frames in a row
+/// its place showed empty, the low bits of its vertex shader's hash, its
+/// texture code, its longest edge in studs and its corners.
+pub(crate) fn dump_cache(path: &str) -> Result<String, String> {
+    let armed_at = state().stats.frames;
+    CACHE_DUMP_NEXT.store(true, Relaxed);
+    let t0 = std::time::Instant::now();
+    loop {
+        {
+            let st = state();
+            if st.stats.cache_dumped_at > armed_at && st.stats.frames >= st.stats.cache_dumped_at + 6 {
+                break;
+            }
+        }
+        if t0.elapsed() > std::time::Duration::from_secs(5) {
+            CACHE_DUMP_NEXT.store(false, Relaxed);
+            return Err("no frame was traced within 5 s".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let st = state();
+    let g = st.gpus.first().ok_or("no trace on any device")?;
+    let generation = st.stats.fit.map_or(0, |w| w[32]) & 0xff;
+    // SAFETY: our mapping of the whole copy, written six frames ago.
+    let words = unsafe { std::slice::from_raw_parts(g.cache_copy_ptr as *const u32, (SLOT_BYTES / 4 * SLOTS as u64) as usize) };
+    let mut text = String::from("born\tseen\tmisses\tsource\tcode\tedge\tA\tB\tC\n");
+    let mut live = 0;
+    for slot in words.chunks(32) {
+        let tag = slot[0];
+        if tag == 0 || tag >> 24 != generation {
+            continue;
+        }
+        live += 1;
+        let p = |i: usize| [f32::from_bits(slot[8 + 3 * i]), f32::from_bits(slot[9 + 3 * i]), f32::from_bits(slot[10 + 3 * i])];
+        let (a, b, c) = (p(0), p(1), p(2));
+        let d = |x: [f32; 3], y: [f32; 3]| ((x[0] - y[0]).powi(2) + (x[1] - y[1]).powi(2) + (x[2] - y[2]).powi(2)).sqrt();
+        let edge = d(a, b).max(d(b, c)).max(d(c, a));
+        text.push_str(&format!(
+            "{}\t{}\t{}\t{:08x}\t{:08x}\t{edge:.2}\t{:.2},{:.2},{:.2}\t{:.2},{:.2},{:.2}\t{:.2},{:.2},{:.2}\n",
+            slot[6], slot[2], slot[3], slot[5], slot[4], a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]
+        ));
+    }
+    drop(st);
+    std::fs::write(path, text).map_err(|e| format!("{path}: {e}"))?;
+    Ok(format!("{live} cached triangles to {path}"))
 }
 
 /// A frame the trace was wanted for but not recorded.
@@ -766,7 +1138,8 @@ fn fit_text(fit: Option<[u32; GLOBALS_READ]>) -> String {
     }
     format!(
         "fit=ok fit_samples={} fov_x={:.2} fov_y={:.2} near={:.4} forward_len={:.4} world_up={:.3},{:.3},{:.3} exposure={:.3} \
-         camera={:.1},{:.1},{:.1} cache_listed={} cache_new={} cache_dropped={} cache_full={} cache_generation={}",
+         camera={:.1},{:.1},{:.1} cache_listed={} cache_new={} cache_dropped={} cache_full={} cache_generation={} \
+         list_cut={} fit_failures={}",
         w[1],
         2.0 * f(4).atan().to_degrees(),
         2.0 * f(5).atan().to_degrees(),
@@ -783,7 +1156,9 @@ fn fit_text(fit: Option<[u32; GLOBALS_READ]>) -> String {
         w[35],
         w[33],
         w[34],
-        w[32] & 0xff
+        w[32] & 0xff,
+        w[40],
+        w[41]
     )
 }
 
@@ -791,9 +1166,10 @@ pub(crate) fn stats_line() -> String {
     let st = state();
     let s = &st.stats;
     format!(
-        "on={} reflections={} traced={} skipped={} keys={} {} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} gpu_samples={}{}",
+        "on={} reflections={} shade={} traced={} skipped={} keys={} {} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} gpu_samples={}{}",
         is_on(),
         if super::super::ssr::reflections_on() { "on" } else { "off" },
+        SHADES[shade().load(Relaxed)],
         s.frames,
         s.skipped,
         s.keys,
@@ -847,6 +1223,6 @@ mod tests {
 
     #[test]
     fn the_build_parameters_have_the_shader_layout() {
-        assert_eq!(std::mem::size_of::<BuildParams>(), 32);
+        assert_eq!(std::mem::size_of::<BuildParams>(), 48);
     }
 }
