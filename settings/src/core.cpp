@@ -1015,17 +1015,124 @@ bool parseShaderTables(const QByteArray &json, QList<SsrTable> *out, QString *er
     return true;
 }
 
-std::optional<QList<SsrTable>> readShaderTables(QString *error) {
+std::optional<QList<SsrTable>> readShaderTables(QString *error, QList<ShaderMode> *modes) {
     const auto out = runLauncher({QStringLiteral("--shader-looks")}, 10000, error);
     if (!out)
         return std::nullopt;
     QList<SsrTable> tables;
+    QList<ShaderMode> parsedModes;
     QString parseError;
-    if (!parseShaderTables(*out, &tables, &parseError)) {
+    if (!parseShaderTables(*out, &tables, &parseError) || !parseShaderModes(*out, tables, &parsedModes, &parseError)) {
         *error = QStringLiteral("intoxicated --shader-looks printed something else: %1").arg(parseError);
         return std::nullopt;
     }
+    if (modes)
+        *modes = parsedModes;
     return tables;
+}
+
+bool parseShaderModes(const QByteArray &json, const QList<SsrTable> &tables, QList<ShaderMode> *out, QString *error) {
+    const auto fail = [&](const QString &why) {
+        if (error)
+            *error = why;
+        return false;
+    };
+    const QJsonObject root = QJsonDocument::fromJson(json).object();
+    QList<ShaderMode> modes;
+    if (!root.contains(QStringLiteral("modes"))) {
+        *out = modes;
+        return true;
+    }
+    if (root.value(QStringLiteral("mode_env")).toString() != kShaderModeSetting)
+        return fail(QStringLiteral("the modes name another variable than %1").arg(kShaderModeSetting));
+    static const QRegularExpression modeName(QStringLiteral("^[a-z0-9_]+$"));
+    for (const QJsonValue &v : root.value(QStringLiteral("modes")).toArray()) {
+        const QJsonObject o = v.toObject();
+        ShaderMode m;
+        m.name = o.value(QStringLiteral("name")).toString();
+        m.title = o.value(QStringLiteral("title")).toString();
+        m.description = o.value(QStringLiteral("description")).toString();
+        if (!modeName.match(m.name).hasMatch() || m.title.isEmpty() || findShaderMode(modes, m.name))
+            return fail(QStringLiteral("a mode without a usable name or title: %1").arg(m.name));
+        const QJsonObject effects = o.value(QStringLiteral("effects")).toObject();
+        for (const SsrTable &t : tables) {
+            const QJsonObject e = effects.value(t.name).toObject();
+            const QString look = e.value(QStringLiteral("look")).toString();
+            if (!e.value(QStringLiteral("on")).isBool() || !t.look(look))
+                return fail(QStringLiteral("mode %1 has no usable switch and look for %2").arg(m.name, t.name));
+            m.effects.insert(t.name, {e.value(QStringLiteral("on")).toBool(), look});
+        }
+        modes.append(m);
+    }
+    *out = modes;
+    return true;
+}
+
+const ShaderMode *findShaderMode(const QList<ShaderMode> &modes, const QString &name) {
+    for (const ShaderMode &m : modes) {
+        if (m.name == name)
+            return &m;
+    }
+    return nullptr;
+}
+
+bool expandShaderMode(const QList<SsrTable> &tables, const QList<ShaderMode> &modes, SettingsConf &conf) {
+    const auto line = conf.value(kShaderModeSetting);
+    if (!line)
+        return false;
+    // A name that is no mode the client ignores, so it is dropped as it is.
+    if (const ShaderMode *m = findShaderMode(modes, line->trimmed())) {
+        const auto unset = [&](const QString &key) { return conf.value(key).value_or(QString()).trimmed().isEmpty(); };
+        for (const SsrTable &t : tables) {
+            if (!m->effects.contains(t.name))
+                continue;
+            const auto [on, look] = m->effects.value(t.name);
+            if (unset(t.switchEnv))
+                setEffectOn(t.switchEnv, conf, on);
+            if (unset(t.lookEnv)) {
+                if (look == t.defaultLook)
+                    conf.remove(t.lookEnv);
+                else
+                    conf.set(t.lookEnv, look);
+            }
+        }
+    }
+    conf.remove(kShaderModeSetting);
+    return true;
+}
+
+QString currentShaderMode(const QList<SsrTable> &tables, const QList<ShaderMode> &modes, const SettingsConf &conf) {
+    SettingsConf c = conf;
+    expandShaderMode(tables, modes, c);
+    for (const ShaderMode &m : modes) {
+        bool all = true;
+        for (const SsrTable &t : tables) {
+            const auto [on, look] = m.effects.value(t.name, {false, t.defaultLook});
+            const bool isOn = effectOn(t.switchEnv, c);
+            QString unknown;
+            if (isOn != on || (on && (ssrLook(t, c, &unknown) != look || !unknown.isEmpty() || !ssrOverrides(t, c).isEmpty()))) {
+                all = false;
+                break;
+            }
+        }
+        if (all)
+            return m.name;
+    }
+    return QString();
+}
+
+bool applyShaderMode(const QList<SsrTable> &tables, const QList<ShaderMode> &modes, SettingsConf &conf,
+                     const QString &mode) {
+    const ShaderMode *m = findShaderMode(modes, mode);
+    if (!m)
+        return false;
+    conf.remove(kShaderModeSetting);
+    for (const SsrTable &t : tables) {
+        const auto [on, look] = m->effects.value(t.name, {false, t.defaultLook});
+        setEffectOn(t.switchEnv, conf, on);
+        applySsrLook(t, conf, look);
+    }
+    return true;
 }
 
 std::optional<SsrTable> readSsrTable(QString *error) {

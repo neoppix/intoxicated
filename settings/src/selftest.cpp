@@ -745,7 +745,7 @@ void testSsrLauncher(const QString &scratch) {
 }
 
 // What `intoxicated --shader-looks` prints, cut down: the reflections with
-// one knob, the depth of field and the bloom with two each.
+// one knob, the depth of field and the bloom with two each, and three modes.
 const QByteArray kShaderLooks = R"json({
   "effects": [
     {"name": "ssr", "title": "Reflections (SSR)", "summary": "Reflections.",
@@ -764,6 +764,18 @@ const QByteArray kShaderLooks = R"json({
                {"default": [1, 1, 1], "env": "INTOXICATED_BLOOM_TINT", "kind": "rgb", "max": 2, "min": 0, "name": "tint"}],
      "looks": [{"description": "Soft.", "name": "soft", "values": {"intensity": 0.35, "tint": [1, 1, 1]}},
                {"description": "Neon.", "name": "neon", "values": {"intensity": 0.7, "tint": [1, 1, 1]}}]}
+  ],
+  "mode_env": "INTOXICATED_SHADERS_MODE",
+  "modes": [
+    {"name": "off", "title": "Off", "description": "Nothing.",
+     "effects": {"ssr": {"on": false, "look": "competitive"}, "dof": {"on": false, "look": "cinematic"},
+                 "bloom": {"on": false, "look": "soft"}}},
+    {"name": "competitive", "title": "Competitive", "description": "Playable.",
+     "effects": {"ssr": {"on": true, "look": "competitive"}, "dof": {"on": false, "look": "cinematic"},
+                 "bloom": {"on": true, "look": "soft"}}},
+    {"name": "cinematic", "title": "Cinematic", "description": "Clips.",
+     "effects": {"ssr": {"on": true, "look": "competitive"}, "dof": {"on": true, "look": "portrait"},
+                 "bloom": {"on": true, "look": "neon"}}}
   ]
 })json";
 
@@ -852,6 +864,83 @@ void testEffectSettings() {
     QFile::remove(path);
 }
 
+void testShaderModes() {
+    QList<SsrTable> tables;
+    parseShaderTables(kShaderLooks, &tables, nullptr);
+    QList<ShaderMode> modes;
+    QString error;
+    check(parseShaderModes(kShaderLooks, tables, &modes, &error), "the modes parse: " + error);
+    same(modes.size(), 3, "three modes");
+    if (tables.size() != 3 || modes.size() != 3)
+        return;
+    same(modes[1].title, QString("Competitive"), "a mode's title");
+    check(modes[2].effects.value("dof") == qMakePair(true, QString("portrait")), "a mode's switch and look");
+    QList<ShaderMode> none;
+    check(parseShaderModes(QByteArray(kShaderLooks).replace("\"modes\"", "\"later\""), tables, &none, &error) &&
+              none.isEmpty(),
+          "a client without modes lists none");
+    const auto refused = [&](const QByteArray &json, const QString &what) {
+        QList<ShaderMode> m;
+        QString why;
+        check(!parseShaderModes(json, tables, &m, &why) && !why.isEmpty(), "refused: " + what + " (" + why + ")");
+    };
+    refused(QByteArray(kShaderLooks).replace("\"look\": \"portrait\"", "\"look\": \"blurry\""), "a look of no effect");
+    refused(QByteArray(kShaderLooks).replace("\"name\": \"cinematic\", \"title\"", "\"name\": \"off\", \"title\""),
+            "a mode listed twice");
+    refused(QByteArray(kShaderLooks).replace("\"mode_env\": \"INTOXICATED_SHADERS_MODE\"", "\"mode_env\": \"PATH\""),
+            "another variable");
+
+    const QString path = settingsConfPath();
+    const auto reloaded = [&] {
+        SettingsConf c;
+        c.load(path);
+        return c;
+    };
+    writeAll(path, "");
+    SettingsConf conf = reloaded();
+    same(currentShaderMode(tables, modes, conf), QString("off"), "nothing set is Off");
+    check(applyShaderMode(tables, modes, conf, "cinematic"), "pick Cinematic");
+    check(!applyShaderMode(tables, modes, conf, "fancy"), "a name that is no mode is refused");
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path),
+         QByteArray("INTOXICATED_SSR=1\nINTOXICATED_DOF=1\nINTOXICATED_DOF_LOOK=portrait\nINTOXICATED_BLOOM=1\n"
+                    "INTOXICATED_BLOOM_LOOK=neon\n"),
+         "a mode is written as every effect's own switch and look");
+    conf = reloaded();
+    same(currentShaderMode(tables, modes, conf), QString("cinematic"), "and reads back as the mode");
+    setSsrKnob(conf, *tables[2].knob("intensity"), {1.0});
+    same(currentShaderMode(tables, modes, conf), QString(), "fine tuning an effect that is on is Custom");
+    check(applyShaderMode(tables, modes, conf, "competitive"), "pick Competitive");
+    check(conf.save(&error), "save: " + error);
+    same(readAll(path), QByteArray("INTOXICATED_SSR=1\nINTOXICATED_BLOOM=1\n"),
+         "the looks back at their defaults, the depth of field off, the fine tuning gone");
+    conf = reloaded();
+    same(currentShaderMode(tables, modes, conf), QString("competitive"), "Competitive");
+    setEffectOn(tables[1].switchEnv, conf, true);
+    same(currentShaderMode(tables, modes, conf), QString(), "one more effect on is Custom");
+    check(applyShaderMode(tables, modes, conf, "off"), "pick Off");
+    same(conf.text(), QString(), "Off writes nothing");
+    setSsrKnob(conf, *tables[2].knob("intensity"), {1.0});
+    same(currentShaderMode(tables, modes, conf), QString("off"), "fine tuning of an effect that is off is still Off");
+
+    // A hand-written mode line: what it asks for where an effect's own line
+    // is unset, written out as the effects' lines.
+    writeAll(path, "INTOXICATED_SHADERS_MODE=cinematic\nINTOXICATED_SSR=0\nINTOXICATED_BLOOM_LOOK=soft\n");
+    conf = reloaded();
+    same(currentShaderMode(tables, modes, conf), QString(), "the mode with the reflections off is Custom");
+    check(expandShaderMode(tables, modes, conf), "the mode line is expanded");
+    same(conf.text(), QString("INTOXICATED_SSR=0\nINTOXICATED_BLOOM_LOOK=soft\nINTOXICATED_DOF=1\nINTOXICATED_DOF_LOOK=portrait\n"
+                              "INTOXICATED_BLOOM=1\n"),
+         "an effect's own lines win, the rest come from the mode");
+    check(!expandShaderMode(tables, modes, conf), "and only once");
+    writeAll(path, "INTOXICATED_SHADERS_MODE=competitive\n");
+    same(currentShaderMode(tables, modes, reloaded()), QString("competitive"), "a mode line alone is that mode");
+    writeAll(path, "INTOXICATED_SHADERS_MODE=fancy\n");
+    conf = reloaded();
+    check(expandShaderMode(tables, modes, conf) && conf.text().isEmpty(), "a line naming no mode is dropped");
+    QFile::remove(path);
+}
+
 // readShaderTables runs `intoxicated --shader-looks`.
 void testShaderLauncher(const QString &scratch) {
     const QString bin = scratch + "/bin2";
@@ -864,10 +953,12 @@ void testShaderLauncher(const QString &scratch) {
     const QByteArray savedPath = qgetenv("PATH");
     qputenv("PATH", QFile::encodeName(bin) + ":" + savedPath);
     QString error;
-    const auto tables = readShaderTables(&error);
+    QList<ShaderMode> modes;
+    const auto tables = readShaderTables(&error, &modes);
     check(tables.has_value(), "the effects come from intoxicated --shader-looks: " + error);
     if (tables)
         same(tables->size(), 3, "all of them");
+    same(modes.size(), 3, "and the modes");
     writeAll(launcher, "#!/bin/sh\necho '{\"effects\": 1}'\n");
     check(!readShaderTables(&error), "something else is refused");
     check(error.startsWith("intoxicated --shader-looks printed something else"), "and said: " + error);
@@ -907,6 +998,7 @@ int runSelfTest() {
     testSsrLauncher(root);
     testShaderTables();
     testEffectSettings();
+    testShaderModes();
     testShaderLauncher(root);
 
     std::printf("self-test: %d checks, %d failed (scratch %s)\n", g_checks, g_failures, qPrintable(root));

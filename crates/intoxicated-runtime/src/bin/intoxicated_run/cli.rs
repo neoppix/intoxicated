@@ -438,6 +438,13 @@ env:
                                      grayscale PNG, with a screenshot of the
                                      same frame and the raw floats beside it);
                                      without either they are not installed
+  INTOXICATED_SHADERS_MODE=<name>    off, competitive or cinematic: every
+                                     effect below switched on or off and
+                                     started from a look at once; an
+                                     effect's own switch or LOOK variable
+                                     wins over it, its knobs change it as
+                                     always. devctl's shaders mode <name>
+                                     does the same live
   INTOXICATED_SSR=1                  screen-space reflections (experimental):
                                      wet-ground style reflections drawn into
                                      the 3D scene before the HUD, by compute

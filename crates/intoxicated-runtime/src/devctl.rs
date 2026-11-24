@@ -23,7 +23,8 @@
 //!   reflections and answers with their state, their looks and their GPU
 //!   time; `dof ...`, `bloom ...`, `lens ...` and `sharpen ...` take the
 //!   same words for the depth of field, the bloom, the lens effects and the
-//!   sharpening.
+//!   sharpening; `shaders mode <name>` sets every effect's switch and look
+//!   from a mode (off, competitive, cinematic) and `shaders` reports them.
 //! - `bussub`, `buslast` and `deeplink` reach the engine's message bus through
 //!   `deeplink::dev_request`, which blocks this thread for at most 5 s.
 //!
@@ -377,9 +378,9 @@ fn reply(line: &str) -> String {
             None => "err depthshot <path>".into(),
         },
         // Screen-space reflections, depth of field, bloom, lens effects and
-        // sharpening: on, off, their settings and GPU cost. See
-        // `android::ssr`.
-        verb @ ("ssr" | "dof" | "bloom" | "lens" | "sharpen") => {
+        // sharpening: on, off, their settings and GPU cost; and the modes
+        // that set them all. See `android::ssr`.
+        verb @ ("ssr" | "dof" | "bloom" | "lens" | "sharpen" | "shaders") => {
             let args: Vec<&str> = it.collect();
             match crate::android::ssr::control_verb(verb, &args) {
                 Some(Ok(state)) => format!("ok {state}"),

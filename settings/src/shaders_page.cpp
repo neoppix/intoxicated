@@ -1,9 +1,10 @@
 // Intoxicated Settings: the Shaders page. The effects the client draws into
-// the game before the HUD (screen-space reflections, depth of field, bloom),
-// one group each: the switch, the named looks and a fine-tune row per knob,
-// each written to settings.conf as it changes. The effects, their knobs and
-// their looks come from `intoxicated --shader-looks`, so nothing here keeps
-// a copy of their values.
+// the game before the HUD (screen-space reflections, depth of field, bloom,
+// lens, sharpen): at the top the whole-page modes, then one group each: the
+// switch, the named looks and a fine-tune row per knob, each written to
+// settings.conf as it changes. The effects, their knobs, their looks and the
+// modes come from `intoxicated --shader-looks`, so nothing here keeps a copy
+// of their values.
 
 #include "app.h"
 #include "style.h"
@@ -139,7 +140,7 @@ ShadersPage::ShadersPage(AppState *state) : m_state(state) {
                                                "settings.conf for every profile. Changes apply the next time "
                                                "Intoxicated starts."));
     QString error;
-    const auto tables = readShaderTables(&error);
+    const auto tables = readShaderTables(&error, &m_modes);
     m_tableError = problemLabel();
     setProblem(m_tableError, tables ? QString()
                                     : QStringLiteral("The effects could not be read, so only their switches are "
@@ -162,6 +163,37 @@ ShadersPage::ShadersPage(AppState *state) : m_state(state) {
             fx.table.lookEnv = fx.table.switchEnv + QStringLiteral("_LOOK");
             m_effects.append(fx);
         }
+    }
+    if (!m_modes.isEmpty()) {
+        Section s = section(QStringLiteral("Mode"));
+        auto *v = new QVBoxLayout(s.body);
+        v->setContentsMargins(14, 10, 14, 10);
+        v->setSpacing(6);
+        auto *row = new QHBoxLayout;
+        row->setSpacing(6);
+        for (int i = 0; i <= m_modes.size(); ++i) {
+            const bool custom = i == m_modes.size();
+            auto *btn = new QPushButton(custom ? QStringLiteral("Custom") : m_modes[i].title);
+            btn->setObjectName(QStringLiteral("segment"));
+            btn->setCheckable(true);
+            btn->setCursor(Qt::PointingHandCursor);
+            btn->setFocusPolicy(Qt::NoFocus);
+            btn->setMinimumHeight(30);
+            btn->setToolTip(custom ? QStringLiteral("The effects below as you set them")
+                                   : QStringLiteral("%1=%2").arg(kShaderModeSetting, m_modes[i].name));
+            row->addWidget(btn, 1);
+            m_modeButtons.append(btn);
+            // Custom is where hand changes land; it is not picked.
+            if (custom)
+                connect(btn, &QPushButton::clicked, this, [this] { reload(); });
+            else
+                connect(btn, &QPushButton::clicked, this, [this, i] { modeChosen(i); });
+        }
+        v->addLayout(row);
+        m_modeDesc = note(QString());
+        v->addWidget(m_modeDesc);
+        b->addWidget(s.box);
+        b->addSpacing(8);
     }
     for (int i = 0; i < m_effects.size(); ++i)
         buildEffect(b, i);
@@ -365,9 +397,30 @@ void ShadersPage::reload() {
     QString error;
     if (!conf.load(settingsConfPath(), &error))
         QMessageBox::warning(this, QStringLiteral("Shaders"), error);
+    // What a hand-written mode line asks for, as the effects' own lines.
+    const QList<SsrTable> tables = knownTables();
+    expandShaderMode(tables, m_modes, conf);
     for (EffectUi &fx : m_effects)
         reloadEffect(conf, fx);
+    if (!m_modeButtons.isEmpty()) {
+        const QString current = currentShaderMode(tables, m_modes, conf);
+        for (int i = 0; i < m_modeButtons.size(); ++i)
+            m_modeButtons[i]->setChecked(i < m_modes.size() ? m_modes[i].name == current : current.isEmpty());
+        const ShaderMode *m = findShaderMode(m_modes, current);
+        m_modeDesc->setText(m ? m->description
+                              : QStringLiteral("The effects below are set by hand. Picking a mode sets every "
+                                               "effect's switch and look and clears the fine tuning."));
+    }
     m_filling = false;
+}
+
+QList<SsrTable> ShadersPage::knownTables() const {
+    QList<SsrTable> out;
+    for (const EffectUi &fx : m_effects) {
+        if (fx.known)
+            out.append(fx.table);
+    }
+    return out;
 }
 
 void ShadersPage::reloadEffect(const SettingsConf &conf, EffectUi &fx) {
@@ -433,6 +486,10 @@ void ShadersPage::edit(const std::function<bool(SettingsConf &)> &change) {
     SettingsConf conf;
     QString error;
     bool ok = conf.load(settingsConfPath(), &error);
+    // A mode line is written out as the effects' own lines first, so a
+    // change to one effect keeps what the mode set for the others.
+    if (ok)
+        expandShaderMode(knownTables(), m_modes, conf);
     if (ok && !change(conf)) {
         ok = false;
         error = QStringLiteral("That value cannot be written.");
@@ -465,6 +522,33 @@ void ShadersPage::lookChosen(int effect, int index) {
         }
     }
     edit([this, effect, look](SettingsConf &c) { return applySsrLook(m_effects.at(effect).table, c, look.name); });
+}
+
+void ShadersPage::modeChosen(int index) {
+    const ShaderMode mode = m_modes.at(index);
+    SettingsConf conf;
+    conf.load(settingsConfPath());
+    expandShaderMode(knownTables(), m_modes, conf);
+    QStringList tuned;
+    for (const EffectUi &fx : m_effects) {
+        if (!fx.known)
+            continue;
+        for (const QString &name : ssrOverrides(fx.table, conf))
+            tuned.append(QStringLiteral("%1 %2").arg(fx.table.title, knobTitle(fx.table.name, name).toLower()));
+    }
+    if (!tuned.isEmpty()) {
+        const auto answer = QMessageBox::question(
+            this, mode.title,
+            QStringLiteral("Use the %1 mode? It sets every effect's switch and look, and your fine tuning of %2 is "
+                           "removed.")
+                .arg(mode.title, tuned.join(QStringLiteral(", "))),
+            QMessageBox::Yes | QMessageBox::Cancel, QMessageBox::Cancel);
+        if (answer != QMessageBox::Yes) {
+            reload();
+            return;
+        }
+    }
+    edit([this, mode](SettingsConf &c) { return applyShaderMode(knownTables(), m_modes, c, mode.name); });
 }
 
 void ShadersPage::knobMoved(int effect, int row) {

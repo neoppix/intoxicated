@@ -172,7 +172,9 @@ private:
 };
 
 // Effects the client draws into the game before the HUD: screen-space
-// reflections, depth of field and bloom, one group each with its switch, its
+// reflections, depth of field, bloom, lens and sharpen. At the top the
+// whole-page modes (Off, Competitive, Cinematic, and Custom when the effects
+// were changed by hand), then one group per effect with its switch, its
 // looks and a fine-tune row per knob. Each control writes settings.conf as it
 // changes.
 class ShadersPage : public QWidget {
@@ -218,12 +220,19 @@ private:
     // Load settings.conf, apply CHANGE, write it, show the result.
     void edit(const std::function<bool(SettingsConf &)> &change);
     void lookChosen(int effect, int index);
+    void modeChosen(int index);
+    // The tables of the effects the client listed.
+    QList<SsrTable> knownTables() const;
     // Write row ROW's override from its controls.
     void knobMoved(int effect, int row);
     void showSliders(const KnobRow &row, const SsrValue &value);
 
     AppState *m_state;
     QList<EffectUi> m_effects;
+    QList<ShaderMode> m_modes;
+    // One per mode, then Custom.
+    QList<QPushButton *> m_modeButtons;
+    QLabel *m_modeDesc = nullptr;
     QLabel *m_tableError;
     bool m_filling = false;
 };

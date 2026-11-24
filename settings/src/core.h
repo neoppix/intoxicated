@@ -259,9 +259,10 @@ std::optional<FlagMap> readDefaultFlags(QString *error);
 
 // --- Effects (the Shaders page) ---------------------------------------------
 
-// The client draws three effects before the HUD: screen-space reflections,
-// depth of field and bloom. Each is set by settings.conf lines the client
-// reads at start: INTOXICATED_SSR=1 (or _DOF, _BLOOM) turns it on,
+// The client draws five effects before the HUD: screen-space reflections,
+// depth of field, bloom, lens and sharpen. Each is set by settings.conf lines
+// the client reads at start: INTOXICATED_SSR=1 (or _DOF, _BLOOM, _LENS,
+// _SHARPEN) turns it on,
 // INTOXICATED_SSR_LOOK=<name> starts from a named look and
 // INTOXICATED_SSR_<KNOB>=<value> overrides one knob of it. The effects, their
 // knobs and looks are the client's own, read from `intoxicated
@@ -316,7 +317,41 @@ std::optional<SsrTable> readSsrTable(QString *error);
 // Parse what `intoxicated --shader-looks` prints: every effect, in the order
 // the client draws them, each a usable table with its own variables.
 bool parseShaderTables(const QByteArray &json, QList<SsrTable> *out, QString *error);
-std::optional<QList<SsrTable>> readShaderTables(QString *error);
+
+// A whole-page mode: every effect's switch and look at once. In
+// settings.conf INTOXICATED_SHADERS_MODE=<name> fills in each effect's switch
+// and look where its own line is unset; this app writes a picked mode as the
+// effects' own lines instead, so the page and the file always agree.
+inline const QString kShaderModeSetting = QStringLiteral("INTOXICATED_SHADERS_MODE");
+
+struct ShaderMode {
+    QString name;
+    QString title;
+    QString description;
+    // Effect name to its switch and look.
+    QMap<QString, QPair<bool, QString>> effects;
+};
+
+// `intoxicated --shader-looks`, parsed. MODES, when given, gets the
+// whole-page modes the client lists (none from a client that lists none).
+std::optional<QList<SsrTable>> readShaderTables(QString *error, QList<ShaderMode> *modes = nullptr);
+
+// Parse the "modes" of what `intoxicated --shader-looks` prints, against its
+// TABLES: every mode names a look of each effect. No "modes" is no modes.
+bool parseShaderModes(const QByteArray &json, const QList<SsrTable> &tables, QList<ShaderMode> *out, QString *error);
+const ShaderMode *findShaderMode(const QList<ShaderMode> &modes, const QString &name);
+// Write out what an INTOXICATED_SHADERS_MODE line asks for as the effects' own
+// lines, where theirs are unset, and remove it. Whether CONF changed.
+bool expandShaderMode(const QList<SsrTable> &tables, const QList<ShaderMode> &modes, SettingsConf &conf);
+// The mode the client starts in: the name of the one whose switches and
+// looks every effect has (an effect off in both counts as matching whatever
+// its look), an empty string when none (Custom). An effect that is on with
+// fine tuning matches no mode.
+QString currentShaderMode(const QList<SsrTable> &tables, const QList<ShaderMode> &modes, const SettingsConf &conf);
+// Every effect's switch and look as the mode sets them, every knob's
+// override removed. Refused, with CONF unchanged, for a name that is no mode.
+bool applyShaderMode(const QList<SsrTable> &tables, const QList<ShaderMode> &modes, SettingsConf &conf,
+                     const QString &mode);
 
 // "wet_road" as a button says it: "Wet road".
 QString ssrLookTitle(const QString &name);

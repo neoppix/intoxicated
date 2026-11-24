@@ -364,6 +364,85 @@ pub(crate) fn effect(name: &str) -> Option<&'static Effect> {
     EFFECTS.iter().copied().find(|fx| fx.name == name)
 }
 
+/// The variable that picks a whole-page mode ([`MODES`]).
+pub const MODE_ENV: &str = "INTOXICATED_SHADERS_MODE";
+
+/// Every effect's switch and look at once. A mode only fills in what is not
+/// set: an effect's own switch or look variable, when it is set, wins over
+/// the mode, and the knobs' variables then change the look as always.
+pub(crate) struct Mode {
+    pub name: &'static str,
+    pub title: &'static str,
+    pub description: &'static str,
+    /// Per effect, in the order of [`EFFECTS`]: on, and the look it starts
+    /// from.
+    pub effects: [(bool, &'static str); N],
+}
+
+/// The modes, for `INTOXICATED_SHADERS_MODE`, devctl `shaders mode` and the
+/// top of the Shaders page.
+pub(crate) const MODES: [Mode; 3] = [
+    Mode {
+        name: "off",
+        title: "Off",
+        description: "Every effect off: the game as the engine draws it.",
+        effects: [(false, "competitive"), (false, "playable"), (false, "soft"), (false, "subtle"), (false, "light")],
+    },
+    Mode {
+        name: "competitive",
+        title: "Competitive",
+        description: "Prettier but playable: faint, soft reflections on floors, only the far background softened, a \
+                      subtle glow and light sharpening. No lens effects, nothing that hides players or blinds.",
+        effects: [(true, "competitive"), (true, "playable"), (true, "soft"), (false, "subtle"), (true, "light")],
+    },
+    Mode {
+        name: "cinematic",
+        title: "Cinematic",
+        description: "For clips: clear reflections, your character in focus against a soft background, strong \
+                      glow, a colour split and rainbow halo like a lens, crunchy sharpening.",
+        effects: [(true, "clean_mirror"), (true, "cinematic"), (true, "neon"), (true, "prism"), (true, "crunchy")],
+    },
+];
+
+pub(crate) fn mode(name: &str) -> Option<&'static Mode> {
+    MODES.iter().find(|m| m.name == name)
+}
+
+pub(crate) const SHADERS_USAGE: &str = "shaders [get]|mode <name>; modes: off competitive cinematic";
+
+/// `var` with the mode `var` names (by [`MODE_ENV`]) filled in for `fx`:
+/// its switch and look variables, where they are unset or blank, read as
+/// the mode sets them. A warning when the mode names no mode.
+fn with_mode<'a>(
+    fx: &'a Effect,
+    var: impl Fn(&str) -> Option<String> + 'a,
+    warnings: &mut Vec<String>,
+) -> impl Fn(&str) -> Option<String> + 'a {
+    let fill = match var(MODE_ENV).as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(name) => match mode(name) {
+            Some(m) => Some(m.effects[fx.index]),
+            None => {
+                warnings.push(format!(
+                    "[android] vulkan: {}: {MODE_ENV}={name:?} is not a mode ({}); using each effect's own settings",
+                    fx.name,
+                    MODES.iter().map(|m| m.name).collect::<Vec<_>>().join(" ")
+                ));
+                None
+            }
+        },
+    };
+    move |name: &str| {
+        let own = var(name);
+        let unset = own.as_deref().is_none_or(|v| v.trim().is_empty());
+        match fill {
+            Some((on, _)) if unset && name == fx.env => Some(if on { "1" } else { "0" }.to_string()),
+            Some((_, look)) if unset && name == fx.look_env => Some(look.to_string()),
+            _ => own,
+        }
+    }
+}
+
 /// What the environment asks for: on or off, every knob's value, and a line
 /// for each value that was not understood (and left at its default).
 #[derive(Clone, Debug, PartialEq)]
@@ -444,6 +523,15 @@ impl Effect {
         Some(self.knobs.iter().zip(look).map(|(k, v)| v.unwrap_or(k.default)).collect())
     }
 
+    /// The look whose values every knob has now, if any.
+    fn look_now(&self) -> Option<&'static str> {
+        let now = self.current();
+        self.looks.iter().map(|l| l.name).find(|name| {
+            self.look_values(name)
+                .is_some_and(|look| look.iter().zip(&now).all(|(want, have)| want.is_none_or(|w| w == *have)))
+        })
+    }
+
     fn look_names(&self) -> String {
         self.looks.iter().map(|l| l.name).collect::<Vec<_>>().join(" ")
     }
@@ -492,7 +580,18 @@ impl Effect {
         })
     }
 
+    /// The effect's settings from `var`, with the mode [`MODE_ENV`] names
+    /// filled in.
     pub(crate) fn parse_settings(&self, var: impl Fn(&str) -> Option<String>) -> Settings {
+        let mut warnings = Vec::new();
+        let var = with_mode(self, var, &mut warnings);
+        let mut s = self.parse_own_settings(var);
+        warnings.append(&mut s.warnings);
+        s.warnings = warnings;
+        s
+    }
+
+    fn parse_own_settings(&self, var: impl Fn(&str) -> Option<String>) -> Settings {
         let (name, env, look_env) = (self.name, self.env, self.look_env);
         let mut warnings = Vec::new();
         let on = match var(env).as_deref().map(str::trim) {
@@ -537,7 +636,10 @@ impl Effect {
     fn start_from(&self, var: impl Fn(&str) -> Option<String>) -> bool {
         let s = self.parse_settings(var);
         for w in &s.warnings {
-            println!("{w}");
+            // The same warning about the mode comes for every effect.
+            if self.index == 0 || !w.contains(MODE_ENV) {
+                println!("{w}");
+            }
         }
         for (k, v) in self.knobs.iter().zip(&s.values) {
             self.set(k, *v);
@@ -642,10 +744,23 @@ pub fn looks_json() -> String {
 }
 
 /// What `intoxicated-run --print-shader-looks` prints, for Intoxicated
-/// Settings' Shaders page: `{"effects": [...]}`, every effect in the order
-/// it is recorded, each as [`Effect::json`] writes it plus its devctl name,
-/// its title and a one-line summary.
+/// Settings' Shaders page: `{"effects": [...], "mode_env": ..., "modes":
+/// [...]}`, every effect in the order it is recorded, each as
+/// [`Effect::json`] writes it plus its devctl name, its title and a
+/// one-line summary, and every mode ([`MODES`]) with its title, a
+/// description and each effect's switch and look.
 pub fn shader_looks_json() -> String {
+    let modes: Vec<serde_json::Value> = MODES
+        .iter()
+        .map(|m| {
+            let effects: serde_json::Map<String, serde_json::Value> = EFFECTS
+                .iter()
+                .zip(m.effects)
+                .map(|(fx, (on, look))| (fx.name.to_string(), serde_json::json!({ "on": on, "look": look })))
+                .collect();
+            serde_json::json!({ "name": m.name, "title": m.title, "description": m.description, "effects": effects })
+        })
+        .collect();
     let effects: Vec<serde_json::Value> = EFFECTS
         .iter()
         .map(|fx| {
@@ -657,7 +772,8 @@ pub fn shader_looks_json() -> String {
             v
         })
         .collect();
-    serde_json::to_string_pretty(&serde_json::json!({ "effects": effects })).expect("a JSON value always serialises")
+    serde_json::to_string_pretty(&serde_json::json!({ "effects": effects, "mode_env": MODE_ENV, "modes": modes }))
+        .expect("a JSON value always serialises")
 }
 
 impl Knob {
@@ -750,10 +866,46 @@ pub fn control(args: &[&str]) -> Result<String, String> {
     SSR.control(args)
 }
 
-/// devctl `ssr ...`, `dof ...`, `bloom ...`, `lens ...` or `sharpen ...`;
-/// `None` for another verb.
+/// devctl `ssr ...`, `dof ...`, `bloom ...`, `lens ...`, `sharpen ...` or
+/// `shaders ...`; `None` for another verb.
 pub fn control_verb(verb: &str, args: &[&str]) -> Option<Result<String, String>> {
+    if verb == "shaders" {
+        return Some(shaders_control(args));
+    }
     effect(verb).map(|fx| fx.control(args))
+}
+
+/// devctl `shaders mode <name>`: every effect's switch and look as the mode
+/// sets them; `shaders` or `shaders get`: each effect's switch and the look
+/// its knobs are at (`custom` when they are at none).
+fn shaders_control(args: &[&str]) -> Result<String, String> {
+    requested_at_start();
+    match args {
+        [] | ["get"] => {}
+        ["mode", name] => {
+            let m = mode(name).ok_or_else(|| format!("no mode {name:?}; {SHADERS_USAGE}"))?;
+            if m.effects.iter().any(|(on, _)| *on) && !passes::wanted() {
+                return Err(format!("the pass hooks are not handed out in this run (set {MODE_ENV} or dev control)"));
+            }
+            for (fx, (on, look)) in EFFECTS.iter().zip(m.effects) {
+                for (k, v) in fx.knobs.iter().zip(fx.look_values(look).expect("a mode names looks of the table")) {
+                    if let Some(v) = v {
+                        fx.set(k, v);
+                    }
+                }
+                set_on(fx, on);
+            }
+        }
+        _ => return Err(SHADERS_USAGE.into()),
+    }
+    let mode_now = MODES.iter().find(|m| {
+        EFFECTS.iter().zip(m.effects).all(|(fx, (on, look))| fx.is_on() == on && (!on || fx.look_now() == Some(look)))
+    });
+    let effects: Vec<String> = EFFECTS
+        .iter()
+        .map(|fx| format!("{}={}:{}", fx.name, u8::from(fx.is_on()), fx.look_now().unwrap_or("custom")))
+        .collect();
+    Ok(format!("mode={} {}", mode_now.map_or("custom", |m| m.name), effects.join(" ")))
 }
 
 // ------------------------------------------------------------- the matcher
@@ -3219,6 +3371,62 @@ mod tests {
     }
 
     #[test]
+    fn modes_name_every_effect_and_fill_in_only_what_is_unset() {
+        assert_eq!(MODES.map(|m| m.name), ["off", "competitive", "cinematic"]);
+        for m in &MODES {
+            assert!(m.title.is_ascii() && m.description.is_ascii() && !m.description.is_empty());
+            assert!(SHADERS_USAGE.contains(m.name));
+            for (fx, (_, look)) in EFFECTS.iter().zip(m.effects) {
+                assert!(fx.looks.iter().any(|l| l.name == look), "{} names no look {look} of {}", m.name, fx.name);
+            }
+        }
+        assert!(MODES[0].effects.iter().all(|(on, _)| !on), "off is off");
+        // Competitive: no lens; the default looks, which are the playable ones.
+        let competitive = mode("competitive").unwrap();
+        for (fx, (on, look)) in EFFECTS.iter().zip(competitive.effects) {
+            assert_eq!(on, fx.name != "lens", "{}", fx.name);
+            assert_eq!(look, fx.looks[0].name, "{}", fx.name);
+        }
+        assert!(mode("cinematic").unwrap().effects.iter().all(|(on, _)| *on));
+        assert!(mode("fancy").is_none());
+
+        // From the environment: the mode, overridden by an effect's own
+        // switch and look, and the knobs as always.
+        let env = |name: &str| {
+            Some(match name {
+                "INTOXICATED_SHADERS_MODE" => "cinematic",
+                "INTOXICATED_SSR" => "0",
+                "INTOXICATED_DOF_LOOK" => "portrait",
+                "INTOXICATED_BLOOM" => " ",
+                "INTOXICATED_SHARPEN_LIMIT" => "0.2",
+                _ => return None,
+            }
+            .to_string())
+        };
+        let ssr = SSR.parse_settings(env);
+        assert!(!ssr.on && ssr.warnings.is_empty(), "its own switch wins");
+        let dof = post::DOF.parse_settings(env);
+        assert!(dof.on);
+        assert_eq!(dof.values[0], [14.0; 3], "its own look wins");
+        let bloom = post::BLOOM.parse_settings(env);
+        assert!(bloom.on, "a blank switch is unset");
+        assert_eq!(bloom.values[0], [0.7; 3], "neon");
+        let sharpen = post::SHARPEN.parse_settings(env);
+        assert!(sharpen.on);
+        assert_eq!(sharpen.values, [[2.0; 3], [0.2; 3], [1.0; 3]], "crunchy, the limit its own");
+        let lens = post::LENS.parse_settings(env);
+        assert!(lens.on && lens.values[2] == [0.7; 3], "prism");
+
+        let off = |name: &str| (name == MODE_ENV).then(|| "off".to_string());
+        assert!(EFFECTS.iter().all(|fx| !fx.parse_settings(off).on));
+        let competitive = |name: &str| (name == MODE_ENV).then(|| "competitive".to_string());
+        let on: Vec<bool> = EFFECTS.iter().map(|fx| fx.parse_settings(competitive).on).collect();
+        assert_eq!(on, [true, true, true, false, true]);
+        let bad = SSR.parse_settings(|name: &str| (name == MODE_ENV).then(|| "fancy".to_string()));
+        assert!(!bad.on && bad.warnings.len() == 1 && bad.warnings[0].contains("is not a mode"), "{:?}", bad.warnings);
+    }
+
+    #[test]
     fn the_shader_looks_json_lists_every_effect_as_its_own_table() {
         let text = shader_looks_json();
         assert!(text.is_ascii());
@@ -3234,6 +3442,16 @@ mod tests {
             assert_eq!(table, fx.json(), "{}", fx.name);
             assert_eq!(j["looks"].as_array().unwrap().len(), fx.looks.len());
             assert_eq!(j["default_look"], fx.looks[0].name);
+        }
+        assert_eq!(doc["mode_env"], MODE_ENV);
+        let modes = doc["modes"].as_array().unwrap();
+        assert_eq!(modes.len(), MODES.len());
+        for (m, j) in MODES.iter().zip(modes) {
+            assert_eq!((j["name"].as_str(), j["title"].as_str()), (Some(m.name), Some(m.title)));
+            assert_eq!(j["description"], m.description);
+            for (fx, (on, look)) in EFFECTS.iter().zip(m.effects) {
+                assert_eq!(j["effects"][fx.name], serde_json::json!({ "on": on, "look": look }), "{} {}", m.name, fx.name);
+            }
         }
         // The reflections' own table is what --print-ssr-looks prints.
         let ssr: serde_json::Value = serde_json::from_str(&looks_json()).unwrap();

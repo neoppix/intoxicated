@@ -310,6 +310,16 @@ ms). Neither shows anything that is not drawn: the aberration moves drawn
 colours by a few pixels, the vignette only darkens and the fringe only adds
 light around what is already bright.
 
+`INTOXICATED_SHADERS_MODE` switches all five at once and starts each from a
+look: `off`; `competitive`, pretty but playable (the reflections' competitive
+look, the depth of field's playable focus past your character, the soft
+bloom, light sharpening, no lens effects); or `cinematic`, the clip look
+(clean_mirror reflections, the depth of field focused on your character, the
+neon bloom, the prism lens and crunchy sharpening). An effect's own switch or
+look variable wins over the mode, and its knobs change the look as always;
+devctl `shaders mode <name>` does the same while the game runs and `shaders`
+reports each effect's switch and look.
+
 When the disk holding the profile's Roblox data runs short, the client says so:
 below 2 GiB free as it hands Roblox its window, below 512 MiB again when the
 run ends. The engine itself never reports a full disk.
