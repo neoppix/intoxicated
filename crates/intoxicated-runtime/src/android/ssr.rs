@@ -1256,6 +1256,9 @@ pub(crate) fn changes_nothing(values: &[[f32; 3]]) -> bool {
     p.intensity <= 0.0 && p.darken <= 0.0 && p.tint[..3] == [1.0; 3]
 }
 
+/// `Params::flags` bit 1: the trace image holds ray-traced reflections.
+const FLAG_TRACED: u32 = 2;
+
 /// `ssr/depth.comp` for a multisampled scene depth, as build.rs made it.
 const SPIRV_DEPTH_MS: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_depth_ms.spv.rs"));
 /// The same for a single-sample one.
@@ -2167,24 +2170,43 @@ fn record(
     }
     stamp(1);
     if ssr {
-        // With `INTOXICATED_RT=1`, the ray-traced reflections' build and
-        // trace in place of the march when the scene was captured; the
-        // march otherwise. See `rt::trace`.
-        let traced = super::rt::requested()
+        // With `INTOXICATED_RT=1` and `rt on`, the reflections are ray traced
+        // and nothing else: the build and the trace in place of the march,
+        // and on a frame that cannot be traced (nothing captured yet) no
+        // reflection at all, the march's pass run with no strength so that
+        // it writes nothing but zeros. See `rt::trace`.
+        let rt_only = super::rt::requested() && super::rt::trace::is_on();
+        let traced = rt_only
             && super::rt::trace::record(cmd, g.device, g.set_layout, set, p, [w, h], g.period_ns, g.timestamp_mask)
                 .unwrap_or_else(|why| {
                     super::rt::trace::failed(&why);
                     false
                 });
+        let push = |q: &Params| {
+            (fns.cmd_push_constants)(
+                cmd,
+                g.pipeline_layout,
+                SHADER_STAGE_COMPUTE,
+                0,
+                std::mem::size_of::<Params>() as u32,
+                (q as *const Params).cast(),
+            );
+        };
         if traced {
             compute_barrier(fns, cmd);
             bind_ssr(g.pipelines[3]);
+            // The compose told the trace measured the camera (see ssr.comp).
+            push(&Params { flags: p.flags | FLAG_TRACED, ..*p });
         } else {
             bind_ssr(g.pipelines[2]);
+            if rt_only {
+                push(&Params { intensity: 0.0, ..*p });
+            }
             (fns.cmd_dispatch)(cmd, w.div_ceil(8), h.div_ceil(8), 1);
             // The trace written, then read by the compose.
             compute_barrier(fns, cmd);
             (fns.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[3]);
+            push(p);
         }
         (fns.cmd_dispatch)(cmd, w.div_ceil(8), h.div_ceil(8), 1);
         compute_barrier(fns, cmd);
@@ -3322,7 +3344,7 @@ mod tests {
                 .collect()
         };
         // The same list as build.rs's `SHADERS`.
-        let shaders: [(&str, &str, &[&str]); 21] = [
+        let shaders: [(&str, &str, &[&str]); 22] = [
             ("depth_capture/resolve.comp", "depth_capture/resolve_ms", &[]),
             ("depth_capture/resolve.comp", "depth_capture/resolve_1x", &["-DSINGLE_SAMPLE"]),
             ("ssr/depth.comp", "ssr/depth_ms", &[]),
@@ -3339,6 +3361,7 @@ mod tests {
             ("ssr/post.comp", "ssr/post_bloom_compose", &["-DBLOOM_COMPOSE"]),
             ("ssr/ssr.comp", "ssr/rt_trace", &["-DRT"]),
             ("ssr/ssr.comp", "ssr/rt_upsample", &["-DRT", "-DUPSAMPLE"]),
+            ("rt/build.comp", "rt/build_fit", &["-DFIT"]),
             ("rt/build.comp", "rt/build_prep", &["-DPREP"]),
             ("rt/build.comp", "rt/build_sort_local", &["-DSORT_LOCAL"]),
             ("rt/build.comp", "rt/build_sort_global", &["-DSORT_GLOBAL"]),

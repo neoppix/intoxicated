@@ -56,6 +56,7 @@ const STAGE_TRANSFER: u32 = 0x1000;
 const STAGE_BOTTOM_OF_PIPE: u32 = 0x2000;
 const ACCESS_SHADER_READ: u32 = 0x20;
 const ACCESS_SHADER_WRITE: u32 = 0x40;
+const ACCESS_TRANSFER_READ: u32 = 0x800;
 const ACCESS_TRANSFER_WRITE: u32 = 0x1000;
 const USAGE_TRANSFER_DST: u32 = 0x2;
 const USAGE_STORAGE: u32 = 0x20;
@@ -63,6 +64,7 @@ const QUERY_TYPE_TIMESTAMP: u32 = 2;
 const QUERY_RESULT_64: u32 = 0x1;
 const QUERY_RESULT_WITH_AVAILABILITY: u32 = 0x4;
 
+const SPIRV_FIT: &[u32] = include!(concat!(env!("OUT_DIR"), "/rt_build_fit.spv.rs"));
 const SPIRV_PREP: &[u32] = include!(concat!(env!("OUT_DIR"), "/rt_build_prep.spv.rs"));
 const SPIRV_SORT_LOCAL: &[u32] = include!(concat!(env!("OUT_DIR"), "/rt_build_sort_local.spv.rs"));
 const SPIRV_SORT_GLOBAL: &[u32] = include!(concat!(env!("OUT_DIR"), "/rt_build_sort_global.spv.rs"));
@@ -79,7 +81,8 @@ const BUILD: usize = 3;
 const BOUNDS: usize = 4;
 const TRACE: usize = 5;
 const UPSAMPLE: usize = 6;
-const PIPELINES: usize = 7;
+const FIT: usize = 7;
+const PIPELINES: usize = 8;
 /// The bindings of our set: the capture, its counter, the sorted keys, the
 /// nodes, the parents, the flags, the globals and the traced blocks.
 const BINDINGS: u32 = 8;
@@ -215,6 +218,10 @@ pub(crate) struct Stats {
     pub build_ms: std::collections::VecDeque<f64>,
     pub trace_ms: std::collections::VecDeque<f64>,
     pub keys: u32,
+    /// The globals as last read back: leaves, captured, fit_ok,
+    /// fit_samples, tan_x, tan_y, near, |forward|, the world's up (4),
+    /// the trace's two sums, the exposure and a spare word.
+    pub fit: Option<[u32; 16]>,
 }
 
 struct Gpu {
@@ -236,6 +243,11 @@ struct Gpu {
     flags: Owned,
     globals: Owned,
     blocks: Owned,
+    /// The blocks were cleared once (they carry the last frame's results).
+    blocks_cleared: bool,
+    /// Host-visible: a copy of the globals (the camera FIT measured).
+    readback: Owned,
+    readback_ptr: usize,
     /// Blocks `blocks` has room for.
     block_room: u64,
     /// Keys the buffers have room for.
@@ -281,7 +293,7 @@ impl Gpu {
         if self.query_pool != 0 {
             (f.destroy_query_pool)(d, self.query_pool, none);
         }
-        for o in [self.sorted, self.nodes, self.parents, self.flags, self.globals, self.blocks] {
+        for o in [self.sorted, self.nodes, self.parents, self.flags, self.globals, self.blocks, self.readback] {
             if o.buffer != 0 {
                 (self.buffers.destroy_buffer)(d, o.buffer, none);
             }
@@ -361,6 +373,9 @@ fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool, extent: [u32; 2]) -
         flags: Owned::default(),
         globals: Owned::default(),
         blocks: Owned::default(),
+        blocks_cleared: false,
+        readback: Owned::default(),
+        readback_ptr: 0,
         block_room: blocks_of([extent[0].max(ROOM_FOR[0]), extent[1].max(ROOM_FOR[1])]),
         keys,
         query_pool: 0,
@@ -388,6 +403,10 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, counter: u64, capacity: u64, timed
     g.flags = make_buffer(&g.buffers, d, &types, 4 * n, usage, false)?;
     g.globals = make_buffer(&g.buffers, d, &types, 256, usage, false)?;
     g.blocks = make_buffer(&g.buffers, d, &types, BLOCK_BYTES * g.block_room, usage, false)?;
+    g.readback = make_buffer(&g.buffers, d, &types, 256, USAGE_TRANSFER_DST, true)?;
+    let mut mapped = std::ptr::null_mut();
+    check((g.buffers.map_memory)(d, g.readback.memory, 0, 256, 0, &mut mapped), "vkMapMemory")?;
+    g.readback_ptr = mapped as usize;
     let f = &g.fns;
     let bindings: Vec<DescriptorSetLayoutBinding> = (0..BINDINGS)
         .map(|b| DescriptorSetLayoutBinding {
@@ -435,7 +454,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, counter: u64, capacity: u64, timed
     };
     check((f.create_pipeline_layout)(d, &info, none, &mut g.trace_layout), "vkCreatePipelineLayout")?;
     let codes: [&[u32]; PIPELINES] =
-        [SPIRV_PREP, SPIRV_SORT_LOCAL, SPIRV_SORT_GLOBAL, SPIRV_BUILD, SPIRV_BOUNDS, SPIRV_TRACE, SPIRV_UPSAMPLE];
+        [SPIRV_PREP, SPIRV_SORT_LOCAL, SPIRV_SORT_GLOBAL, SPIRV_BUILD, SPIRV_BOUNDS, SPIRV_TRACE, SPIRV_UPSAMPLE, SPIRV_FIT];
     for (i, code) in codes.into_iter().enumerate() {
         g.shaders[i] = shader(f, d, code)?;
         let pipeline = ComputePipelineCreateInfo {
@@ -451,7 +470,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, counter: u64, capacity: u64, timed
                 name: c"main".as_ptr(),
                 specialization: none,
             },
-            layout: if i >= TRACE { g.trace_layout } else { g.build_layout },
+            layout: if i == TRACE || i == UPSAMPLE { g.trace_layout } else { g.build_layout },
             base_pipeline: 0,
             base_pipeline_index: -1,
         };
@@ -572,6 +591,14 @@ pub(crate) fn record(
     }
     st.stats.keys = n;
     st.stats.frames += 1;
+    let clear_blocks = !g.blocks_cleared;
+    g.blocks_cleared = true;
+    if g.readback_ptr != 0 {
+        // SAFETY: our mapping of 256 bytes, written by an earlier frame's
+        // copy; a torn or old value only skews the report.
+        let words: [u32; 16] = unsafe { std::ptr::read_volatile(g.readback_ptr as *const [u32; 16]) };
+        st.stats.fit = Some(words);
+    }
     let f = &g.fns;
     let timed = g.query_pool != 0;
     let stamp = |i: usize| {
@@ -585,10 +612,16 @@ pub(crate) fn record(
     stamp(0);
     // The last frame's trace has read our buffers before they are cleared.
     (g.buffers.pipeline_barrier)(cmd, STAGE_COMPUTE, STAGE_TRANSFER | STAGE_COMPUTE, 0, 0, std::ptr::null(), 0, std::ptr::null(), 0, std::ptr::null());
-    (f.cmd_fill_buffer)(cmd, g.globals.buffer, 0, 256, 0);
+    // The globals' counts each frame; the exposure and the trace's sums
+    // after them are kept (cleared once, below).
+    (f.cmd_fill_buffer)(cmd, g.globals.buffer, 0, 16, 0);
     (f.cmd_fill_buffer)(cmd, g.flags.buffer, 0, 4 * n as u64, 0);
     // What this frame's draws wrote, as counted when they were recorded.
     (f.cmd_fill_buffer)(cmd, counter, 0, 4, bytes as u32);
+    if clear_blocks {
+        (f.cmd_fill_buffer)(cmd, g.blocks.buffer, 0, BLOCK_BYTES * g.block_room, 0);
+        (f.cmd_fill_buffer)(cmd, g.globals.buffer, 16, 240, 0);
+    }
     g.barrier(cmd, STAGE_TRANSFER | STAGE_COMPUTE, ACCESS_TRANSFER_WRITE | ACCESS_SHADER_WRITE);
     let mut bp = BuildParams {
         n,
@@ -611,6 +644,7 @@ pub(crate) fn record(
         g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
     };
     (f.cmd_bind_descriptor_sets)(cmd, BIND_POINT_COMPUTE, g.build_layout, 0, 1, &g.set, 0, std::ptr::null());
+    dispatch(FIT, &bp, 1);
     dispatch(PREP, &bp, n.div_ceil(256));
     for (pipeline, k, j, groups) in sort_plan(n) {
         bp.k = k;
@@ -621,6 +655,11 @@ pub(crate) fn record(
     bp.j = 0;
     dispatch(BUILD, &bp, n.div_ceil(256));
     dispatch(BOUNDS, &bp, n.div_ceil(256));
+    // The camera FIT measured, for `rt stats`.
+    let to_host = MemoryBarrier { s_type: ST_MEMORY_BARRIER, p_next: std::ptr::null(), src_access_mask: ACCESS_SHADER_WRITE, dst_access_mask: ACCESS_TRANSFER_READ };
+    (g.buffers.pipeline_barrier)(cmd, STAGE_COMPUTE, STAGE_TRANSFER, 0, 1, &to_host, 0, std::ptr::null(), 0, std::ptr::null());
+    let region = [0u64, 0, 64];
+    (g.buffers.copy_buffer)(cmd, g.globals.buffer, g.readback.buffer, 1, region.as_ptr());
     stamp(1);
     (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[TRACE]);
     let sets = [ssr_set, g.set];
@@ -674,16 +713,38 @@ fn p95(q: &std::collections::VecDeque<f64>) -> f64 {
     v[(v.len() * 95 / 100).min(v.len() - 1)]
 }
 
+/// The camera FIT measured, as `rt stats` reports it.
+fn fit_text(fit: Option<[u32; 16]>) -> String {
+    let Some(w) = fit else { return "fit=none".into() };
+    let f = |i: usize| f32::from_bits(w[i]);
+    if w[2] == 0 {
+        return format!("fit=failed fit_samples={}", w[3]);
+    }
+    format!(
+        "fit=ok fit_samples={} fov_x={:.2} fov_y={:.2} near={:.4} forward_len={:.4} world_up={:.3},{:.3},{:.3} exposure={:.3}",
+        w[3],
+        2.0 * f(4).atan().to_degrees(),
+        2.0 * f(5).atan().to_degrees(),
+        f(6),
+        f(7),
+        f(8),
+        f(9),
+        f(10),
+        f(14)
+    )
+}
+
 pub(crate) fn stats_line() -> String {
     let st = state();
     let s = &st.stats;
     format!(
-        "on={} reflections={} traced={} skipped={} keys={} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} gpu_samples={}{}",
+        "on={} reflections={} traced={} skipped={} keys={} {} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} gpu_samples={}{}",
         is_on(),
         if super::super::ssr::reflections_on() { "on" } else { "off" },
         s.frames,
         s.skipped,
         s.keys,
+        fit_text(s.fit),
         mean(&s.build_ms),
         p95(&s.build_ms),
         mean(&s.trace_ms),

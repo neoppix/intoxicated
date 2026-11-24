@@ -20,10 +20,12 @@ layout(set = 0, binding = 0) uniform Frame {
 
 layout(location = 0) out vec3 world_normal;
 layout(location = 1) out vec4 color;
+layout(location = 2) out vec3 to_camera;
 
 void main() {
     vec3 world = vec3(dot(world_x, position), dot(world_y, position), dot(world_z, position));
     world_normal = vec3(dot(world_x.xyz, normal.xyz), dot(world_y.xyz, normal.xyz), dot(world_z.xyz, normal.xyz));
     color = vec4(length(world - frame.camera.xyz) * 0.01);
+    to_camera = frame.camera.xyz - world;
     gl_Position = frame.view_projection * vec4(world, 1.0);
 }

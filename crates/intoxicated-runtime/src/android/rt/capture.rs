@@ -3,17 +3,23 @@
 //!
 //! # What is captured
 //!
-//! Every vertex shader the engine creates on a device with transform
-//! feedback (see `rt`) has its clip-space position and its colour output
-//! decorated for capture ([`super::spirv`]); nothing it computes changes.
+//! Every vertex shader of lit world geometry the engine creates on a device
+//! with transform feedback (see `rt`) has its clip-space position, its
+//! colour output and its camera vector output decorated for capture
+//! ([`super::spirv`]); nothing it computes changes. Other shaders
+//! (particles, billboards, the sky) are left alone and never captured.
 //! A graphics pipeline counts as drawing visible scene geometry, and is
 //! captured, when its vertex shader was instrumented, it has no
 //! tessellation or geometry stage, it draws triangles (a list, strip or
 //! fan, not set dynamically; strips and fans without primitive restart), it
-//! does not discard its primitives before
-//! rasterisation, and it writes colour (at least one blend attachment with
-//! a non-zero write mask, not set dynamically). So depth-only and shadow
-//! pipelines are never captured.
+//! does not discard its primitives before rasterisation, it writes colour
+//! (at least one blend attachment with a non-zero write mask, not set
+//! dynamically) and it does not blend. So depth-only and shadow pipelines
+//! are never captured, nor transparent ones, nor the interface the engine
+//! draws in the world (text and images on signs and boards, name tags):
+//! its fragment shader clips it to its frame through alpha, and its
+//! triangles reach well past what shows (a scrolling text on a display
+//! showed in reflections beside the display).
 //!
 //! Transform feedback is active only inside the scene passes (a depth
 //! attachment the size of a swapchain image, no swapchain image among the
@@ -37,8 +43,8 @@
 //! passes are never captured, whatever pipeline they use.
 //!
 //! Every triangle, of every instance, lands in our buffer as three vertices
-//! (clip-space position, then the colour the vertex shader passes on, or
-//! (-1, -1, -1, -1) where it has none) in the order drawn, strips and fans
+//! (clip-space position, the colour the vertex shader passes on, the vector
+//! from the vertex to the camera in the world) in the order drawn, strips and fans
 //! already split into separate triangles: post-transform, post-skinning
 //! geometry, the player's own character included, and only what the engine
 //! actually drew this frame. Pipelines that draw strips or fans with
@@ -77,6 +83,8 @@ const STAGE_VERTEX: u32 = 0x1;
 const STAGE_TESSELLATION: u32 = 0x2 | 0x4;
 const STAGE_GEOMETRY: u32 = 0x8;
 
+const DYNAMIC_SCISSOR: u32 = 1;
+const DYNAMIC_SCISSOR_WITH_COUNT: u32 = 1_000_267_004;
 const DYNAMIC_PRIMITIVE_TOPOLOGY: u32 = 1_000_267_002;
 const DYNAMIC_RASTERIZER_DISCARD_ENABLE: u32 = 1_000_377_001;
 const DYNAMIC_PRIMITIVE_RESTART_ENABLE: u32 = 1_000_377_004;
@@ -108,7 +116,7 @@ const BIND_POINT_GRAPHICS: u32 = 0;
 pub(crate) const TRIANGLE_BYTES: u64 = 3 * spirv::STRIDE as u64;
 
 /// The triangles our buffer holds, unless `INTOXICATED_RT_TRIANGLES` says
-/// (48 MiB; Timebomb Duels draws about 30000 a frame in its lobby).
+/// (72 MiB; Timebomb Duels draws 60000 to 180000 a frame in its lobby).
 const DEFAULT_TRIANGLES: u64 = 1 << 19;
 
 pub const DUMP_ENV: &str = "INTOXICATED_RT_DUMP";
@@ -165,6 +173,8 @@ pub(crate) struct Pipeline {
     /// Captured while bound in a scene pass, or why not.
     pub capture: Result<(), &'static str>,
     pub topology: u32,
+    /// The scissor fixed in the pipeline, if it is not dynamic.
+    pub scissor: Option<[i32; 4]>,
 }
 
 /// One command buffer's recording, as far as capture goes.
@@ -175,6 +185,9 @@ struct Cmd {
     scene: bool,
     /// And capturing it is possible.
     capturing: bool,
+    /// The pass's extent, and the scissor last set (x, y, width, height).
+    extent: [u32; 2],
+    scissor: Option<[i32; 4]>,
     /// The graphics pipeline bound.
     bound: u64,
     active: bool,
@@ -219,9 +232,9 @@ pub(crate) struct Stats {
     pub draws_skipped: u64,
     /// Skipped because the buffer was full.
     pub draws_overflowed: u64,
+    /// Skipped because a scissor smaller than the pass cut them.
+    pub draws_clipped: u64,
     pub modules_instrumented: u64,
-    /// Of those, the ones with a colour output of their own.
-    pub modules_coloured: u64,
     pub modules_left: u64,
     pub pipelines_captured: u64,
     pub pipelines_skipped: u64,
@@ -276,6 +289,7 @@ static CREATE_SHADER_MODULE: AtomicUsize = AtomicUsize::new(0);
 static DESTROY_SHADER_MODULE: AtomicUsize = AtomicUsize::new(0);
 static CREATE_GRAPHICS_PIPELINES: AtomicUsize = AtomicUsize::new(0);
 static DESTROY_PIPELINE: AtomicUsize = AtomicUsize::new(0);
+static CMD_SET_SCISSOR: AtomicUsize = AtomicUsize::new(0);
 
 fn next<F: Copy>(slot: &AtomicUsize) -> Option<F> {
     let p = slot.load(Relaxed);
@@ -296,6 +310,7 @@ pub(crate) fn hook(name: &[u8], next: *mut c_void) -> *mut c_void {
         b"vkDestroyShaderModule" => (&DESTROY_SHADER_MODULE, destroy_shader_module as *const ()),
         b"vkCreateGraphicsPipelines" => (&CREATE_GRAPHICS_PIPELINES, create_graphics_pipelines as *const ()),
         b"vkDestroyPipeline" => (&DESTROY_PIPELINE, destroy_pipeline as *const ()),
+        b"vkCmdSetScissor" => (&CMD_SET_SCISSOR, cmd_set_scissor as *const ()),
         _ => return next,
     };
     slot.store(next as usize, Relaxed);
@@ -360,7 +375,6 @@ extern "C" fn create_shader_module(device: *mut c_void, info: *const c_void, all
         if vertex && xfb {
             if done {
                 st.stats.modules_instrumented += 1;
-                st.stats.modules_coloured += u64::from(spirv::has_colour(words));
             } else {
                 st.stats.modules_left += 1;
                 let why = match &instrumented {
@@ -399,7 +413,7 @@ unsafe fn is_dynamic(dynamic: *const c_void, which: &[u32]) -> bool {
 /// # Safety
 /// `info` must be a valid `VkGraphicsPipelineCreateInfo`.
 unsafe fn describe_pipeline(info: *const c_void, device: usize, modules: &HashMap<(usize, u64), Module>) -> Pipeline {
-    let mut p = Pipeline { vs: 0, fs: 0, capture: Ok(()), topology: u32::MAX };
+    let mut p = Pipeline { vs: 0, fs: 0, capture: Ok(()), topology: u32::MAX, scissor: None };
     let fail = |p: &mut Pipeline, why: &'static str| {
         if p.capture.is_ok() {
             p.capture = Err(why);
@@ -463,8 +477,32 @@ unsafe fn describe_pipeline(info: *const c_void, device: usize, modules: &HashMa
     if !writes_colour {
         fail(&mut p, "it writes no colour (depth only)");
     }
+    // Blending: transparent parts, and the interface the engine draws in the
+    // world (SurfaceGui and BillboardGui text and images, name tags), whose
+    // fragment shader clips it to its frame by alpha, so its triangles reach
+    // well past what shows. Only opaque geometry is captured.
+    let blends = !cb.is_null() && {
+        let (n, atts): (u32, *const u8) = (get(cb, 28), get(cb, 32));
+        !atts.is_null()
+            && (0..n as usize).any(|i| {
+                let a = atts.add(i * 32) as *const c_void;
+                get::<u32>(a, 0) != 0 && get::<u32>(a, 28) != 0
+            })
+    };
+    if blends {
+        fail(&mut p, "it blends (transparent, or interface drawn in the world)");
+    }
     if is_dynamic(dynamic, &[DYNAMIC_COLOR_WRITE_ENABLE, DYNAMIC_COLOR_WRITE_MASK]) {
         fail(&mut p, "its colour writes are dynamic");
+    }
+    // A scissor fixed in the pipeline (`VkPipelineViewportStateCreateInfo`:
+    // scissorCount at 32, pScissors at 40), unless it is dynamic.
+    let vs: *const c_void = get(info, 56);
+    if !vs.is_null() && !is_dynamic(dynamic, &[DYNAMIC_SCISSOR, DYNAMIC_SCISSOR_WITH_COUNT]) {
+        let (n, rects): (u32, *const c_void) = (get(vs, 32), get(vs, 40));
+        if n > 0 && !rects.is_null() {
+            p.scissor = Some(get(rects, 0));
+        }
     }
     p
 }
@@ -519,6 +557,21 @@ extern "C" fn create_graphics_pipelines(
         }
     }
     rc
+}
+
+/// `vkCmdSetScissor`: the first rectangle, for the capture's test of a
+/// clipped draw.
+extern "C" fn cmd_set_scissor(cmd: *mut c_void, first: u32, count: u32, rects: *const [i32; 4]) {
+    if first == 0 && count > 0 && !rects.is_null() {
+        // SAFETY: the engine's array of `count` rectangles, read during its call.
+        let r = unsafe { std::ptr::read_unaligned(rects) };
+        if let Some(c) = state().cmds.get_mut(&(cmd as usize)) {
+            c.scissor = Some(r);
+        }
+    }
+    if let Some(f) = next::<extern "C" fn(*mut c_void, u32, u32, *const [i32; 4])>(&CMD_SET_SCISSOR) {
+        f(cmd, first, count, rects);
+    }
 }
 
 extern "C" fn destroy_pipeline(device: *mut c_void, pipeline: u64, alloc: *const c_void) {
@@ -579,6 +632,7 @@ pub(crate) fn pass_beginning(pass: &Pass) {
     let c = st.cmds.entry(cmd).or_default();
     c.device = device;
     c.scene = true;
+    c.extent = z.extent;
     c.capturing = false;
     c.active = false;
     if !xfb {
@@ -615,6 +669,11 @@ pub(crate) fn pass_beginning(pass: &Pass) {
     if let Some(c) = st.cmds.get_mut(&cmd) {
         c.capturing = true;
     }
+}
+
+/// Whether the scissor `r` (x, y, width, height) leaves all of `extent`.
+fn covers(r: [i32; 4], extent: [u32; 2]) -> bool {
+    r[0] <= 0 && r[1] <= 0 && r[0] as i64 + r[2] as i64 >= extent[0] as i64 && r[1] as i64 + r[3] as i64 >= extent[1] as i64
 }
 
 /// How many vertices a draw of `count` vertices or indices of `instances`
@@ -733,10 +792,22 @@ pub(crate) fn drew(cmd: *mut c_void, kind: &'static str, count: u32, instances: 
     if !c.scene && !c.listing {
         return;
     }
-    let (listing, bound, device, scene, capturing) = (c.listing, c.bound, c.device, c.scene, c.capturing);
+    let (listing, bound, device, scene, capturing, extent, dynamic_scissor) =
+        (c.listing, c.bound, c.device, c.scene, c.capturing, c.extent, c.scissor);
     let p = st.pipelines.get(&(device, bound)).cloned();
+    // A draw cut down by a scissor smaller than the pass (an interface
+    // clipped to its frame, a scrolling text clipped to its display) would
+    // be captured whole, outside where it shows; it is not captured.
+    let scissor = p.as_ref().and_then(|p| p.scissor).or(dynamic_scissor);
+    let clipped = scissor.is_some_and(|r| !covers(r, extent));
     if capturing {
-        let take = p.as_ref().filter(|p| p.capture.is_ok() && kind != "indirect").map(|p| xfb_vertices(p.topology, count, instances));
+        let take = p
+            .as_ref()
+            .filter(|p| p.capture.is_ok() && kind != "indirect" && !clipped)
+            .map(|p| xfb_vertices(p.topology, count, instances));
+        if clipped && p.as_ref().is_some_and(|p| p.capture.is_ok()) {
+            st.stats.draws_clipped += 1;
+        }
         let room = st.gpus.iter().find(|g| g.device == device).map(|g| (g.capacity, g.bytes));
         match (take, room) {
             (Some(vertices), Some((capacity, at))) if at + vertices * spirv::STRIDE as u64 <= capacity => {
@@ -773,15 +844,17 @@ pub(crate) fn drew(cmd: *mut c_void, kind: &'static str, count: u32, instances: 
     }
     if listing && scene {
         let line = format!(
-            "0x{:x}\t0x{bound:x}\t{kind}\t{count}\t{instances}\t{}\tvs-{:016x}\tfs-{:016x}\n",
+            "0x{:x}\t0x{bound:x}\t{kind}\t{count}\t{instances}\t{}\tvs-{:016x}\tfs-{:016x}\t{:?}\n",
             cmd as usize,
             match p.as_ref().map(|p| p.capture) {
+                Some(Ok(())) if clipped => "clipped by its scissor",
                 Some(Ok(())) => "captured",
                 Some(Err(why)) => why,
                 None => "unknown pipeline",
             },
             p.as_ref().map_or(0, |p| p.vs),
             p.as_ref().map_or(0, |p| p.fs),
+            scissor,
         );
         st.listing.push(line);
     }
@@ -805,7 +878,7 @@ pub(crate) fn frame_end(presents: u64) {
     if finished_listing {
         if let Some(dir) = dump_dir() {
             let path = format!("{dir}/draws-{presents}.tsv");
-            let mut text = String::from("cmd\tpipeline\tkind\tcount\tinstances\tcapture\tvs\tfs\n");
+            let mut text = String::from("cmd\tpipeline\tkind\tcount\tinstances\tcapture\tvs\tfs\tscissor\n");
             text.push_str(&st.listing.concat());
             match std::fs::write(&path, text) {
                 Ok(()) => println!("[android] vulkan: rt: {} scene draws written to {path}", st.listing.len()),
@@ -858,7 +931,7 @@ pub(crate) fn stats_line() -> String {
     let bytes = LAST_BYTES.load(Relaxed);
     format!(
         "triangles={} capacity={} frames={} begins={} binds_captured={} binds_skipped={} draws_captured={} draws_skipped={} \
-         draws_overflowed={} vs_instrumented={} vs_coloured={} vs_left={} pipelines_captured={} pipelines_skipped={} frame={}",
+         draws_overflowed={} draws_clipped={} vs_instrumented={} vs_left={} pipelines_captured={} pipelines_skipped={} frame={}",
         bytes / TRIANGLE_BYTES,
         capacity_triangles(),
         s.frames,
@@ -868,8 +941,8 @@ pub(crate) fn stats_line() -> String {
         s.draws_captured,
         s.draws_skipped,
         s.draws_overflowed,
+        s.draws_clipped,
         s.modules_instrumented,
-        s.modules_coloured,
         s.modules_left,
         s.pipelines_captured,
         s.pipelines_skipped,
@@ -886,8 +959,8 @@ pub(crate) fn request_draws() -> Result<String, String> {
 
 /// devctl `rt dump <path>`: the next frame's captured triangles, as a
 /// little-endian `u32` byte count and then that many bytes of vertices,
-/// three per triangle, each a clip-space position and a colour (`vec4`
-/// each; the colour (-1, -1, -1, -1) where the shader has none).
+/// three per triangle, each a clip-space position, a colour and the vector
+/// to the camera (`vec4` each; the last one's w is not written).
 pub(crate) fn dump(path: &str) -> Result<String, String> {
     if dump_dir().is_none() {
         return Err(format!("{DUMP_ENV}=<dir> at start is needed"));
@@ -1136,7 +1209,12 @@ mod tests {
         assert_eq!(xfb_vertices(4, 1, 1), 0);
         // Not triangles.
         assert_eq!(xfb_vertices(1, 100, 1), 0);
-        // A vertex is a position and a colour.
-        assert_eq!(TRIANGLE_BYTES, 96);
+        // A scissor of the whole pass, or more, clips nothing.
+        assert!(covers([0, 0, 1667, 1349], [1667, 1349]));
+        assert!(covers([-10, 0, 4000, 4000], [1667, 1349]));
+        assert!(!covers([100, 0, 1567, 1349], [1667, 1349]));
+        assert!(!covers([0, 0, 1667, 1000], [1667, 1349]));
+        // A vertex is a position, a colour and a camera vector.
+        assert_eq!(TRIANGLE_BYTES, 144);
     }
 }

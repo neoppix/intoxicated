@@ -282,34 +282,39 @@ crosshair is on; mode 2 can settle on the floor just behind the character when
 little else is in view (INFERRED); and the studs of the fixed focus assume a
 near plane of 0.1 studs, which was not measured.
 
-Ray-traced reflections are a prototype on top of the screen-space ones, off by
-default: `INTOXICATED_RT=1` (it turns the screen-space reflections on as well,
-unless `INTOXICATED_SSR` is set; their look knobs apply to both). Each frame
-the client captures the triangles the engine draws in its 3D scene (transform
-feedback, enabled through Vulkan: the engine's vertex shaders get their
-position and colour outputs marked for capture and compute nothing
-differently), builds a bounding volume hierarchy over them on the GPU and
-traces one reflection ray per 2 by 2 pixels against it, spread back over the
-pixels of the same surface. So a reflection can show what is off screen or
-hidden, such as players off screen seen in a wall, or the front of your own
-character in the wall ahead of it. Where the hit is what the screen shows, the
-reflection takes the screen's colour; elsewhere it takes the colour the
-engine's vertex shader passed on, lit by a fixed light from above, without
-textures (a shirt shows as the body colour under it). Only what the engine
-itself drew that frame can be reflected: what it culled cannot (most of what is
-behind the camera, presumably; not measured). In the Timebomb Duels lobby
-(90000 to 180000 triangles a frame, 1667x1349, RTX 4070 Ti) it costs 0.3 to 0.6
-ms of GPU time for the hierarchy and 0.8 to 1.1 ms for the rays with the
-default look (all the reflections' work about 1.6 ms, against 0.7 ms for the
-screen-space march), about 1.5 ms for the rays when every surface is a mirror;
-frame times did not change at the engine's 240 fps. NVIDIA's FreeBSD driver
-offers no hardware ray tracing: on the RTX 4070 Ti, drivers 580.142 and
-620.70.06 list neither `VK_KHR_acceleration_structure` nor `VK_KHR_ray_query`
-nor `VK_KHR_ray_tracing_pipeline` (vulkaninfo lists them for llvmpipe only) and
-the package ships no `libnvidia-rtcore`, so the hierarchy and the rays are
-compute shaders of the client's own running on the shader cores. devctl `rt
-on`, `rt off` and `rt stats` switch them and report the triangles and the GPU
-time.
+Ray-traced reflections are a prototype, off by default: `INTOXICATED_RT=1` (it
+turns the reflections on as well, unless `INTOXICATED_SSR` is set; their look
+knobs apply). With it every reflection is ray traced and the screen-space march
+does not run at all; without it the screen-space reflections are their own
+effect as before. Each frame the client captures the opaque world geometry the
+engine draws in its 3D scene (transform feedback, enabled through Vulkan: the
+engine's lit vertex shaders get their position, colour and camera vector
+outputs marked for capture and compute nothing differently; particles,
+billboards, name tags, the sky and anything that blends, which includes text
+and images on signs, are left out), measures the camera's real projection from
+it, builds a bounding volume hierarchy on the GPU and traces one reflection ray
+per 2 by 2 pixels against it, spread back over the pixels of the same surface
+and steadied over frames while the view holds still. So a reflection can show
+what is off screen or hidden, such as players off screen seen in a wall, or the
+front of your own character in the wall ahead of it. Where the hit is what the
+screen shows, the reflection takes the screen's colour; elsewhere the colour
+the engine's vertex shader passed on, without textures, at the brightness the
+screen shows such colours at on average. Only what the engine itself drew that
+frame can be reflected: it culls what is outside the view (of 165000 captured
+triangles, 8 touched the space behind the camera), so an object leaves the
+reflections when it leaves the view. In the Timebomb Duels lobby (50000 to
+190000 triangles a frame, 1667x1349, RTX 4070 Ti) it costs 0.2 to 0.3 ms of GPU
+time for the hierarchy and 0.4 to 0.7 ms for the rays with the default and
+floor mirror looks, about 1.3 ms for the rays when every surface is a mirror
+(all of the reflections' work about 1 ms, against 0.6 ms for the march); frame
+times did not change at the engine's 240 fps. NVIDIA's FreeBSD driver offers no
+hardware ray tracing: on the RTX 4070 Ti, drivers 580.142 and 620.70.06 list
+neither `VK_KHR_acceleration_structure` nor `VK_KHR_ray_query` nor
+`VK_KHR_ray_tracing_pipeline` (vulkaninfo lists them for llvmpipe only) and the
+package ships no `libnvidia-rtcore`, so the hierarchy and the rays are compute
+shaders of the client's own running on the shader cores. devctl `rt on`, `rt
+off` and `rt stats` switch them and report the triangles, the measured camera
+and the GPU time.
 
 When the disk holding the profile's Roblox data runs short, the client says so:
 below 2 GiB free as it hands Roblox its window, below 512 MiB again when the

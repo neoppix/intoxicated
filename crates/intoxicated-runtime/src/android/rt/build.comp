@@ -3,8 +3,9 @@
 // captured (`capture.rs`): a bounding volume hierarchy over them, sorted
 // along a Morton curve (a linear BVH). The driver offers no hardware
 // acceleration structures on this GPU, so this is the software stand-in.
-// One source, five stages:
+// One source, six stages:
 //
+//     -DFIT           the camera's real projection, from the capture
 //     -DPREP          a key per triangle: the Morton code of its centre,
 //                     or ~0 for one that is not real geometry
 //     -DSORT_LOCAL    bitonic sort, the steps that stay within 1024 keys
@@ -18,21 +19,32 @@
 //     glslc -O --target-env=vulkan1.0 -mfmt=num -D<STAGE> build.comp -o -
 //         -> build_<stage>.spv.rs
 //
-// Positions are clip-space as captured. They are turned into the view space
-// of `ssr/ssr.comp` (x right, y up, z away from the camera, in units of the
-// near plane) the way that shader turns depth into position: with
-// reversed-Z and the far plane at infinity, clip z is the near plane and
-// clip w the distance, so (x tan_x, -y tan_y, w) / z.
+// Positions are clip-space as captured. They are turned into view space (x
+// right, y up, z away from the camera, in units of the near plane), the
+// space `ssr/ssr.comp` with RT turns the depth buffer into: with reversed-Z
+// and the far plane at infinity, clip z is the near plane and clip w the
+// distance, so (x tan_x, -y tan_y, w) / near. tan_x, tan_y and the near
+// plane are not guessed (the reflections' fov knob) but measured every
+// frame by FIT: each captured vertex also carries the vector from it to the
+// camera in the world, in studs and with true angles, and clip x, y and w
+// are linear in it (clip = M (vertex - camera) for the rows x, y and w), so
+// M is a least-squares fit over a few thousand vertices; its rows are the
+// camera's right, up and forward axes scaled by 1 / tan_x, 1 / tan_y and 1.
+// The fit also gives which way is up in the world, in view space. FIT also
+// turns the trace's last sums into the exposure (see Globals).
 
 #version 450
 
 #ifdef SORT_LOCAL
 layout(local_size_x = 512) in;
+#elif defined(FIT)
+layout(local_size_x = 128) in;
 #else
 layout(local_size_x = 256) in;
 #endif
 
-// Per captured vertex: the clip-space position, then the colour.
+// Per captured vertex: the clip-space position, the colour, the vector to
+// the camera (xyz).
 layout(std430, binding = 0) readonly buffer Xfb { vec4 xfb[]; };
 layout(std430, binding = 1) readonly buffer Counter { uint counter_bytes; };
 layout(std430, binding = 2) buffer Sorted { uvec2 sorted[]; };
@@ -43,6 +55,22 @@ layout(std430, binding = 6) buffer Globals {
     // Triangles that are leaves (real geometry), and those captured.
     uint leaves;
     uint captured;
+    // FIT: 1 when it found the projection, and the vertices it used.
+    uint fit_ok;
+    uint fit_samples;
+    // tan_x, tan_y, the near plane, |forward| (1 for a true projection).
+    vec4 camera;
+    // The world's up in view space.
+    vec4 world_up;
+    // The trace's sums, over a sample of its hits that the screen shows, of
+    // the brightness of the screen there and of the hit triangle's own
+    // colour (both times 256), and from them, frame by frame, how much
+    // brighter the screen is than the bare colour: the light the engine
+    // gives an off-screen hit, on average. Kept from frame to frame.
+    uint lit_screen;
+    uint lit_colour;
+    float exposure;
+    uint unused;
 };
 
 // std430; `trace::BuildParams` mirrors it.
@@ -58,16 +86,108 @@ layout(push_constant) uniform Params {
 } pc;
 
 vec3 to_view(vec4 c) {
+    if (fit_ok != 0u) {
+        return vec3(c.x * camera.x, -c.y * camera.y, c.w) / camera.z;
+    }
     return vec3(c.x * pc.tan_half.x, -c.y * pc.tan_half.y, c.w) / c.z;
 }
 
 vec4 position(uint v) {
-    return xfb[2u * v];
+    return xfb[3u * v];
 }
 
 bool usable(vec4 c) {
-    return c.z > 0.0 && !any(isnan(c)) && !any(isinf(c));
+    return c.z > 0.0 && c.w > 0.0 && !any(isnan(c)) && !any(isinf(c));
 }
+
+#ifdef FIT
+
+const uint FIT_THREADS = 128u;
+const uint FIT_SAMPLES = 4096u;
+
+// Per thread: the normal matrix (6), the three right-hand sides (9), the
+// sum of clip z and the count.
+shared float red[17][FIT_THREADS];
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint vertices = 3u * min(counter_bytes / 144u, pc.cap);
+    uint step_ = max(1u, vertices / FIT_SAMPLES);
+    float a[17];
+    for (int i = 0; i < 17; ++i) {
+        a[i] = 0.0;
+    }
+    for (uint k = t; k < FIT_SAMPLES && k * step_ < vertices; k += FIT_THREADS) {
+        uint v = k * step_;
+        vec4 c = xfb[3u * v];
+        vec3 p = -xfb[3u * v + 2u].xyz;
+        float l = length(p);
+        if (!usable(c) || !(l > 1e-3) || isinf(l)) {
+            continue;
+        }
+        // Each vertex scaled to unit distance, so near and far weigh alike.
+        vec3 u = p / l;
+        vec4 q = c / l;
+        a[0] += u.x * u.x; a[1] += u.x * u.y; a[2] += u.x * u.z;
+        a[3] += u.y * u.y; a[4] += u.y * u.z; a[5] += u.z * u.z;
+        a[6] += u.x * q.x; a[7] += u.y * q.x; a[8] += u.z * q.x;
+        a[9] += u.x * q.y; a[10] += u.y * q.y; a[11] += u.z * q.y;
+        a[12] += u.x * q.w; a[13] += u.y * q.w; a[14] += u.z * q.w;
+        a[15] += c.z;
+        a[16] += 1.0;
+    }
+    for (int i = 0; i < 17; ++i) {
+        red[i][t] = a[i];
+    }
+    barrier();
+    for (uint s = FIT_THREADS / 2u; s > 0u; s >>= 1) {
+        if (t < s) {
+            for (int i = 0; i < 17; ++i) {
+                red[i][t] += red[i][t + s];
+            }
+        }
+        barrier();
+    }
+    if (t != 0u) {
+        return;
+    }
+    if (lit_colour > 256u * 64u) {
+        float ratio = clamp(float(lit_screen) / float(lit_colour), 0.1, 2.0);
+        exposure = exposure > 0.0 ? mix(exposure, ratio, 0.1) : ratio;
+    }
+    lit_screen = 0u;
+    lit_colour = 0u;
+    float n = red[16][0];
+    fit_samples = uint(n);
+    fit_ok = 0u;
+    if (n < 64.0) {
+        return;
+    }
+    mat3 A = mat3(red[0][0], red[1][0], red[2][0],
+                  red[1][0], red[3][0], red[4][0],
+                  red[2][0], red[4][0], red[5][0]);
+    if (abs(determinant(A)) < 1e-6 * n * n * n) {
+        return;
+    }
+    mat3 inv = inverse(A);
+    vec3 mx = inv * vec3(red[6][0], red[7][0], red[8][0]);
+    vec3 my = inv * vec3(red[9][0], red[10][0], red[11][0]);
+    vec3 mw = inv * vec3(red[12][0], red[13][0], red[14][0]);
+    float lw = length(mw);
+    vec2 tan_xy = vec2(lw / length(mx), lw / length(my));
+    float near = red[15][0] / n;
+    if (any(isnan(vec4(tan_xy, near, lw))) || any(lessThan(tan_xy, vec2(0.02))) || any(greaterThan(tan_xy, vec2(50.0)))
+        || !(near > 0.0) || abs(lw - 1.0) > 0.05) {
+        return;
+    }
+    // The camera's axes in the world: right, up (clip y is flipped), forward.
+    vec3 right = mx / length(mx), up = -my / length(my), forward = mw / lw;
+    camera = vec4(tan_xy, near, lw);
+    world_up = vec4(normalize(vec3(right.y, up.y, forward.y)), 0.0);
+    fit_ok = 1u;
+}
+
+#endif
 
 #ifdef PREP
 
@@ -92,7 +212,7 @@ void main() {
     if (i >= pc.n) {
         return;
     }
-    uint total = min(counter_bytes / 96u, min(pc.cap, pc.n));
+    uint total = min(counter_bytes / 144u, min(pc.cap, pc.n));
     uint key = 0xffffffffu;
     if (i < total) {
         vec4 a = position(3u * i), b = position(3u * i + 1u), c = position(3u * i + 2u);

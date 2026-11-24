@@ -116,9 +116,22 @@ float depth_at(ivec2 p) {
 }
 
 // View space: x right, y up, z away from the camera.
+#ifdef RT
+// The camera as `rt/build.comp`'s FIT measured it this frame (set at the
+// start of main): tan of the half fields of view, the near plane, the
+// world's up in view space; the fov knob and view-space y when it could not.
+vec2 g_tan;
+float g_near;
+vec3 g_up;
+bool g_fit;
+#define TAN_HALF g_tan
+#else
+#define TAN_HALF pc.tan_half
+#endif
+
 vec3 view_pos(vec2 pixel, float d) {
     vec2 ndc = pixel / vec2(pc.size) * 2.0 - 1.0;
-    return vec3(ndc.x * pc.tan_half.x, -ndc.y * pc.tan_half.y, 1.0) / d;
+    return vec3(ndc.x * TAN_HALF.x, -ndc.y * TAN_HALF.y, 1.0) / d;
 }
 
 // What depth says about one pixel: its normal (zero when a whole axis is
@@ -168,7 +181,12 @@ float wetness(vec3 N) {
     if ((pc.flags & 1u) == 0u) {
         return 1.0;
     }
-    return smoothstep(pc.up_threshold - UP_SOFTNESS, pc.up_threshold + UP_SOFTNESS, N.y);
+#ifdef RT
+    float up = dot(N, g_up);
+#else
+    float up = N.y;
+#endif
+    return smoothstep(pc.up_threshold - UP_SOFTNESS, pc.up_threshold + UP_SOFTNESS, up);
 }
 
 #ifdef COMPOSE
@@ -242,10 +260,22 @@ void main() {
         vec3 P = view_pos(vec2(p) + 0.5, d);
         vec3 N = surface_at(p, P).n;
         float wet = N == vec3(0.0) ? 0.0 : wetness(N);
+        // Traced (flags bit 1): the trace has measured the real camera and
+        // weighed in the wetness by the world's up; this pass has neither,
+        // so any surface may show the trace, and is wet by how strongly it
+        // reflects.
+        bool traced = (pc.flags & 2u) != 0u;
+        vec4 r = vec4(0.0);
+        if (traced && N != vec3(0.0)) {
+            r = gathered(p, P, N);
+            wet = clamp(r.a / max(pc.intensity, 1e-3), 0.0, 1.0);
+        }
         if (wet > 0.0) {
             vec3 own = base.rgb;
             base.rgb *= mix(vec3(1.0), pc.tint.rgb * (1.0 - pc.darken), wet);
-            vec4 r = gathered(p, P, N);
+            if (!traced) {
+                r = gathered(p, P, N);
+            }
             if (r.a > 1.0 / 1024.0) {
                 vec3 c = r.rgb / r.a;
                 vec3 hue = own / max(luma(own), 0.02);
@@ -261,7 +291,7 @@ void main() {
 
 // Where a view-space point, or a direction (its point at infinity), lands.
 vec2 to_pixel(vec3 v) {
-    vec2 ndc = vec2(v.x / (v.z * pc.tan_half.x), -v.y / (v.z * pc.tan_half.y));
+    vec2 ndc = vec2(v.x / (v.z * TAN_HALF.x), -v.y / (v.z * TAN_HALF.y));
     return (ndc * 0.5 + 0.5) * vec2(pc.size);
 }
 
@@ -426,20 +456,44 @@ vec4 reflection(ivec2 p, vec3 P, vec3 N, float wet) {
 // The colour of a hit: the scene colour where the hit is what the screen
 // shows there; otherwise (off screen, or behind what the screen shows) the
 // colour the hit triangle's vertex shader passed on, the engine's base
-// colour of the part without its textures, lit by a light from above, or a
-// neutral grey where the shader passes on no colour.
+// colour of the part without its textures, times the exposure: how much
+// brighter the screen is than the bare colours of hits it shows, measured
+// over recent frames (see `rt/build.comp`).
+//
+// Everything is in the view space of the camera FIT measured (see
+// `rt/build.comp`), the depth buffer and the captured triangles alike, so a
+// ray leaves a surface at its true angle. Each block's result is kept for
+// the next frame and blended in again while its pixel stays at the same
+// depth, which steadies it.
 
 layout(std430, set = 1, binding = 0) readonly buffer Xfb { vec4 xfb[]; };
 layout(std430, set = 1, binding = 2) readonly buffer Sorted { uvec2 sorted[]; };
 layout(std430, set = 1, binding = 3) readonly buffer Nodes { vec4 nodes[]; };
-layout(std430, set = 1, binding = 6) readonly buffer Globals { uint leaves; uint captured; };
+layout(std430, set = 1, binding = 6) buffer Globals {
+    uint leaves;
+    uint captured;
+    uint fit_ok;
+    uint fit_samples;
+    vec4 camera;
+    vec4 world_up;
+    uint lit_screen;
+    uint lit_colour;
+    float exposure;
+    uint unused;
+};
 // Per block: the premultiplied colour and strength as four halves, the
 // pixel the ray left from (x | y << 16, or ~0 for none).
 layout(std430, set = 1, binding = 7) buffer Blocks { uvec4 blocks[]; };
 
 const int STACK = 48;
-const vec3 LIGHT = vec3(0.32, 0.87, -0.37);
 const uint NO_PIXEL = 0xffffffffu;
+
+void camera_from_fit() {
+    g_fit = fit_ok != 0u;
+    g_tan = g_fit ? camera.xy : pc.tan_half;
+    g_near = camera.z;
+    g_up = g_fit ? world_up.xyz : vec3(0.0, 1.0, 0.0);
+}
 
 uvec2 half_size() {
     return (pc.size + 1u) / 2u;
@@ -448,8 +502,11 @@ uvec2 half_size() {
 #ifndef UPSAMPLE
 
 vec3 tri_view(uint v) {
-    vec4 c = xfb[2u * v];
-    return vec3(c.x * pc.tan_half.x, -c.y * pc.tan_half.y, c.w) / c.z;
+    vec4 c = xfb[3u * v];
+    if (g_fit) {
+        return vec3(c.x * g_tan.x, -c.y * g_tan.y, c.w) / g_near;
+    }
+    return vec3(c.x * g_tan.x, -c.y * g_tan.y, c.w) / c.z;
 }
 
 // Moller-Trumbore, both faces: t (or -1) and the barycentrics of B and C.
@@ -561,20 +618,15 @@ float trace_ray(vec3 O, vec3 D, float t_min, float t_max, out uint tri_hit, out 
     return found ? best : -1.0;
 }
 
-// The hit triangle's own colour at the hit, lit: the colour its vertex
-// shader passed on (gamma-encoded, as the engine's fragment shaders take
-// it, so the light goes in by its square root), grey without one.
-vec3 hit_colour(uint tri, vec2 uv, vec3 R) {
-    vec3 A = tri_view(3u * tri), B = tri_view(3u * tri + 1u), C = tri_view(3u * tri + 2u);
-    vec3 n = normalize(cross(B - A, C - A));
-    n = dot(n, R) > 0.0 ? -n : n;
-    float lit = 0.35 + 0.65 * max(dot(n, LIGHT), 0.0);
-    vec4 ca = xfb[2u * (3u * tri) + 1u], cb = xfb[2u * (3u * tri + 1u) + 1u], cc = xfb[2u * (3u * tri + 2u) + 1u];
-    vec3 albedo = vec3(0.5);
-    if (min(ca.a, min(cb.a, cc.a)) >= 0.0 && !any(isnan(ca + cb + cc))) {
-        albedo = clamp(ca.rgb * (1.0 - uv.x - uv.y) + cb.rgb * uv.x + cc.rgb * uv.y, 0.0, 1.0);
-    }
-    return albedo * sqrt(lit);
+// The hit triangle's own colour at the hit: the colour its vertex shader
+// passed on, interpolated. The engine's fragment shaders take it as
+// gamma-encoded (they square it, light in linear and take the square root
+// at the end), so as it is, it is the part's colour under a light of 1; no
+// light of ours is added.
+vec3 hit_colour(uint tri, vec2 uv) {
+    vec4 ca = xfb[3u * (3u * tri) + 1u], cb = xfb[3u * (3u * tri + 1u) + 1u], cc = xfb[3u * (3u * tri + 2u) + 1u];
+    vec3 c = ca.rgb * (1.0 - uv.x - uv.y) + cb.rgb * uv.x + cc.rgb * uv.y;
+    return any(isnan(c)) ? vec3(0.5) : clamp(c, 0.0, 1.0);
 }
 
 vec4 reflection_rt(ivec2 p, vec3 P, vec3 N, float wet) {
@@ -619,8 +671,16 @@ vec4 reflection_rt(ivec2 p, vec3 P, vec3 N, float wet) {
             }
         }
     }
-    if (!on_screen) {
-        c = hit_colour(tri, uv, R);
+    vec3 own = hit_colour(tri, uv);
+    if (on_screen) {
+        // A sample of what the engine's light makes of the bare colour.
+        if ((((p.x >> 1) ^ (p.y >> 1)) & 7) == 0) {
+            const vec3 L = vec3(0.2126, 0.7152, 0.0722);
+            atomicAdd(lit_screen, uint(dot(clamp(c, 0.0, 1.0), L) * 256.0));
+            atomicAdd(lit_colour, uint(dot(own, L) * 256.0));
+        }
+    } else {
+        c = own * (exposure > 0.0 ? exposure : 1.0);
     }
     float sure = 1.0;
     // A ray that ends somewhere fades out over the last 40% of it.
@@ -650,7 +710,11 @@ uint leader(ivec2 b) {
 
 #if defined(RT) && !defined(UPSAMPLE)
 
+// How much of a block's last result is kept when its pixel is where it was.
+const float HISTORY = 0.6;
+
 void main() {
+    camera_from_fit();
     ivec2 b = ivec2(gl_GlobalInvocationID.xy);
     uvec2 hs = half_size();
     if (any(greaterThanEqual(uvec2(b), hs))) {
@@ -658,21 +722,35 @@ void main() {
     }
     vec4 r = vec4(0.0);
     uint from = leader(b);
+    float d = 0.0;
     if (from != NO_PIXEL) {
         ivec2 p = ivec2(from & 0xffffu, from >> 16);
-        vec3 P = view_pos(vec2(p) + 0.5, depth_at(p));
+        d = depth_at(p);
+        vec3 P = view_pos(vec2(p) + 0.5, d);
         vec3 N = surface_at(p, P).n;
         float wet = N == vec3(0.0) ? 0.0 : wetness(N);
         if (wet > 0.0) {
             r = reflection_rt(p, P, N, wet);
         }
     }
-    blocks[uint(b.y) * hs.x + uint(b.x)] = uvec4(packHalf2x16(r.rg), packHalf2x16(r.ba), from, 0u);
+    uint i = uint(b.y) * hs.x + uint(b.x);
+    uvec4 last = blocks[i];
+    float last_d = uintBitsToFloat(last.w);
+    if (from != NO_PIXEL && last.z == from && abs(last_d - d) <= 0.001 * d) {
+        vec4 h = vec4(unpackHalf2x16(last.x), unpackHalf2x16(last.y));
+        if (!any(isnan(h)) && !any(isinf(h))) {
+            r = mix(r, h, HISTORY);
+        }
+    }
+    blocks[i] = uvec4(packHalf2x16(r.rg), packHalf2x16(r.ba), from, floatBitsToUint(d));
 }
 
 #else
 
 void main() {
+#ifdef UPSAMPLE
+    camera_from_fit();
+#endif
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(uvec2(p), pc.size))) {
         return;
