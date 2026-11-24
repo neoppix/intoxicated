@@ -2145,11 +2145,25 @@ fn record(
     }
     stamp(1);
     if ssr {
-        bind_ssr(g.pipelines[2]);
-        (fns.cmd_dispatch)(cmd, w.div_ceil(8), h.div_ceil(8), 1);
-        // The trace written, then read by the compose.
-        compute_barrier(fns, cmd);
-        (fns.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[3]);
+        // With `INTOXICATED_RT=1`, the ray-traced reflections' build and
+        // trace in place of the march when the scene was captured; the
+        // march otherwise. See `rt::trace`.
+        let traced = super::rt::requested()
+            && super::rt::trace::record(cmd, g.device, g.set_layout, set, p, [w, h], g.period_ns, g.timestamp_mask)
+                .unwrap_or_else(|why| {
+                    super::rt::trace::failed(&why);
+                    false
+                });
+        if traced {
+            compute_barrier(fns, cmd);
+            bind_ssr(g.pipelines[3]);
+        } else {
+            bind_ssr(g.pipelines[2]);
+            (fns.cmd_dispatch)(cmd, w.div_ceil(8), h.div_ceil(8), 1);
+            // The trace written, then read by the compose.
+            compute_barrier(fns, cmd);
+            (fns.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[3]);
+        }
         (fns.cmd_dispatch)(cmd, w.div_ceil(8), h.div_ceil(8), 1);
         compute_barrier(fns, cmd);
     }
@@ -3286,7 +3300,7 @@ mod tests {
                 .collect()
         };
         // The same list as build.rs's `SHADERS`.
-        let shaders: [(&str, &str, &[&str]); 14] = [
+        let shaders: [(&str, &str, &[&str]); 20] = [
             ("depth_capture/resolve.comp", "depth_capture/resolve_ms", &[]),
             ("depth_capture/resolve.comp", "depth_capture/resolve_1x", &["-DSINGLE_SAMPLE"]),
             ("ssr/depth.comp", "ssr/depth_ms", &[]),
@@ -3301,6 +3315,12 @@ mod tests {
             ("ssr/post.comp", "ssr/post_bloom_down", &["-DBLOOM_DOWN"]),
             ("ssr/post.comp", "ssr/post_bloom_up", &["-DBLOOM_UP"]),
             ("ssr/post.comp", "ssr/post_bloom_compose", &["-DBLOOM_COMPOSE"]),
+            ("ssr/ssr.comp", "ssr/rt_trace", &["-DRT"]),
+            ("rt/build.comp", "rt/build_prep", &["-DPREP"]),
+            ("rt/build.comp", "rt/build_sort_local", &["-DSORT_LOCAL"]),
+            ("rt/build.comp", "rt/build_sort_global", &["-DSORT_GLOBAL"]),
+            ("rt/build.comp", "rt/build_build", &["-DBUILD"]),
+            ("rt/build.comp", "rt/build_bounds", &["-DBOUNDS"]),
         ];
         for (source, stem, defines) in shaders {
             let run = std::process::Command::new(GLSLC)

@@ -777,6 +777,19 @@ pub(crate) fn device_destroying(device: *mut c_void) {
     st.cmds.clear();
 }
 
+/// The capture buffers of `device` when this frame's scene was captured
+/// (transform feedback began at least once since its depth was cleared):
+/// the triangles, the counter of bytes written and the capacity in bytes.
+pub(crate) fn frame_captured(device: usize) -> Option<(u64, u64, u64)> {
+    let st = state();
+    st.gpus.iter().find(|g| g.device == device && g.started).map(|g| (g.xfb.buffer, g.counter.buffer, g.capacity))
+}
+
+/// The bytes the last frames captured, as last read back.
+pub(crate) fn last_bytes() -> u64 {
+    LAST_BYTES.load(Relaxed)
+}
+
 // ------------------------------------------------------------ devctl
 
 pub(crate) fn stats_line() -> String {

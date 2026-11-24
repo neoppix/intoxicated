@@ -521,6 +521,20 @@ env:
                                      threshold (0.5)
   INTOXICATED_BLOOM_RADIUS=<0..1>    0 a tight glow, 1 a wide one (0.7)
   INTOXICATED_BLOOM_TINT=<r,g,b>     colour of the glow, each 0 to 2 (1,1,1)
+  INTOXICATED_RT=1                   ray-traced reflections (prototype): the
+                                     scene's triangles are captured as the
+                                     engine draws them and the reflections'
+                                     rays are traced against them, so they
+                                     show what is off screen or hidden too.
+                                     Needs INTOXICATED_SSR=1 (their look
+                                     knobs apply). Off by default. devctl rt
+                                     on|off|stats
+  INTOXICATED_RT_TRIANGLES=<n>       triangles captured per frame at most
+                                     (2097152)
+  INTOXICATED_RT_DUMP=<dir>          research: the engine's shader modules and
+                                     pipelines to <dir>; devctl rt draws and
+                                     rt dump <path> write a frame's draws and
+                                     triangles
   INTOXICATED_FILES_DIR=<dir>        the engine's data root (default
                                      <profile>/data): its files/ and cache/
   INTOXICATED_EARLY_DIRS=<keys>      directory setters sent before

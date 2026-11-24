@@ -1,0 +1,279 @@
+// The acceleration structure of the ray-traced reflections (see `trace.rs`),
+// built on the GPU every frame from the triangles transform feedback
+// captured (`capture.rs`): a bounding volume hierarchy over them, sorted
+// along a Morton curve (a linear BVH). The driver offers no hardware
+// acceleration structures on this GPU, so this is the software stand-in.
+// One source, five stages:
+//
+//     -DPREP          a key per triangle: the Morton code of its centre,
+//                     or ~0 for one that is not real geometry
+//     -DSORT_LOCAL    bitonic sort, the steps that stay within 1024 keys
+//     -DSORT_GLOBAL   bitonic sort, one step across blocks
+//     -DBUILD         the hierarchy from the sorted keys (Karras 2012)
+//     -DBOUNDS        each node's two child boxes, from the leaves up
+//
+// Built by build.rs with the system's glslc, else taken from the committed
+// files beside this one:
+//
+//     glslc -O --target-env=vulkan1.0 -mfmt=num -D<STAGE> build.comp -o -
+//         -> build_<stage>.spv.rs
+//
+// Positions are clip-space as captured. They are turned into the view space
+// of `ssr/ssr.comp` (x right, y up, z away from the camera, in units of the
+// near plane) the way that shader turns depth into position: with
+// reversed-Z and the far plane at infinity, clip z is the near plane and
+// clip w the distance, so (x tan_x, -y tan_y, w) / z.
+
+#version 450
+
+#ifdef SORT_LOCAL
+layout(local_size_x = 512) in;
+#else
+layout(local_size_x = 256) in;
+#endif
+
+layout(std430, binding = 0) readonly buffer Xfb { vec4 xfb[]; };
+layout(std430, binding = 1) readonly buffer Counter { uint counter_bytes; };
+layout(std430, binding = 2) buffer Sorted { uvec2 sorted[]; };
+layout(std430, binding = 3) coherent buffer Nodes { vec4 nodes[]; };
+layout(std430, binding = 4) buffer Parents { int parents[]; };
+layout(std430, binding = 5) buffer Flags { uint flags[]; };
+layout(std430, binding = 6) buffer Globals {
+    // Triangles that are leaves (real geometry), and those captured.
+    uint leaves;
+    uint captured;
+};
+
+// std430; `trace::BuildParams` mirrors it.
+layout(push_constant) uniform Params {
+    // Keys sorted: a power of two at least the triangles used.
+    uint n;
+    // Triangles our capture buffer holds.
+    uint cap;
+    // The bitonic stage and step.
+    uint k;
+    uint j;
+    vec2 tan_half;
+} pc;
+
+vec3 to_view(vec4 c) {
+    return vec3(c.x * pc.tan_half.x, -c.y * pc.tan_half.y, c.w) / c.z;
+}
+
+bool usable(vec4 c) {
+    return c.z > 0.0 && !any(isnan(c)) && !any(isinf(c));
+}
+
+#ifdef PREP
+
+uint spread(uint v) {
+    v = (v | (v << 16)) & 0x030000FFu;
+    v = (v | (v << 8)) & 0x0300F00Fu;
+    v = (v | (v << 4)) & 0x030C30C3u;
+    v = (v | (v << 2)) & 0x09249249u;
+    return v;
+}
+
+// A logarithmic warp around the camera before quantising: fine near it,
+// coarse far away, so the character and what is near it are sorted finely
+// whatever else the scene holds.
+uint cell(float x) {
+    float f = sign(x) * log2(1.0 + abs(x));
+    return uint(clamp((f + 24.0) / 48.0 * 1024.0, 0.0, 1023.0));
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) {
+        return;
+    }
+    uint total = min(counter_bytes / 48u, min(pc.cap, pc.n));
+    uint key = 0xffffffffu;
+    if (i < total) {
+        vec4 a = xfb[3u * i], b = xfb[3u * i + 1u], c = xfb[3u * i + 2u];
+        if (usable(a) && usable(b) && usable(c)) {
+            vec3 A = to_view(a), B = to_view(b), C = to_view(c);
+            vec3 n = cross(B - A, C - A);
+            if (dot(n, n) > 0.0 && !any(isinf(n))) {
+                vec3 m = (A + B + C) / 3.0;
+                key = (spread(cell(m.x)) << 2) | (spread(cell(m.y)) << 1) | spread(cell(m.z));
+                atomicAdd(leaves, 1u);
+            }
+        }
+    }
+    sorted[i] = uvec2(key, i);
+    if (i == 0u) {
+        captured = total;
+    }
+}
+
+#endif
+
+#if defined(SORT_LOCAL) || defined(SORT_GLOBAL)
+
+bool after(uvec2 a, uvec2 b) {
+    return a.x > b.x || (a.x == b.x && a.y > b.y);
+}
+
+#endif
+
+#ifdef SORT_LOCAL
+
+shared uvec2 block[1024];
+
+void step_(uint base, uint k, uint j) {
+    uint t = gl_LocalInvocationID.x;
+    uint i = 2u * j * (t / j) + (t % j);
+    uint l = i + j;
+    bool up = ((base + i) & k) == 0u;
+    uvec2 a = block[i], b = block[l];
+    if (after(a, b) == up) {
+        block[i] = b;
+        block[l] = a;
+    }
+    memoryBarrierShared();
+    barrier();
+}
+
+void main() {
+    uint base = gl_WorkGroupID.x * 1024u;
+    uint t = gl_LocalInvocationID.x;
+    block[t] = sorted[base + t];
+    block[t + 512u] = sorted[base + t + 512u];
+    memoryBarrierShared();
+    barrier();
+    if (pc.k == 0u) {
+        for (uint k = 2u; k <= 1024u; k <<= 1) {
+            for (uint j = k >> 1; j > 0u; j >>= 1) {
+                step_(base, k, j);
+            }
+        }
+    } else {
+        for (uint j = 512u; j > 0u; j >>= 1) {
+            step_(base, pc.k, j);
+        }
+    }
+    sorted[base + t] = block[t];
+    sorted[base + t + 512u] = block[t + 512u];
+}
+
+#endif
+
+#ifdef SORT_GLOBAL
+
+void main() {
+    uint t = gl_GlobalInvocationID.x;
+    if (t >= pc.n / 2u) {
+        return;
+    }
+    uint i = 2u * pc.j * (t / pc.j) + (t % pc.j);
+    uint l = i + pc.j;
+    bool up = (i & pc.k) == 0u;
+    uvec2 a = sorted[i], b = sorted[l];
+    if (after(a, b) == up) {
+        sorted[i] = b;
+        sorted[l] = a;
+    }
+}
+
+#endif
+
+#ifdef BUILD
+
+int m;
+
+// The length of the common prefix of keys i and j, the index breaking ties;
+// -1 outside the leaves.
+int delta(int i, int j) {
+    if (j < 0 || j >= m) {
+        return -1;
+    }
+    uint a = sorted[i].x, b = sorted[j].x;
+    if (a == b) {
+        return 32 + (31 - findMSB(uint(i ^ j)));
+    }
+    return 31 - findMSB(a ^ b);
+}
+
+void main() {
+    m = int(leaves);
+    int i = int(gl_GlobalInvocationID.x);
+    if (i >= m - 1) {
+        return;
+    }
+    int d = delta(i, i + 1) - delta(i, i - 1) >= 0 ? 1 : -1;
+    int dmin = delta(i, i - d);
+    int lmax = 2;
+    while (delta(i, i + lmax * d) > dmin) {
+        lmax <<= 1;
+    }
+    int l = 0;
+    for (int t = lmax >> 1; t >= 1; t >>= 1) {
+        if (delta(i, i + (l + t) * d) > dmin) {
+            l += t;
+        }
+    }
+    int j = i + l * d;
+    int dnode = delta(i, j);
+    int s = 0;
+    int t = l;
+    do {
+        t = (t + 1) >> 1;
+        if (delta(i, i + (s + t) * d) > dnode) {
+            s += t;
+        }
+    } while (t > 1);
+    int gamma = i + s * d + min(d, 0);
+    // A leaf is ~its index, a node its index.
+    int left = min(i, j) == gamma ? ~gamma : gamma;
+    int right = max(i, j) == gamma + 1 ? ~(gamma + 1) : gamma + 1;
+    nodes[4 * i].w = intBitsToFloat(left);
+    nodes[4 * i + 2].w = intBitsToFloat(right);
+    if (left < 0) {
+        parents[int(pc.n) + ~left] = i;
+    } else {
+        parents[left] = i;
+    }
+    if (right < 0) {
+        parents[int(pc.n) + ~right] = i;
+    } else {
+        parents[right] = i;
+    }
+    if (i == 0) {
+        parents[0] = -1;
+    }
+}
+
+#endif
+
+#ifdef BOUNDS
+
+void main() {
+    int m = int(leaves);
+    int leaf = int(gl_GlobalInvocationID.x);
+    if (leaf >= m || m < 2) {
+        return;
+    }
+    uint tri = sorted[leaf].y;
+    vec3 A = to_view(xfb[3u * tri]), B = to_view(xfb[3u * tri + 1u]), C = to_view(xfb[3u * tri + 2u]);
+    vec3 lo = min(A, min(B, C)), hi = max(A, max(B, C));
+    int child = ~leaf;
+    int p = parents[int(pc.n) + leaf];
+    for (int guard = 0; guard < 128 && p >= 0; ++guard) {
+        bool is_left = floatBitsToInt(nodes[4 * p].w) == child;
+        int at = 4 * p + (is_left ? 0 : 2);
+        nodes[at].xyz = lo;
+        nodes[at + 1].xyz = hi;
+        memoryBarrierBuffer();
+        if (atomicAdd(flags[p], 1u) == 0u) {
+            return;
+        }
+        memoryBarrierBuffer();
+        lo = min(nodes[4 * p].xyz, nodes[4 * p + 2].xyz);
+        hi = max(nodes[4 * p + 1].xyz, nodes[4 * p + 3].xyz);
+        child = p;
+        p = parents[p];
+    }
+}
+
+#endif

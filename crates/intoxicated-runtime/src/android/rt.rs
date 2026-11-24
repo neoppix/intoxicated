@@ -32,6 +32,7 @@ use std::sync::{Mutex, OnceLock};
 
 pub(crate) mod capture;
 pub(crate) mod spirv;
+pub(crate) mod trace;
 
 
 /// The switch.
@@ -435,6 +436,13 @@ unsafe fn apply(info: *const c_void, extensions: &[&'static CStr], enabled: Enab
 pub fn control(args: &[&str]) -> Result<String, String> {
     match args {
         ["draws"] => capture::request_draws(),
+        [w @ ("on" | "off")] => {
+            if !requested() {
+                return Err(format!("the ray-traced reflections are off ({ENV}=1 at start turns them on)"));
+            }
+            trace::set_on(*w == "on");
+            Ok(trace::stats_line())
+        }
         ["dump", path] => capture::dump(path),
         [] | ["stats"] => {
             if !requested() {
@@ -449,14 +457,15 @@ pub fn control(args: &[&str]) -> Result<String, String> {
                 })
                 .collect();
             Ok(format!(
-                "engine_api={} instance_api={} {} {}",
+                "engine_api={} instance_api={} {} {} {}",
                 version_text(ENGINE_API_VERSION.load(Relaxed)),
                 version_text(INSTANCE_API_VERSION.load(Relaxed)),
                 if devices.is_empty() { "no device".to_string() } else { devices.join(" ") },
                 capture::stats_line(),
+                trace::stats_line()
             ))
         }
-        _ => Err("rt [stats] | draws | dump <path>".into()),
+        _ => Err("rt [stats] | on | off | draws | dump <path>".into()),
     }
 }
 
@@ -472,6 +481,7 @@ pub(crate) fn device_destroying(device: *mut c_void) {
     if !requested() {
         return;
     }
+    trace::device_destroying(device);
     DEVICES.lock().unwrap_or_else(|e| e.into_inner()).retain(|(dev, _)| *dev != device as usize);
 }
 
