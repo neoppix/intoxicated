@@ -116,8 +116,8 @@ const PIPELINES: usize = 14;
 /// 4 the parents, 5 the flags, 6 the globals, 7 the traced blocks, 8 the
 /// triangles to trace, 9 the cache, 10 this frame's draws, 11 its textures
 /// by serial, 12 the environment, 13 and 14 the indirect light, 15 and 16
-/// the filtered indirect light.
-const BINDINGS: [u32; 16] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+/// the filtered indirect light, 17 the triangles that give off light.
+const BINDINGS: [u32; 17] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
 /// Bytes of the indirect light a 2 by 2 block.
 const GI_BYTES: u64 = 32;
 /// The environment: 256 by 256 directions, 16 bytes each.
@@ -143,7 +143,9 @@ const TEXTURES: u32 = capture::MAX_TEXTURES as u32;
 /// Bytes of the globals (`build.comp`'s `Globals`) and of what `rt stats`
 /// reads back of them.
 const GLOBALS_BYTES: u64 = 512;
-const GLOBALS_READ: usize = 57;
+const GLOBALS_READ: usize = 77;
+/// Our mapped copy of the globals' first `GLOBALS_READ` words.
+const READBACK_BYTES: u64 = 512;
 /// Byte offset of `full_rate` in the globals.
 const GLOBALS_FULL_RATE: u64 = 208;
 /// Bytes per traced 2 by 2 block.
@@ -238,6 +240,26 @@ pub(crate) fn shade_flags() -> u32 {
 pub const ENV_ENV: &str = "INTOXICATED_RT_ENV";
 static ENV_ON: OnceLock<AtomicBool> = OnceLock::new();
 const FLAG_NO_ENV: u32 = 32;
+/// The indirect light was computed this frame before the reflections
+/// (`ssr.comp` `gi_at`).
+const FLAG_GI: u32 = 1 << 14;
+/// Bytes of the list of triangles that give off light (`MAX_EMITTERS` in
+/// `rt/build.comp`), and where their count is in the globals.
+const EMITTERS_BYTES: u64 = 4 * 16384;
+const GLOBALS_EMITTERS: u64 = 304;
+/// The blocks' sizes in the globals (`rscale`, `gscale`).
+const GLOBALS_SCALES: u64 = 308;
+/// Pixels may trace their own reflection ray (`ssr.comp`'s upsample) only
+/// while the blocks are their finest, 2 by 2.
+const FLAG_FULL_RATE: u32 = 1 << 15;
+/// The reflections trace on a grid at most this wide over two; wider
+/// outputs get bigger blocks.
+const TARGET_WIDTH: u32 = 1920;
+/// The GPU time the build and the trace together should stay under (ms),
+/// looked at every `BUDGET_FRAMES` frames; `MAX_COARSER` steps at most.
+const BUDGET_MS: f64 = 3.0;
+const BUDGET_FRAMES: u32 = 120;
+const MAX_COARSER: u32 = 2;
 
 fn env_switch() -> &'static AtomicBool {
     ENV_ON.get_or_init(|| AtomicBool::new(std::env::var(ENV_ENV).map_or(true, |v| v.trim() != "0")))
@@ -251,9 +273,10 @@ pub(crate) fn set_env(on: bool) {
     env_switch().store(on, Relaxed);
 }
 
-/// A debug view in place of the reflections: devctl `rt view off|normal|source`
-/// (`ssr.comp`: flags bits 6 and 7).
-pub(crate) const VIEWS: [&str; 3] = ["off", "normal", "source"];
+/// A debug view in place of the reflections: devctl `rt view
+/// off|normal|source|category` (`ssr.comp`: flags bits 6 and 7; category
+/// colours what each ray hit by kind).
+pub(crate) const VIEWS: [&str; 4] = ["off", "normal", "source", "category"];
 static VIEW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 pub(crate) fn set_view(name: &str) -> Result<(), String> {
@@ -414,6 +437,9 @@ pub(crate) struct Stats {
     pub build_ms: std::collections::VecDeque<f64>,
     pub trace_ms: std::collections::VecDeque<f64>,
     pub keys: u32,
+    /// The blocks' sizes in pixels a side: the reflections', the indirect
+    /// light's.
+    pub scales: (u32, u32),
     /// The globals as last read back (`build.comp`'s `Globals`).
     pub fit: Option<[u32; GLOBALS_READ]>,
     /// The frame the cache was last copied out at, for `rt dump-cache`.
@@ -452,6 +478,8 @@ struct Gpu {
     gi_room: u64,
     /// The GI filter's buffers, 8 bytes a block.
     gi_filtered: [Owned; 2],
+    /// This frame's triangles that give off light, by index.
+    emitters: Owned,
     /// The ring slot of the last trace, whose set 2 the apply pass binds.
     last_slot: usize,
     /// A zeroed stand-in for the engine's per-frame uniform block.
@@ -471,6 +499,12 @@ struct Gpu {
     dummy_ready: bool,
     /// The blocks were cleared once (they carry the last frame's results).
     blocks_cleared: bool,
+    /// Steps the time budget has coarsened the blocks by (0 to
+    /// `MAX_COARSER`), the frames since it last looked, and the scales the
+    /// buffers' contents were made at.
+    coarser: u32,
+    budget_frames: u32,
+    scales: (u32, u32),
     /// Host-visible: a copy of the globals (the camera FIT measured).
     readback: Owned,
     readback_ptr: usize,
@@ -553,6 +587,7 @@ impl Gpu {
             self.gi[1],
             self.gi_filtered[0],
             self.gi_filtered[1],
+            self.emitters,
             self.no_frame_block,
             self.readback,
             self.cache_copy,
@@ -645,6 +680,7 @@ fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool, extent: [u32; 2]) -
         gi: [Owned::default(); 2],
         gi_room: 0,
         gi_filtered: [Owned::default(); 2],
+        emitters: Owned::default(),
         last_slot: 0,
         no_frame_block: Owned::default(),
         cache_copy: Owned::default(),
@@ -658,6 +694,9 @@ fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool, extent: [u32; 2]) -
         dummy_view: 0,
         dummy_ready: false,
         blocks_cleared: false,
+        coarser: 0,
+        budget_frames: 0,
+        scales: (0, 0),
         readback: Owned::default(),
         readback_ptr: 0,
         block_room: blocks_of([extent[0].max(ROOM_FOR[0]), extent[1].max(ROOM_FOR[1])]),
@@ -820,11 +859,12 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         make_buffer(&g.buffers, d, &types, g.gi_room / 4, usage, false)?,
         make_buffer(&g.buffers, d, &types, g.gi_room / 4, usage, false)?,
     ];
+    g.emitters = make_buffer(&g.buffers, d, &types, EMITTERS_BYTES, usage, false)?;
     g.no_frame_block = make_buffer(&g.buffers, d, &types, FRAME_BLOCK_BYTES, USAGE_UNIFORM | USAGE_TRANSFER_DST, false)?;
     make_textures(g, &types)?;
-    g.readback = make_buffer(&g.buffers, d, &types, 256, USAGE_TRANSFER_DST, true)?;
+    g.readback = make_buffer(&g.buffers, d, &types, READBACK_BYTES, USAGE_TRANSFER_DST, true)?;
     let mut mapped = std::ptr::null_mut();
-    check((g.buffers.map_memory)(d, g.readback.memory, 0, 256, 0, &mut mapped), "vkMapMemory")?;
+    check((g.buffers.map_memory)(d, g.readback.memory, 0, READBACK_BYTES, 0, &mut mapped), "vkMapMemory")?;
     g.readback_ptr = mapped as usize;
     let f = &g.fns;
     let bindings: Vec<DescriptorSetLayoutBinding> = BINDINGS
@@ -939,6 +979,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         DescriptorBufferInfo { buffer: g.gi[1].buffer, offset: 0, range: g.gi_room },
         DescriptorBufferInfo { buffer: g.gi_filtered[0].buffer, offset: 0, range: g.gi_room / 4 },
         DescriptorBufferInfo { buffer: g.gi_filtered[1].buffer, offset: 0, range: g.gi_room / 4 },
+        DescriptorBufferInfo { buffer: g.emitters.buffer, offset: 0, range: EMITTERS_BYTES },
     ];
     let writes: Vec<WriteDescriptorSet> = infos
         .iter()
@@ -984,6 +1025,7 @@ pub(crate) fn record(
     period_ns: f64,
     mask: u64,
 ) -> Result<bool, String> {
+    let _timed = capture::Timed::start();
     if !is_on() {
         return Ok(false);
     }
@@ -1046,12 +1088,36 @@ pub(crate) fn record(
         check((g.buffers.map_memory)(g.device as Dev, g.cache_copy.memory, 0, SLOT_BYTES * slots() as u64, 0, &mut mapped), "vkMapMemory")?;
         g.cache_copy_ptr = mapped as usize;
     }
-    let clear_blocks = !g.blocks_cleared;
+    // The blocks' size: the reflections' a side by the output's width (one
+    // ray a block on a grid at most `TARGET_WIDTH` / 2 wide), the indirect
+    // light's twice that; both coarser while the GPU time stays over the
+    // budget, finer again well under it.
+    g.budget_frames += 1;
+    if g.budget_frames >= BUDGET_FRAMES {
+        g.budget_frames = 0;
+        let mean = |q: &std::collections::VecDeque<f64>| q.iter().rev().take(60).sum::<f64>() / q.len().clamp(1, 60) as f64;
+        // The build does not shrink with the blocks: the trace gets what
+        // the budget leaves it, never under 1 ms.
+        let room = (BUDGET_MS - mean(&st.stats.build_ms)).max(1.0);
+        let trace = mean(&st.stats.trace_ms);
+        if trace > room && g.coarser < MAX_COARSER {
+            g.coarser += 1;
+        } else if trace < 0.5 * room && g.coarser > 0 {
+            g.coarser -= 1;
+        }
+    }
+    let rscale = extent[0].div_ceil(TARGET_WIDTH / 2).max(2) + g.coarser;
+    let scales = (rscale, 2 * rscale);
+    let rescaled = g.scales != scales;
+    g.scales = scales;
+    st.stats.scales = scales;
+    let clear_blocks = !g.blocks_cleared || rescaled;
+    let first_clear = !g.blocks_cleared;
     g.blocks_cleared = true;
     let dummy_was_ready = g.dummy_ready;
     g.dummy_ready = true;
     if g.readback_ptr != 0 {
-        // SAFETY: our mapping of 256 bytes, written by an earlier frame's
+        // SAFETY: our mapping of `READBACK_BYTES`, written by an earlier frame's
         // copy; a torn or old value only skews the report.
         let words: [u32; GLOBALS_READ] = unsafe { std::ptr::read_volatile(g.readback_ptr as *const [u32; GLOBALS_READ]) };
         st.stats.fit = Some(words);
@@ -1077,25 +1143,33 @@ pub(crate) fn record(
     (f.cmd_fill_buffer)(cmd, g.globals.buffer, 160, 4, 0);
     // `full_rate`: std430 puts the `sky` vec4 before it at 192, so 208.
     (f.cmd_fill_buffer)(cmd, g.globals.buffer, GLOBALS_FULL_RATE, 4, 0);
+    (f.cmd_fill_buffer)(cmd, g.globals.buffer, GLOBALS_EMITTERS, 4, 0);
     (f.cmd_fill_buffer)(cmd, g.flags.buffer, 0, 4 * n as u64, 0);
-    if clear_blocks {
-        (f.cmd_fill_buffer)(cmd, g.blocks.buffer, 0, BLOCK_BYTES * g.block_room, 0);
+    if first_clear {
         (f.cmd_fill_buffer)(cmd, g.globals.buffer, 16, GLOBALS_BYTES - 16, 0);
         (f.cmd_fill_buffer)(cmd, g.slots.buffer, 0, SLOT_BYTES * slots() as u64, 0);
         (f.cmd_fill_buffer)(cmd, g.env.buffer, 0, ENV_BYTES, 0);
+        (f.cmd_fill_buffer)(cmd, g.no_frame_block.buffer, 0, FRAME_BLOCK_BYTES, 0);
+    }
+    // The per-block buffers, when the blocks' size changed (their
+    // contents index the old grid).
+    if clear_blocks {
+        (f.cmd_fill_buffer)(cmd, g.blocks.buffer, 0, BLOCK_BYTES * g.block_room, 0);
         (f.cmd_fill_buffer)(cmd, g.gi[0].buffer, 0, g.gi_room, 0);
         (f.cmd_fill_buffer)(cmd, g.gi[1].buffer, 0, g.gi_room, 0);
         (f.cmd_fill_buffer)(cmd, g.gi_filtered[0].buffer, 0, g.gi_room / 4, 0);
         (f.cmd_fill_buffer)(cmd, g.gi_filtered[1].buffer, 0, g.gi_room / 4, 0);
-        (f.cmd_fill_buffer)(cmd, g.no_frame_block.buffer, 0, FRAME_BLOCK_BYTES, 0);
     }
+    (f.cmd_fill_buffer)(cmd, g.globals.buffer, GLOBALS_SCALES, 4, scales.0);
+    (f.cmd_fill_buffer)(cmd, g.globals.buffer, GLOBALS_SCALES + 4, 4, scales.1);
     g.barrier(cmd, STAGE_TRANSFER | STAGE_COMPUTE, ACCESS_TRANSFER_WRITE | ACCESS_SHADER_WRITE);
     let current = (triangles.min(capacity / capture::TRIANGLE_BYTES)) as u32;
     // This frame's draws and textures: the draws' codes by first triangle,
     // the views into set 2 (our image where there is none) and the table
     // from serial to place.
     let (draws, textures) = capture::frame_textures(device);
-    let draws: Vec<[u32; 4]> = draws.iter().take(MAX_DRAWS).map(|d| [d[0], d[1], 0, d[2]]).collect();
+    // (first triangle, texture code, emission, blends).
+    let draws: Vec<[u32; 4]> = draws.iter().take(MAX_DRAWS).map(|d| [d[0], d[1], d[3], d[2]]).collect();
     let mut map = vec![[0u32; 2]; TEX_MAP];
     for (place, &(serial, _, _)) in textures.iter().enumerate() {
         if let Some(e) = (0..4).map(|i| (serial as usize + i) % TEX_MAP).find(|&e| map[e][0] == 0) {
@@ -1234,49 +1308,58 @@ pub(crate) fn record(
     if st.stats.light {
         tp.flags |= FLAG_LIGHT;
     }
-    (f.cmd_push_constants)(
-        cmd,
-        g.trace_layout,
-        SHADER_STAGE_COMPUTE,
-        0,
-        std::mem::size_of::<super::super::ssr::Params>() as u32,
-        (&tp as *const super::super::ssr::Params).cast(),
-    );
+    let gi_run = gi_on() && g.gi_room >= GI_BYTES * blocks_of(extent);
+    if gi_run {
+        tp.flags |= FLAG_GI;
+    }
+    if scales.0 == 2 {
+        tp.flags |= FLAG_FULL_RATE;
+    }
+    let push = |q: &super::super::ssr::Params| {
+        (f.cmd_push_constants)(
+            cmd,
+            g.trace_layout,
+            SHADER_STAGE_COMPUTE,
+            0,
+            std::mem::size_of::<super::super::ssr::Params>() as u32,
+            (q as *const super::super::ssr::Params).cast(),
+        );
+    };
+    // One invocation a block, the reflections' or the indirect light's.
+    let half = |pipeline: usize| {
+        // (The environment pass takes a quarter of the pixels, 2 by 2.)
+        let s = match pipeline {
+            GI | GI_FILTER => scales.1,
+            ENV => 2,
+            _ => scales.0,
+        };
+        (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[pipeline]);
+        (f.cmd_dispatch)(cmd, extent[0].div_ceil(s).div_ceil(8), extent[1].div_ceil(s).div_ceil(8), 1);
+    };
+    push(&tp);
     // The sky the opaque copy shows, into the environment, a quarter of the
     // pixels a frame.
-    (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[ENV]);
-    (f.cmd_dispatch)(cmd, extent[0].div_ceil(2).div_ceil(8), extent[1].div_ceil(2).div_ceil(8), 1);
+    half(ENV);
     g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
-    (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[TRACE]);
+    if gi_run {
+        // The indirect light first, so the reflections can show it (flags
+        // bit 14): one ray a block, accumulated over frames, then filtered
+        // by two a-trous passes 1 and 2 blocks apart (the step in `steps`);
+        // applied after the reflections' compose (see `record_gi_apply`).
+        half(GI);
+        for step in [1u32, 2] {
+            g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
+            push(&super::super::ssr::Params { steps: step, ..tp });
+            half(GI_FILTER);
+        }
+        g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
+        push(&tp);
+    }
     // One ray per 2 by 2 block, then every pixel from the blocks around it.
-    (f.cmd_dispatch)(cmd, extent[0].div_ceil(2).div_ceil(8), extent[1].div_ceil(2).div_ceil(8), 1);
+    half(TRACE);
     g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
     (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[UPSAMPLE]);
     (f.cmd_dispatch)(cmd, extent[0].div_ceil(8), extent[1].div_ceil(8), 1);
-    if gi_on() && g.gi_room >= GI_BYTES * blocks_of(extent) {
-        // One indirect ray a block, accumulated over frames (applied after
-        // the reflections' compose, see `record_gi_apply`).
-        g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
-        (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[GI]);
-        (f.cmd_dispatch)(cmd, extent[0].div_ceil(2).div_ceil(8), extent[1].div_ceil(2).div_ceil(8), 1);
-        // Filtered: three a-trous passes, 1, 2 and 4 blocks apart (the
-        // step in `steps`).
-        (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[GI_FILTER]);
-        for step in [1u32, 2, 4] {
-            g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
-            let mut fp = tp;
-            fp.steps = step;
-            (f.cmd_push_constants)(
-                cmd,
-                g.trace_layout,
-                SHADER_STAGE_COMPUTE,
-                0,
-                std::mem::size_of::<super::super::ssr::Params>() as u32,
-                (&fp as *const super::super::ssr::Params).cast(),
-            );
-            (f.cmd_dispatch)(cmd, extent[0].div_ceil(2).div_ceil(8), extent[1].div_ceil(2).div_ceil(8), 1);
-        }
-    }
     stamp(2);
     if timed {
         g.pending[slot] = true;
@@ -1317,7 +1400,7 @@ pub(crate) fn record_gi_apply(cmd: *mut c_void, device: usize, ssr_set: u64, par
 
 /// devctl `rt dump-cache <path>`: the cache's live triangles after the next
 /// traced frame, one line each: frame first and last seen, frames in a row
-/// its place showed empty, the low bits of its vertex shader's hash, its
+/// its place showed empty, the light it gives off (packed), its
 /// texture code, its longest edge in studs and its corners.
 pub(crate) fn dump_cache(path: &str) -> Result<String, String> {
     let armed_at = state().stats.frames;
@@ -1341,7 +1424,7 @@ pub(crate) fn dump_cache(path: &str) -> Result<String, String> {
     let generation = st.stats.fit.map_or(0, |w| w[32]) & 0xff;
     // SAFETY: our mapping of the whole copy, written six frames ago.
     let words = unsafe { std::slice::from_raw_parts(g.cache_copy_ptr as *const u32, (SLOT_BYTES / 4 * slots() as u64) as usize) };
-    let mut text = String::from("born\tseen\tmisses\tsource\tcode\tedge\tA\tB\tC\n");
+    let mut text = String::from("born\tseen\tmisses\temission\tcode\tedge\tA\tB\tC\n");
     let mut live = 0;
     for slot in words.chunks(32) {
         let tag = slot[0];
@@ -1401,7 +1484,7 @@ fn fit_text(fit: Option<[u32; GLOBALS_READ]>) -> String {
     format!(
         "fit=ok fit_samples={} fov_x={:.2} fov_y={:.2} near={:.4} forward_len={:.4} world_up={:.3},{:.3},{:.3} exposure={:.3} \
          camera={:.1},{:.1},{:.1} cache_listed={} cache_new={} cache_dropped={} cache_full={} cache_generation={} \
-         list_cut={} fit_failures={} full_rate_pixels={}",
+         list_cut={} fit_failures={} full_rate_pixels={} emitters={}",
         w[1],
         2.0 * f(4).atan().to_degrees(),
         2.0 * f(5).atan().to_degrees(),
@@ -1421,7 +1504,8 @@ fn fit_text(fit: Option<[u32; GLOBALS_READ]>) -> String {
         w[32] & 0xff,
         w[40],
         w[41],
-        w[GLOBALS_FULL_RATE as usize / 4]
+        w[GLOBALS_FULL_RATE as usize / 4],
+        w[GLOBALS_EMITTERS as usize / 4]
     )
 }
 
@@ -1429,7 +1513,7 @@ pub(crate) fn stats_line() -> String {
     let st = state();
     let s = &st.stats;
     format!(
-        "on={} reflections={} shade={} engine_light={} environment={} gi={} view={} traced={} skipped={} keys={} {} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} gpu_samples={}{}",
+        "on={} reflections={} shade={} engine_light={} environment={} gi={} view={} blocks={}x{} gi_blocks={}x{} traced={} skipped={} keys={} {} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} gpu_samples={}{}",
         is_on(),
         if super::super::ssr::reflections_on() { "on" } else { "off" },
         SHADES[shade().load(Relaxed)],
@@ -1437,6 +1521,10 @@ pub(crate) fn stats_line() -> String {
         if env_on() { "on" } else { "off" },
         if gi_on() { "on" } else { "off" },
         VIEWS[VIEW.load(Relaxed) as usize],
+        s.scales.0,
+        s.scales.0,
+        s.scales.1,
+        s.scales.1,
         s.frames,
         s.skipped,
         s.keys,

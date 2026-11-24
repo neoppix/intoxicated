@@ -328,8 +328,8 @@ What to know before turning it on:
   takes the screen's colour there; devctl `rt shade lit|own|mix|screen`.
 - Interface drawn in the world, such as leaderboards, name tags and trophy
   icons, does not reflect, nor do particles or see-through parts (of what
-  the game draws blended, only characters are traced, where their alpha is
-  at least 0.95).
+  the game draws blended, only characters and Neon parts are traced, where
+  their alpha is at least 0.95, and 0.05 for Neon).
 - Reflections can flicker while the camera moves.
 - Objects the game has never drawn cannot appear; a static part that moved
   while out of view stays in the reflections at its old place until the view
@@ -341,7 +341,11 @@ What to know before turning it on:
   512 studs of the camera (`INTOXICATED_RT_REACH`). Measured in Timebomb Duels at 1667x1349 on an RTX 4070 Ti: 0.2 to
   0.3 ms for the hierarchy and 0.5 to 0.7 ms for the rays (all of the
   reflections' work 0.9 to 1.3 ms, against 0.6 ms for the screen-space
-  ones); frame times did not change at the engine's 240 fps.
+  ones); frame times did not change at the engine's 240 fps. In Jailbreak
+  (the city, its menu's camera flight) with terrain and Neon parts and the
+  indirect light on, at 1667x1349: 120,000 to 260,000 triangles, 1.1 to 2.0
+  ms for the hierarchy and 1.2 to 2.4 ms for the trace at 4 by 4 blocks; the
+  capture hooks cost the render thread about 0.5 ms a frame (0.6 us a draw).
 - It runs as compute on the shader cores because NVIDIA's FreeBSD driver
   has no hardware ray tracing: on the RTX 4070 Ti, drivers 580.142 and
   620.70.06 list neither `VK_KHR_acceleration_structure` nor
@@ -367,20 +371,39 @@ the game never drew may be there (`INTOXICATED_RT_ENV=0` or devctl `rt env off`
 turns it off). Only parts that stayed in place for a second are kept in the
 cache, so what a moving player wears leaves no trail.
 
+Neon parts give off light: the client recognises the engine's Neon shader
+(its colour `4 * pow(colour * 1.35, 4)`, unlit) and captures those parts even
+where the engine draws them blending, so they show in reflections at their
+own brightness, in view or not, and light their surroundings in the indirect
+light below (taken at a twelfth of their drawn brightness). Terrain (grass,
+rock, sand; not water) is captured too: its shaders pass on no colour, so it
+is grey until the screen has shown it, then in the colour the screen showed
+it in. devctl `rt view category` colours what each reflection ray hit (yellow
+Neon, green terrain, white a part that stays in place, grey one that moves,
+dark blue nothing), and `rt kind neon|terrain on|off` leaves a kind out, for
+bisecting.
+
 Diffuse indirect light, more experimental still and off unless
-`INTOXICATED_RT_GI=1` at start (devctl `rt gi on|off` then): one ray per 2
-by 2 pixels every other frame (in a checkerboard) in a cosine-weighted
-direction. A hit the screen shows takes its light from the screen, with the
-engine's own lamps and glowing (neon) parts in it; what a cached part shows
-beyond the engine's sun and ambient is remembered as light it gives off, so
-it still lights its surroundings out of view; any other hit is lit as the
-engine lights it (one bounce; a miss takes the sky). The rays are gathered
-over up to 32 frames at the same point in the world (sooner forgotten when
-the light there changes), then smoothed by three a-trous filter passes that
-stop at edges in depth and normal and between light and dark (guided by the
-noise measured at each point, as SVGF does), and put in place of the
-engine's own ambient light, so corners darken and coloured walls tint what
-faces them. It takes about 160 MB more video memory when on.
+`INTOXICATED_RT_GI=1` at start (devctl `rt gi on|off` then): one ray per
+block of pixels a frame in a cosine-weighted direction (a low-discrepancy
+sequence shifted per block), plus a ray towards one of the Neon parts. A hit
+the screen shows takes its light from the screen, with the engine's own lamps
+in it; any other hit is lit as the engine lights it (one bounce; a miss takes
+the sky). The rays are gathered over up to 32 frames at the same point in the
+world (sooner forgotten when the light there changes), smoothed by two small
+a-trous filter passes that stop at edges in depth and normal and between
+light and dark (guided by the noise measured at each point, as SVGF does),
+and put in place of the engine's own ambient light, so corners darken and
+coloured walls tint what faces them. It is computed before the reflections,
+so they show it. It takes about 160 MB more video memory when on.
+
+The reflections trace one ray per block of 2 by 2 pixels up to an output 1920
+wide (3 by 3 up to 2880, 4 by 4 above), the indirect light one per block twice
+as wide; both get coarser, by up to two steps, while the trace takes more than
+the 3 ms budget leaves after the hierarchy's build, and finer again well under
+it (`rt stats`: `blocks`, `gi_blocks`). Only at 2 by 2 do near curved pixels
+trace their own rays. `rt stats` also reports the render thread's time in the
+client's capture hooks (`cpu_us_frame`, `cpu_ns_draw`).
 
 devctl `rt on` and `rt off` switch it while the game runs (with
 `INTOXICATED_RT=1` at start), `rt stats` reports the triangles, the textures,

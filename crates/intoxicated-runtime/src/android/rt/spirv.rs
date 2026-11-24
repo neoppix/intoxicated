@@ -52,6 +52,7 @@ const OP_EXT_INST: u16 = 12;
 const OP_ENTRY_POINT: u16 = 15;
 const OP_EXECUTION_MODE: u16 = 16;
 const OP_CAPABILITY: u16 = 17;
+const OP_TYPE_INT: u16 = 21;
 const OP_TYPE_FLOAT: u16 = 22;
 const OP_TYPE_VECTOR: u16 = 23;
 const OP_TYPE_MATRIX: u16 = 24;
@@ -248,8 +249,26 @@ pub(crate) fn instrument_vertex(words: &[u32]) -> Result<Vec<u32>, &'static str>
     // The colour and the camera vector, which lit world geometry has, and
     // an output of ours for the world position.
     let flow = Flow::new(words, &list);
-    let colour = colour_output(words, &list, &flow).ok_or("no colour output")?;
-    let camera = camera_vector_output(words, &list, &flow).ok_or("no camera vector output (not lit world geometry)")?;
+    let colour = colour_output(words, &list, &flow);
+    let camera = camera_vector_output(words, &list, &flow);
+    // Terrain has no colour to pass on (its material's colour comes from
+    // textures in the fragment shader), and some of its shaders no camera
+    // vector either; it is captured without them, its world position taken
+    // where it is made into the vec4 the projection multiplies.
+    let terrain = is_terrain(words, &list, &flow);
+    if camera.is_none() && !terrain {
+        return Err("no camera vector output (not lit world geometry)");
+    }
+    if colour.is_none() && !terrain {
+        return Err("no colour output");
+    }
+    let (world, after, fixed) = match &camera {
+        Some(c) => (c.world, c.difference, c.fixed),
+        None => {
+            let (w, at) = projected_world(words, &list, &flow).ok_or("no world position (terrain)")?;
+            (w, at, true)
+        }
+    };
     let (float, _, vec4) = float_types(words, &list).ok_or("no float type")?;
     let vec4 = vec4.ok_or("no vec4 type")?;
     let location = free_output_location(words, &list, &flow).ok_or("no free output location for the world position")?;
@@ -269,15 +288,25 @@ pub(crate) fn instrument_vertex(words: &[u32]) -> Result<Vec<u32>, &'static str>
     };
     // The world position's w: 1 for a static vertex, plus 2 when the normal
     // is captured too.
-    let normal = normal_output(words, &list, &flow, camera.output, colour);
+    // 4 more without a camera vector (FIT leaves such vertices out).
+    let normal = match (&camera, colour) {
+        (Some(c), Some(colour)) => normal_output(words, &list, &flow, c.output, colour),
+        _ => None,
+    };
     let flag = new_id();
-    let flag_value = f32::from(u8::from(camera.fixed)) + if normal.is_some() { 2.0 } else { 0.0 };
+    let flag_value = f32::from(u8::from(fixed)) + if normal.is_some() { 2.0 } else { 0.0 } + if camera.is_none() { 4.0 } else { 0.0 };
     globals.push(op(OP_CONSTANT, &[float, flag, flag_value.to_bits()]));
     let world_out = new_id();
     globals.push(op(OP_VARIABLE, &[pointer, world_out, STORAGE_OUTPUT]));
     let world4 = new_id();
     decorations.push(op(OP_DECORATE, &[world_out, DECORATION_LOCATION, location]));
-    let mut captured = vec![(colour, COLOUR_OFFSET), (camera.output, CAMERA_OFFSET), (world_out, WORLD_OFFSET)];
+    let mut captured = vec![(world_out, WORLD_OFFSET)];
+    if let Some(c) = &camera {
+        captured.push((c.output, CAMERA_OFFSET));
+    }
+    if let Some(colour) = colour {
+        captured.push((colour, COLOUR_OFFSET));
+    }
     if let Some(uv) = uv_output(words, &list, &flow) {
         captured.push((uv.1, UV_OFFSET));
     }
@@ -312,10 +341,11 @@ pub(crate) fn instrument_vertex(words: &[u32]) -> Result<Vec<u32>, &'static str>
         } else {
             out.extend_from_slice(w(i));
         }
-        if i.op == OP_F_SUB && w(i)[2] == camera.difference {
-            // Right after the camera vector is computed, in the same block:
-            // the world position it was computed from, and whether static.
-            out.extend(op(OP_COMPOSITE_CONSTRUCT, &[vec4, world4, camera.world, flag]));
+        if matches!(i.op, OP_F_SUB | OP_COMPOSITE_CONSTRUCT) && i.len >= 3 && w(i)[2] == after {
+            // Right after the camera vector (or the projected position) is
+            // computed, in the same block: the world position it was
+            // computed from, and whether static.
+            out.extend(op(OP_COMPOSITE_CONSTRUCT, &[vec4, world4, world, flag]));
             out.extend(op(OP_STORE, &[world_out, world4]));
         }
         if n == last_capability && !has_capability {
@@ -572,12 +602,32 @@ pub(crate) struct VertexInfo {
     /// It places its vertices by bones (a character), not by the part's own
     /// matrices.
     pub skinned: bool,
+    /// The engine's terrain: no colour is passed on (`colour` is `u32::MAX`),
+    /// nor a normal.
+    pub terrain: bool,
+}
+
+/// Whether a vertex shader draws the engine's terrain: its position input
+/// (location 0) is a vector of integers (the voxel mesh's quantized
+/// positions), where every other mesh's is of floats.
+fn is_terrain(words: &[u32], list: &[Inst], flow: &Flow) -> bool {
+    let pointee = |id: u32| list.iter().find(|i| i.op == OP_TYPE_VECTOR && i.len >= 4 && words[i.at + 1] == id).map(|i| words[i.at + 2]);
+    let is_int = |id: u32| list.iter().any(|i| i.op == OP_TYPE_INT && i.len >= 3 && words[i.at + 1] == id);
+    let inputs = flow.inputs_at(0);
+    !inputs.is_empty()
+        && flow
+            .vars
+            .iter()
+            .filter(|v| inputs.contains(&v.0))
+            .all(|v| pointee(v.1).is_some_and(is_int))
 }
 
 pub(crate) fn vertex_info(words: &[u32]) -> Option<VertexInfo> {
     let list = instructions(words).ok()?;
     let flow = Flow::new(words, &list);
-    let colour = colour_output(words, &list, &flow)?;
+    let Some(colour) = colour_output(words, &list, &flow) else {
+        return is_terrain(words, &list, &flow).then_some(VertexInfo { colour: u32::MAX, uv: None, normal: false, skinned: false, terrain: true });
+    };
     let camera = camera_vector_output(words, &list, &flow);
     let output = camera.as_ref().map_or(0, |c| c.output);
     Some(VertexInfo {
@@ -585,6 +635,7 @@ pub(crate) fn vertex_info(words: &[u32]) -> Option<VertexInfo> {
         uv: uv_output(words, &list, &flow).map(|(l, _)| l),
         normal: normal_output(words, &list, &flow, output, colour).is_some(),
         skinned: camera.is_some_and(|c| !c.fixed),
+        terrain: false,
     })
 }
 
@@ -714,6 +765,82 @@ pub(crate) fn fragment_albedo(words: &[u32]) -> Option<Albedo> {
     None
 }
 
+/// A fragment shader that gives off light rather than taking it: its colour
+/// `scale * pow(colour * gain, power)` of an input's colour, as the engine
+/// draws its Neon material (`pow(c * 1.35, 4) * 4`, unlit, before its
+/// exposure). The first such power in the module.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Emission {
+    pub gain: f32,
+    pub power: f32,
+    pub scale: f32,
+}
+
+impl Emission {
+    /// Packed for the draw list and the traced triangles (`build.comp`,
+    /// `ssr.comp`): gain / 4, power / 8 and scale / 16 as unorm bytes,
+    /// and 255 in the top byte; 0 for none.
+    pub(crate) fn packed(self) -> u32 {
+        let byte = |v: f32, range: f32| ((v / range).clamp(0.0, 1.0) * 255.0).round() as u32;
+        byte(self.gain, 4.0) | (byte(self.power, 8.0) << 8) | (byte(self.scale, 16.0) << 16) | (255 << 24)
+    }
+}
+
+const OP_CONSTANT_COMPOSITE: u16 = 44;
+const GLSL_POW: u32 = 26;
+
+pub(crate) fn fragment_emission(words: &[u32]) -> Option<Emission> {
+    let list = instructions(words).ok()?;
+    if !list.iter().any(|i| i.op == OP_ENTRY_POINT && i.len >= 3 && words[i.at + 1] == MODEL_FRAGMENT) {
+        return None;
+    }
+    let flow = Flow::new(words, &list);
+    // A float constant, or the first component of a constant vector.
+    let constant = |id: u32| -> Option<f32> {
+        let mut id = id;
+        for _ in 0..2 {
+            let i = list.iter().find(|i| matches!(i.op, OP_CONSTANT | OP_CONSTANT_COMPOSITE) && i.len >= 4 && words[i.at + 2] == id)?;
+            if i.op == OP_CONSTANT {
+                return Some(f32::from_bits(words[i.at + 3]));
+            }
+            id = words[i.at + 3];
+        }
+        None
+    };
+    // `x * constant` in either order: (x, the constant).
+    let scaled = |id: u32| -> Option<(u32, f32)> {
+        match flow.defs.get(&id) {
+            Some((OP_F_MUL | OP_VECTOR_TIMES_SCALAR, x)) if x.len() >= 2 => {
+                constant(x[1]).map(|k| (x[0], k)).or_else(|| constant(x[0]).map(|k| (x[1], k)))
+            }
+            _ => None,
+        }
+    };
+    let inputs: HashSet<u32> = flow.vars.iter().filter(|v| v.2 == STORAGE_INPUT).map(|v| v.0).collect();
+    for (&pow, (op, x)) in &flow.defs {
+        if *op != OP_EXT_INST || x.len() != 4 || x[1] != GLSL_POW {
+            continue;
+        }
+        let Some(power) = constant(x[3]) else { continue };
+        let Some((colour, gain)) = scaled(x[2]) else { continue };
+        // The colour comes from exactly one input, and nothing else varies.
+        let from = flow.memories(colour);
+        if from.len() != 1 || !from.is_subset(&inputs) {
+            continue;
+        }
+        let scale = flow
+            .defs
+            .iter()
+            .filter(|(_, (op, y))| matches!(*op, OP_F_MUL | OP_VECTOR_TIMES_SCALAR) && y.len() >= 2 && (y[0] == pow || y[1] == pow))
+            .find_map(|(_, (_, y))| constant(if y[0] == pow { y[1] } else { y[0] }));
+        let Some(scale) = scale else { continue };
+        if gain > 0.0 && power > 0.0 && scale > 0.0 {
+            return Some(Emission { gain, power, scale });
+        }
+    }
+    None
+}
+
 /// The shader's camera vector output: a `vec3` output that is, or a `vec4`
 /// output whose x, y and z are, `a - b` where `a` depends on no vertex
 /// input (the camera's position from a uniform block) and `b` on the
@@ -776,6 +903,37 @@ fn camera_vector_output(words: &[u32], list: &[Inst], flow: &Flow) -> Option<Cam
         let fixed = flow.memories(world).iter().all(|m| !any_input.contains(m) || position.contains(m) || flow.builtins.contains(m));
         Some(CameraVector { output: v, difference: first, world, fixed })
     })
+}
+
+/// A shader without a camera vector: the world position, a `vec3` from the
+/// position input made into a `vec4` with w 1 (for the projection), and that
+/// `OpCompositeConstruct`.
+fn projected_world(words: &[u32], list: &[Inst], flow: &Flow) -> Option<(u32, u32)> {
+    let (_, vec3, vec4) = float_types(words, list)?;
+    let (vec3, vec4) = (vec3?, vec4?);
+    let position = flow.inputs_at(0);
+    let one = |id: u32| list.iter().any(|i| i.op == OP_CONSTANT && i.len >= 4 && words[i.at + 2] == id && f32::from_bits(words[i.at + 3]) == 1.0);
+    let is_vec3 = |id: u32| list.iter().any(|i| i.len >= 3 && words[i.at + 2] == id && words[i.at + 1] == vec3);
+    // x, y and z picked out of one vec3, in order.
+    let picked = |ids: &[u32]| -> Option<u32> {
+        let mut from = None;
+        for (k, id) in ids.iter().enumerate() {
+            match flow.defs.get(id) {
+                Some((OP_COMPOSITE_EXTRACT, x)) if x.len() == 2 && x[1] == k as u32 && from.is_none_or(|f| f == x[0]) => from = Some(x[0]),
+                _ => return None,
+            }
+        }
+        from
+    };
+    list.iter()
+        .filter(|i| i.op == OP_COMPOSITE_CONSTRUCT && matches!(i.len, 5 | 7) && words[i.at + 1] == vec4)
+        .filter_map(|i| {
+            let x = &words[i.at + 3..i.at + i.len];
+            let (xyz, w) = if x.len() == 2 { (Some(x[0]), x[1]) } else { (picked(&x[..3]), x[3]) };
+            Some((xyz?, w, words[i.at + 2]))
+        })
+        .find(|&(x, w, _)| one(w) && is_vec3(x) && !flow.memories(x).is_disjoint(&position))
+        .map(|(x, _, at)| (x, at))
 }
 
 /// The camera vector output and what it is made of.
@@ -975,8 +1133,61 @@ mod tests {
         assert_eq!(fragment_albedo(VS), None, "a vertex shader has none");
         // The test vertex shader passes its colour at 1 and has no texture
         // coordinates.
-        assert_eq!(vertex_info(VS), Some(VertexInfo { colour: 1, uv: None, normal: true, skinned: false }));
+        assert_eq!(vertex_info(VS), Some(VertexInfo { colour: 1, uv: None, normal: true, skinned: false, terrain: false }));
         assert!(vertex_info(SKINNED).is_some_and(|v| v.skinned && v.normal));
+    }
+
+    #[test]
+    fn terrain_is_captured_without_a_colour() {
+        const TERRAIN: &[u32] = include!("test_terrain.spv.rs");
+        const NOCAMERA: &[u32] = include!("test_terrain_nocamera.spv.rs");
+        for (words, what) in [(TERRAIN, "with a camera vector"), (NOCAMERA, "without one")] {
+            assert_eq!(vertex_info(words), Some(VertexInfo { colour: u32::MAX, uv: None, normal: false, skinned: false, terrain: true }), "{what}");
+            let out = instrument_vertex(words).unwrap_or_else(|e| panic!("{what}: {e}"));
+            validate(&out);
+            // The world position (and the camera vector where there is one)
+            // are captured, no colour.
+            let list = instructions(&out).unwrap();
+            let offsets: Vec<u32> = list
+                .iter()
+                .filter(|i| i.op == OP_DECORATE && out[i.at + 2] == DECORATION_OFFSET)
+                .map(|i| out[i.at + 3])
+                .collect();
+            assert!(offsets.contains(&WORLD_OFFSET) && !offsets.contains(&COLOUR_OFFSET), "{what}: {offsets:?}");
+            assert_eq!(offsets.contains(&CAMERA_OFFSET), words == TERRAIN, "{what}");
+        }
+        // A float position is no terrain: without a colour it stays out.
+        let list = instructions(VS).unwrap();
+        let flow = Flow::new(VS, &list);
+        assert!(!is_terrain(VS, &list, &flow));
+    }
+
+    #[test]
+    fn the_neon_material_gives_off_light() {
+        const NEON: &[u32] = include!("test_neon.spv.rs");
+        const FS: &[u32] = include!("test_fs.spv.rs");
+        let e = fragment_emission(NEON).expect("found");
+        assert!((e.gain - 1.35).abs() < 1e-6 && e.power == 4.0 && e.scale == 4.0, "{e:?}");
+        assert_eq!(e.packed() >> 24, 255);
+        assert_eq!(fragment_emission(FS), None, "a lit shader gives off none");
+        assert_eq!(fragment_emission(VS), None, "a vertex shader has none");
+        if let Ok(dir) = std::env::var("INTOXICATED_TEST_SHADERS") {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                let bytes = std::fs::read(&path).unwrap();
+                let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                if let Some(e) = fragment_emission(&words) {
+                    eprintln!("EMISSIVE {} {e:?}", path.display());
+                }
+                if let Some(v) = vertex_info(&words).filter(|v| v.terrain) {
+                    let out = instrument_vertex(&words);
+                    eprintln!("TERRAIN {} {v:?} {:?}", path.display(), out.as_ref().map(|o| o.len()));
+                    if let Ok(o) = out {
+                        validate(&o);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

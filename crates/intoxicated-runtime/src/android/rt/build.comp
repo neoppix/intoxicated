@@ -124,11 +124,28 @@ layout(std430, set = BUFSET, binding = 6) buffer Globals {
     vec4 prev_up;
     vec4 prev_forward;
     vec4 prev_camera;
+    // Triangles listed this frame that give off light (see `emitters`).
+    uint emitters_n;
+    // The pixels a side of the reflections' and of the indirect light's
+    // blocks (`trace.rs` sets them each frame; ssr.comp).
+    uint rscale;
+    uint gscale;
 };
+// This frame's listed triangles that give off light (Neon parts), by index,
+// for the trace's light sampling (ssr.comp `emitter_light`).
+layout(std430, set = BUFSET, binding = 17) buffer Emitters { uint emitters[]; };
+const uint MAX_EMITTERS = 16384u;
+
+void add_emitter(uint i) {
+    uint k = atomicAdd(emitters_n, 1u);
+    if (k < MAX_EMITTERS) {
+        emitters[k] = i;
+    }
+}
 // Triangles to trace, six vec4 each: three vertices (world xyz, the colour
 // packed in w), the texture coordinates of A and B, then those of C, the
-// texture code (see `capture::MODE_*`) and the source (the low bits of the
-// vertex shader's hash, for dumps), then the three vertex normals packed
+// texture code (see `capture::MODE_*`) and the light it gives off (packed,
+// see `spirv::Emission::packed`; 0 for none), then the three vertex normals packed
 // (snorm 8-bit xyz) and 1 when they are real.
 layout(std430, set = BUFSET, binding = 8) buffer Tris { vec4 tris[]; };
 // The cache: `SLOT_WORDS` words a slot, at the `S_*` offsets.
@@ -229,10 +246,12 @@ void main() {
         uint v = k * step_;
         vec4 c = xfb[VERTEX_VEC4 * v];
         vec3 V = xfb[VERTEX_VEC4 * v + 2u].xyz;
-        vec3 W = xfb[VERTEX_VEC4 * v + 3u].xyz;
+        vec4 W4 = xfb[VERTEX_VEC4 * v + 3u];
+        vec3 W = W4.xyz;
         vec3 p = -V;
         float l = length(p);
-        if (!usable(c) || !(l > 1e-3) || isinf(l) || any(isnan(W)) || any(isinf(W))) {
+        // w 4 and up: no camera vector was written (terrain).
+        if (!usable(c) || !(l > 1e-3) || isinf(l) || any(isnan(W)) || any(isinf(W)) || W4.w >= 3.5) {
             continue;
         }
         // Each vertex scaled to unit distance, so near and far weigh alike.
@@ -376,18 +395,30 @@ void main() {
         col[k] = pack_colour(xfb[v + 1u]);
         uv[k] = xfb[v + 4u].xy;
         vec3 n = xfb[v + 5u].xyz;
-        normals = normals && W[k].w >= 1.5 && dot(n, n) > 1e-8 && !any(isnan(n));
+        normals = normals && mod(W[k].w, 4.0) >= 1.5 && dot(n, n) > 1e-8 && !any(isnan(n));
         nrm[k] = normals ? packSnorm4x8(vec4(normalize(n), 0.0)) : 0u;
         fixed_ = fixed_ && mod(W[k].w, 2.0) > 0.5 && usable(xfb[v]);
         tris[TRI_VEC4 * i + k] = vec4(W[k].xyz, uintBitsToFloat(col[k]));
     }
     uvec4 d = draw_of(i);
+    // Terrain passes on no colour (`capture::MODE_TERRAIN`): grey until the
+    // screen has shown its cached triangle (ssr.comp `learn_colour`).
+    bool terrain = (d.y >> 30) == 3u;
+    if (terrain) {
+        for (uint k = 0u; k < 3u; ++k) {
+            col[k] = pack_colour(vec4(0.5, 0.5, 0.5, 1.0));
+            tris[TRI_VEC4 * i + k].w = uintBitsToFloat(col[k]);
+        }
+    }
     // A blending draw's triangle counts only where its colour says it is
     // opaque: the engine's nearly invisible parts (zone markers, barriers)
     // are drawn so too. One that is not is folded to a point, which the
-    // hierarchy leaves out, and kept out of the cache.
+    // hierarchy leaves out, and kept out of the cache. A Neon part's (it
+    // gives off light, d.z) counts unless it is nearly invisible.
     float alpha = min(xfb[VERTEX_VEC4 * 3u * i + 1u].a, min(xfb[VERTEX_VEC4 * (3u * i + 1u) + 1u].a, xfb[VERTEX_VEC4 * (3u * i + 2u) + 1u].a));
-    if (d.w != 0u && !(alpha >= 0.95)) {
+    bool emits = d.z != 0u;
+    if (d.w != 0u && !(alpha >= (emits ? 0.05 : 0.95))) {
+        emits = false;
         for (uint k = 0u; k < 3u; ++k) {
             tris[TRI_VEC4 * i + k] = vec4(W[0].xyz, uintBitsToFloat(col[k]));
         }
@@ -396,6 +427,9 @@ void main() {
     tris[TRI_VEC4 * i + 3u] = vec4(uv[0], uv[1]);
     tris[TRI_VEC4 * i + 4u] = vec4(uv[2], uintBitsToFloat(d.y), uintBitsToFloat(d.z));
     tris[TRI_VEC4 * i + 5u] = uintBitsToFloat(uvec4(nrm[0], nrm[1], nrm[2], normals ? 1u : 0u));
+    if (emits) {
+        add_emitter(i);
+    }
     if (!fixed_ || fit_ok == 0u) {
         return;
     }
@@ -432,6 +466,11 @@ void main() {
             // Its slot, beside the normals flag, for the light it gives off.
             tris[TRI_VEC4 * i + 5u].w = uintBitsToFloat((normals ? 1u : 0u) | ((base / SLOT_WORDS + 1u) << 1));
             for (uint k = 0u; k < 3u; ++k) {
+                if (terrain) {
+                    // The colour learnt so far.
+                    col[k] = slots[base + S_COL + k];
+                    tris[TRI_VEC4 * i + k].w = uintBitsToFloat(col[k]);
+                }
                 slots[base + S_COL + k] = col[k];
                 slots[base + S_NRM + k] = nrm[k];
                 uvec3 b = floatBitsToUint(W[k].xyz);
@@ -584,6 +623,9 @@ void main() {
     tris[TRI_VEC4 * at + 4u] = vec4(u2, uintBitsToFloat(slots[base + S_CODE]), uintBitsToFloat(slots[base + S_SOURCE]));
     uint nA = slots[base + S_NRM], nB = slots[base + S_NRM + 1u], nC = slots[base + S_NRM + 2u];
     tris[TRI_VEC4 * at + 5u] = uintBitsToFloat(uvec4(nA, nB, nC, ((nA | nB | nC) != 0u ? 1u : 0u) | ((base / SLOT_WORDS + 1u) << 1)));
+    if (slots[base + S_SOURCE] != 0u) {
+        add_emitter(at);
+    }
 }
 
 #endif

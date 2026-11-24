@@ -116,6 +116,9 @@ const BIND_POINT_GRAPHICS: u32 = 0;
 pub(crate) const SERIAL_MASK: u32 = (1 << 30) - 1;
 pub(crate) const MODE_COLOUR: u32 = 1 << 30;
 pub(crate) const MODE_DETAIL: u32 = 2 << 30;
+/// The engine's terrain: no colour captured; the trace learns it from the
+/// screen (see `build.comp` INSERT and `ssr.comp`'s GI pass).
+pub(crate) const MODE_TERRAIN: u32 = 3 << 30;
 /// Base colour textures a frame can use.
 pub(crate) const MAX_TEXTURES: usize = 256;
 
@@ -223,6 +226,8 @@ struct Module {
     outputs: Option<spirv::VertexInfo>,
     /// A fragment shader's base colour texture.
     albedo: Option<spirv::Albedo>,
+    /// A fragment shader that gives off light (the Neon material).
+    emission: Option<spirv::Emission>,
 }
 
 #[derive(Clone, Debug)]
@@ -243,6 +248,11 @@ pub(crate) struct Pipeline {
     /// It blends: its triangles count only where their colour's alpha says
     /// they are opaque (see `build.comp` INSERT).
     pub blends: bool,
+    /// The light its fragment shader gives off, packed (see
+    /// `spirv::Emission::packed`), or 0.
+    pub emission: u32,
+    /// It draws the engine's terrain (see `spirv::VertexInfo::terrain`).
+    pub terrain: bool,
 }
 
 /// One command buffer's recording, as far as capture goes.
@@ -294,7 +304,7 @@ struct Gpu {
     /// This frame's base colour textures: (first triangle, serial and mode,
     /// whether the pipeline blends) each time either changes, and the views
     /// (serial, view, layout).
-    draws: Vec<[u32; 3]>,
+    draws: Vec<[u32; 4]>,
     textures: Vec<(u32, u64, u32)>,
     /// The per-frame uniform block a captured draw last read (buffer,
     /// offset, range): the engine's lighting, read by the trace.
@@ -323,6 +333,12 @@ pub(crate) struct Stats {
     pub draws_clipped: u64,
     /// Captured with their base colour texture known.
     pub draws_textured: u64,
+    /// Captured draws of the Neon material, which give off light.
+    pub draws_emissive: u64,
+    /// Captured draws of the engine's terrain.
+    pub draws_terrain: u64,
+    /// The last frames' time in our hooks (ns) and their draws.
+    pub cpu: std::collections::VecDeque<(u64, u64)>,
     pub modules_instrumented: u64,
     pub modules_left: u64,
     pub pipelines_captured: u64,
@@ -506,7 +522,8 @@ extern "C" fn create_shader_module(device: *mut c_void, info: *const c_void, all
         }
         let outputs = if done { spirv::vertex_info(words) } else { None };
         let albedo = if !vertex && xfb { spirv::fragment_albedo(words) } else { None };
-        st.modules.insert((device as usize, handle), Module { hash, vertex, instrumented: done, outputs, albedo });
+        let emission = if !vertex && xfb { spirv::fragment_emission(words) } else { None };
+        st.modules.insert((device as usize, handle), Module { hash, vertex, instrumented: done, outputs, albedo, emission });
     }
     rc
 }
@@ -535,7 +552,7 @@ unsafe fn is_dynamic(dynamic: *const c_void, which: &[u32]) -> bool {
 /// # Safety
 /// `info` must be a valid `VkGraphicsPipelineCreateInfo`.
 unsafe fn describe_pipeline(info: *const c_void, device: usize, modules: &HashMap<(usize, u64), Module>) -> Pipeline {
-    let mut p = Pipeline { vs: 0, fs: 0, capture: Ok(()), topology: u32::MAX, scissor: None, albedo: None, blends: false };
+    let mut p = Pipeline { vs: 0, fs: 0, capture: Ok(()), topology: u32::MAX, scissor: None, albedo: None, blends: false, emission: 0, terrain: false };
     let mut fragment = None;
     let fail = |p: &mut Pipeline, why: &'static str| {
         if p.capture.is_ok() {
@@ -557,11 +574,13 @@ unsafe fn describe_pipeline(info: *const c_void, device: usize, modules: &HashMa
         match stage {
             STAGE_VERTEX => {
                 p.vs = m.map_or(0, |m| m.hash);
+                p.terrain = m.is_some_and(|m| m.outputs.is_some_and(|o| o.terrain));
                 vertex = Some(m.copied());
             }
             0x10 => {
                 p.fs = m.map_or(0, |m| m.hash);
                 fragment = m.and_then(|m| m.albedo);
+                p.emission = m.and_then(|m| m.emission).map_or(0, spirv::Emission::packed);
             }
             s if s & (STAGE_TESSELLATION | STAGE_GEOMETRY) != 0 => fail(&mut p, "a tessellation or geometry stage"),
             _ => {}
@@ -629,9 +648,12 @@ unsafe fn describe_pipeline(info: *const c_void, device: usize, modules: &HashMa
     // barriers and zone markers are drawn so, some with their transparency
     // where the capture cannot see it; and so is the interface drawn in the
     // world.
+    // Neon parts are captured too, blending or not (the engine draws them
+    // so in some places): they give off light, and are traced as opaque
+    // wherever their colour is not nearly invisible (see `build.comp`).
     let character = matches!(vertex, Some(Some(m)) if m.outputs.is_some_and(|o| o.normal && o.skinned));
     p.blends = blends;
-    if blends && !character {
+    if blends && !character && p.emission == 0 {
         fail(&mut p, "it blends and is not a character (see-through parts, interface drawn in the world)");
     }
     if is_dynamic(dynamic, &[DYNAMIC_COLOR_WRITE_ENABLE, DYNAMIC_COLOR_WRITE_MASK]) {
@@ -685,6 +707,8 @@ extern "C" fn create_graphics_pipelines(
                 p.fs,
                 p.topology,
                 match p.capture {
+                    Ok(()) if p.emission != 0 => "captured, gives off light (Neon)",
+                    Ok(()) if p.terrain => "captured, terrain (colour learnt from the screen)",
                     Ok(()) => "captured",
                     Err(why) => why,
                 }
@@ -802,6 +826,7 @@ unsafe fn frame_block_writes(count: u32, writes: *const u8) -> Vec<(u64, u64, u6
 }
 
 extern "C" fn update_sets(device: *mut c_void, count: u32, writes: *const u8, copies: u32, copy_list: *const c_void) {
+    let timed = Timed::start();
     // SAFETY: the engine's own array, read during its call.
     let found = unsafe { image_writes(count, writes) };
     // SAFETY: as above.
@@ -815,6 +840,7 @@ extern "C" fn update_sets(device: *mut c_void, count: u32, writes: *const u8, co
             st.set_frames.insert(set, (buffer, offset, range, dynamic));
         }
     }
+    drop(timed);
     if let Some(f) = next::<extern "C" fn(*mut c_void, u32, *const u8, u32, *const c_void)>(&UPDATE_SETS) {
         f(device, count, writes, copies, copy_list);
     }
@@ -854,6 +880,7 @@ extern "C" fn create_template(device: *mut c_void, info: *const c_void, alloc: *
 
 extern "C" fn update_with_template(device: *mut c_void, set: u64, template: u64, data: *const u8) {
     {
+        let _timed = Timed::start();
         let mut st = state();
         if let Some((entries, _)) = st.templates.get(&template) {
             // SAFETY: the engine's data for this template, read during its call.
@@ -886,6 +913,7 @@ extern "C" fn cmd_bind_sets(
     dynamic: *const u32,
 ) {
     if bind_point == BIND_POINT_GRAPHICS && !sets.is_null() {
+        let _timed = Timed::start();
         let mut st = state();
         if let Some(c) = st.cmds.get_mut(&(cmd as usize)) {
             for i in 0..count {
@@ -909,6 +937,7 @@ extern "C" fn cmd_bind_sets(
 
 extern "C" fn cmd_push(cmd: *mut c_void, bind_point: u32, layout: u64, set: u32, count: u32, writes: *const u8) {
     if bind_point == BIND_POINT_GRAPHICS {
+        let _timed = Timed::start();
         // SAFETY: the engine's own array, read during its call.
         let found = unsafe { image_writes(count, writes) };
         // SAFETY: as above.
@@ -932,6 +961,7 @@ extern "C" fn cmd_push(cmd: *mut c_void, bind_point: u32, layout: u64, set: u32,
 
 extern "C" fn cmd_push_template(cmd: *mut c_void, template: u64, layout: u64, set: u32, data: *const u8) {
     {
+        let _timed = Timed::start();
         let mut st = state();
         if let Some((entries, _)) = st.templates.get(&template) {
             // SAFETY: the engine's data for this template, read during its call.
@@ -955,6 +985,7 @@ extern "C" fn cmd_push_template(cmd: *mut c_void, template: u64, layout: u64, se
 
 extern "C" fn destroy_view(device: *mut c_void, view: u64, alloc: *const c_void) {
     {
+        let _timed = Timed::start();
         let mut st = state();
         st.view_serials.remove(&view);
         for views in st.set_views.values_mut() {
@@ -978,6 +1009,42 @@ fn draw_texture(st: &State, c: &Cmd, p: &Pipeline) -> Option<(u64, u32, bool)> {
         None => *st.set_views.get(c.sets.get(set as usize)?)?.get(&binding)?,
     };
     (view != 0).then_some((view, layout, scalar))
+}
+
+/// The render thread's time in our hooks' own work (not the driver's),
+/// summed until the frame ends, and how many draws that covered; then the
+/// last `CPU_WINDOW` frames' totals for `rt stats`.
+static HOOK_NS: AtomicU64 = AtomicU64::new(0);
+static HOOK_DRAWS: AtomicU64 = AtomicU64::new(0);
+const CPU_WINDOW: usize = 120;
+
+pub(crate) struct Timed(std::time::Instant);
+
+impl Timed {
+    pub(crate) fn start() -> Timed {
+        Timed(std::time::Instant::now())
+    }
+}
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        HOOK_NS.fetch_add(self.0.elapsed().as_nanos() as u64, Relaxed);
+    }
+}
+
+/// The kinds of draw that can be left out of the capture for bisecting
+/// (devctl `rt kind neon|terrain on|off`), all on at start.
+pub(crate) const KINDS: [&str; 2] = ["neon", "terrain"];
+static KINDS_ON: [AtomicBool; 2] = [AtomicBool::new(true), AtomicBool::new(true)];
+
+pub(crate) fn set_kind(name: &str, on: bool) -> Result<(), String> {
+    let i = KINDS.iter().position(|k| *k == name).ok_or_else(|| format!("rt kind {} on|off", KINDS.join("|")))?;
+    KINDS_ON[i].store(on, Relaxed);
+    Ok(())
+}
+
+fn kind_on(p: &Pipeline) -> bool {
+    !(p.emission != 0 && !KINDS_ON[0].load(Relaxed)) && !(p.terrain && !KINDS_ON[1].load(Relaxed))
 }
 
 /// `vkCmdSetScissor`: the first rectangle, for the capture's test of a
@@ -1006,6 +1073,7 @@ extern "C" fn destroy_pipeline(device: *mut c_void, pipeline: u64, alloc: *const
 
 /// `vkBeginCommandBuffer`.
 pub(crate) fn cmd_begun(cmd: *mut c_void) {
+    let _timed = Timed::start();
     state().cmds.insert(cmd as usize, Cmd::default());
 }
 
@@ -1014,6 +1082,7 @@ pub(crate) fn cmd_begun(cmd: *mut c_void) {
 /// Before every scene pass, outside it: the barrier that keeps this frame's
 /// capture from overwriting what the last one's readers still use.
 pub(crate) fn pass_beginning(pass: &Pass) {
+    let _timed = Timed::start();
     let (depth, full, to_swapchain, colours, colour) = {
         let reg = super::super::vk_layer::passes::registry();
         let d = super::super::ssr::describe(pass, &reg);
@@ -1136,6 +1205,7 @@ fn end_if_active(st: &mut State, cmd: *mut c_void) {
 /// Before the engine's `vkCmdBindPipeline` is forwarded: no pipeline may be
 /// bound while transform feedback is active.
 pub(crate) fn binding(cmd: *mut c_void, bind_point: u32) {
+    let _timed = Timed::start();
     if bind_point != BIND_POINT_GRAPHICS {
         return;
     }
@@ -1144,6 +1214,7 @@ pub(crate) fn binding(cmd: *mut c_void, bind_point: u32) {
 
 /// After it was forwarded.
 pub(crate) fn bound(cmd: *mut c_void, bind_point: u32, pipeline: u64) {
+    let _timed = Timed::start();
     if bind_point != BIND_POINT_GRAPHICS {
         return;
     }
@@ -1164,6 +1235,7 @@ pub(crate) fn bound(cmd: *mut c_void, bind_point: u32, pipeline: u64) {
 /// Before `vkCmdNextSubpass` or `vkCmdExecuteCommands`: capture stops for
 /// the rest of the pass, which neither allows while it is active.
 pub(crate) fn interrupted(cmd: *mut c_void) {
+    let _timed = Timed::start();
     let mut st = state();
     end_if_active(&mut st, cmd);
     if let Some(c) = st.cmds.get_mut(&(cmd as usize)) {
@@ -1173,6 +1245,7 @@ pub(crate) fn interrupted(cmd: *mut c_void) {
 
 /// Before a pass's end is forwarded.
 pub(crate) fn pass_ending(cmd: *mut c_void) {
+    let _timed = Timed::start();
     end_if_active(&mut state(), cmd);
 }
 
@@ -1180,6 +1253,7 @@ pub(crate) fn pass_ending(cmd: *mut c_void) {
 /// visible to the compute that reads it, and for a dump copied where the
 /// host reads it.
 pub(crate) fn pass_ended(cmd: *mut c_void) {
+    let _timed = Timed::start();
     let mut st = state();
     let Some(c) = st.cmds.get_mut(&(cmd as usize)) else { return };
     let capturing = c.capturing;
@@ -1231,6 +1305,8 @@ pub(crate) fn pass_ended(cmd: *mut c_void) {
 /// count grows by what the draw writes. An indirect draw, whose size only
 /// the GPU knows, is not captured. Also the counts and `rt draws`.
 pub(crate) fn drew(cmd: *mut c_void, kind: &'static str, count: u32, instances: u32) {
+    let _timed = Timed::start();
+    HOOK_DRAWS.fetch_add(1, Relaxed);
     let mut st = state();
     let Some(c) = st.cmds.get(&(cmd as usize)) else { return };
     if !c.scene && !c.listing {
@@ -1247,7 +1323,7 @@ pub(crate) fn drew(cmd: *mut c_void, kind: &'static str, count: u32, instances: 
     if capturing {
         let take = p
             .as_ref()
-            .filter(|p| p.capture.is_ok() && kind != "indirect" && !clipped)
+            .filter(|p| p.capture.is_ok() && kind != "indirect" && !clipped && kind_on(p))
             .map(|p| xfb_vertices(p.topology, count, instances));
         if clipped && p.as_ref().is_some_and(|p| p.capture.is_ok()) {
             st.stats.draws_clipped += 1;
@@ -1271,7 +1347,9 @@ pub(crate) fn drew(cmd: *mut c_void, kind: &'static str, count: u32, instances: 
                 // The draw's base colour texture, numbered, from its first
                 // triangle on.
                 let texture = st.cmds.get(&(cmd as usize)).zip(p.as_ref()).and_then(|(c, p)| draw_texture(&st, c, p));
+                let terrain = p.as_ref().is_some_and(|p| p.terrain);
                 let code = match texture {
+                    _ if terrain => MODE_TERRAIN,
                     Some((view, layout, scalar)) => {
                         let serial = match st.view_serials.get(&view) {
                             Some(&n) => n,
@@ -1302,13 +1380,20 @@ pub(crate) fn drew(cmd: *mut c_void, kind: &'static str, count: u32, instances: 
                     g.frame_block = frame_block;
                 }
                 let blended = u32::from(p.as_ref().is_some_and(|p| p.blends));
-                if g.draws.last().map_or((0, 0), |d| (d[1], d[2])) != (code, blended) {
-                    g.draws.push([(g.bytes / TRIANGLE_BYTES) as u32, code, blended]);
+                let emission = p.as_ref().map_or(0, |p| p.emission);
+                if g.draws.last().map_or((0, 0, 0), |d| (d[1], d[2], d[3])) != (code, blended, emission) {
+                    g.draws.push([(g.bytes / TRIANGLE_BYTES) as u32, code, blended, emission]);
                 }
                 g.bytes += bytes;
                 st.stats.draws_captured += 1;
-                if code != 0 {
+                if code != 0 && !terrain {
                     st.stats.draws_textured += 1;
+                }
+                if emission != 0 {
+                    st.stats.draws_emissive += 1;
+                }
+                if terrain {
+                    st.stats.draws_terrain += 1;
                 }
             }
             (Some(_), Some(_)) => {
@@ -1350,6 +1435,11 @@ pub(crate) fn drew(cmd: *mut c_void, kind: &'static str, count: u32, instances: 
 pub(crate) fn frame_end(presents: u64) {
     PRESENTS.store(presents, Relaxed);
     let mut st = state();
+    let (ns, draws) = (HOOK_NS.swap(0, Relaxed), HOOK_DRAWS.swap(0, Relaxed));
+    if st.stats.cpu.len() == CPU_WINDOW {
+        st.stats.cpu.pop_front();
+    }
+    st.stats.cpu.push_back((ns, draws));
     if !st.frame_log.is_empty() {
         st.last_log = st.frame_log.join(",");
     }
@@ -1411,7 +1501,7 @@ pub(crate) fn frame_captured(device: usize) -> Option<Captured> {
 
 /// This frame's base colour textures on `device`: the draws' codes by first
 /// triangle and the views.
-pub(crate) fn frame_textures(device: usize) -> (Vec<[u32; 3]>, Vec<(u32, u64, u32)>) {
+pub(crate) fn frame_textures(device: usize) -> (Vec<[u32; 4]>, Vec<(u32, u64, u32)>) {
     let st = state();
     st.gpus.iter().find(|g| g.device == device).map_or((Vec::new(), Vec::new()), |g| (g.draws.clone(), g.textures.clone()))
 }
@@ -1445,9 +1535,17 @@ pub(crate) fn stats_line() -> String {
     let s = &st.stats;
     let bytes = LAST_BYTES.load(Relaxed);
     let failed = st.failed.last().map_or(String::new(), |(_, why)| format!(" capture_failed={why:?}"));
+    let n = s.cpu.len().max(1) as f64;
+    let (ns, draws) = s.cpu.iter().fold((0u64, 0u64), |a, b| (a.0 + b.0, a.1 + b.1));
+    let cpu_frame = ns as f64 / n / 1000.0;
+    let mut sorted: Vec<u64> = s.cpu.iter().map(|c| c.0).collect();
+    sorted.sort_unstable();
+    let cpu_p95 = sorted.get((sorted.len() * 95 / 100).min(sorted.len().saturating_sub(1))).copied().unwrap_or(0) as f64 / 1000.0;
+    let cpu_draw = if draws > 0 { ns as f64 / draws as f64 } else { 0.0 };
+    let draws_frame = draws as f64 / n;
     format!(
         "triangles={} capacity={} frames={} begins={} binds_captured={} binds_skipped={} draws_captured={} draws_skipped={} \
-         draws_overflowed={} draws_clipped={} draws_textured={} textures={} vs_instrumented={} vs_left={} pipelines_captured={} pipelines_skipped={} frame={}{}",
+         cpu_us_frame={:.0} cpu_us_p95={:.0} cpu_ns_draw={:.0} draws_frame={:.0} draws_overflowed={} draws_clipped={} draws_textured={} draws_emissive={} draws_terrain={} textures={} vs_instrumented={} vs_left={} pipelines_captured={} pipelines_skipped={} frame={}{}",
         bytes / TRIANGLE_BYTES,
         st.gpus.first().map_or(capacity_triangles(), |g| g.capacity / TRIANGLE_BYTES),
         s.frames,
@@ -1456,9 +1554,15 @@ pub(crate) fn stats_line() -> String {
         s.binds_skipped,
         s.draws_captured,
         s.draws_skipped,
+        cpu_frame,
+        cpu_p95,
+        cpu_draw,
+        draws_frame,
         s.draws_overflowed,
         s.draws_clipped,
         s.draws_textured,
+        s.draws_emissive,
+        s.draws_terrain,
         st.gpus.first().map_or(0, |g| g.textures.len()),
         s.modules_instrumented,
         s.modules_left,

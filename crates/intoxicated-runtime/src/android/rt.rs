@@ -536,6 +536,10 @@ pub fn control(args: &[&str]) -> Result<String, String> {
             trace::set_view(name)?;
             Ok(trace::stats_line())
         }
+        ["kind", name, w @ ("on" | "off")] => {
+            capture::set_kind(name, *w == "on")?;
+            Ok(trace::stats_line())
+        }
         ["shade", name] => {
             trace::set_shade(name)?;
             Ok(trace::stats_line())
@@ -561,7 +565,7 @@ pub fn control(args: &[&str]) -> Result<String, String> {
                 trace::stats_line()
             ))
         }
-        _ => Err("rt [stats] | on | off | shade lit|own|mix|screen | env on|off | gi on|off | view off|normal|source | draws | dump <path> | dump-cache <path>".into()),
+        _ => Err("rt [stats] | on | off | shade lit|own|mix|screen | env on|off | gi on|off | view off|normal|source|category | kind neon|terrain on|off | draws | dump <path> | dump-cache <path>".into()),
     }
 }
 
