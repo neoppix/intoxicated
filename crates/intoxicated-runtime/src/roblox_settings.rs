@@ -130,11 +130,19 @@ fn read_cache(path: &Path) -> Option<(String, SystemTime)> {
 
 /// Write `body` beside `path` and rename it in, so a reader never sees half a
 /// document. Failures are ignored: the cache only saves a request.
+///
+/// The cache is shared by every profile, so two clients can write it at
+/// once. Each write gets a temporary name of its own (process id and a
+/// counter); with one shared name a second writer could truncate the first
+/// one's file just before it was renamed into place.
 fn write_cache(path: &Path, body: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WRITES: AtomicU64 = AtomicU64::new(0);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let tmp = path.with_extension("json.new");
+    let n = WRITES.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.{}.{n}.new", std::process::id()));
     if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, path).is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -399,6 +407,34 @@ mod tests {
 
     fn cache_in(dir: &Path) -> Cache {
         Cache { file: dir.join(CACHE_PATH) }
+    }
+
+    #[test]
+    fn writers_racing_on_the_shared_cache_leave_one_whole_document() {
+        // Clients on two profiles refreshing the cache at the same moment.
+        let dir = scratch("race");
+        let file = cache_in(&dir).file;
+        let bodies: Vec<String> = (0..8)
+            .map(|i| format!(r#"{{"applicationSettings":{{"FIntWriter":"{i}","Pad":"{}"}}}}"#, "x".repeat(200_000)))
+            .collect();
+        std::thread::scope(|s| {
+            for body in &bodies {
+                let file = &file;
+                s.spawn(move || {
+                    for _ in 0..10 {
+                        write_cache(file, body);
+                    }
+                });
+            }
+        });
+        let got = std::fs::read_to_string(&file).unwrap();
+        assert!(bodies.contains(&got), "the cache is one writer's whole document ({} bytes)", got.len());
+        let left: Vec<_> = std::fs::read_dir(file.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["clientsettings.json"], "no temporary file is left behind");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

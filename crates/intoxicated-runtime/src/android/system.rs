@@ -151,20 +151,37 @@ fn stand_in<'a>(index: &'a FontIndex, candidates: &[&str]) -> Option<&'a PathBuf
 /// Make `link` a symlink to `target`. An existing link to `target` is kept,
 /// a link to anything else replaced, and anything that is not a link left
 /// alone. True when `link` ends up usable.
+///
+/// The tree is shared by every profile, and a client already running reads
+/// it while the next one builds it. So a link is never removed and made
+/// again: the new one is made under a temporary name and renamed over the
+/// old one, and a link another client made first is taken as it is.
 fn link_font(link: &Path, target: &Path) -> bool {
+    let points_at_target = || std::fs::read_link(link).is_ok_and(|t| t == target);
     match std::fs::symlink_metadata(link) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            if std::fs::read_link(link).is_ok_and(|t| t == target) {
-                return true;
-            }
-            if std::fs::remove_file(link).is_err() {
-                return false;
-            }
-            std::os::unix::fs::symlink(target, link).is_ok()
-        }
+        Ok(meta) if meta.file_type().is_symlink() => points_at_target() || replace_link(link, target),
         Ok(_) => true,
-        Err(_) => std::os::unix::fs::symlink(target, link).is_ok(),
+        Err(_) => std::os::unix::fs::symlink(target, link).is_ok() || points_at_target(),
     }
+}
+
+/// Point the existing link `link` at `target` with one rename(2).
+fn replace_link(link: &Path, target: &Path) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static MADE: AtomicU64 = AtomicU64::new(0);
+    let (Some(dir), Some(name)) = (link.parent(), link.file_name()) else {
+        return false;
+    };
+    let n = MADE.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{}.{}.{n}.tmp", name.to_string_lossy(), std::process::id()));
+    if std::os::unix::fs::symlink(target, &tmp).is_err() {
+        return false;
+    }
+    if std::fs::rename(&tmp, link).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    true
 }
 
 /// Remove the links in `fonts` whose target is gone (a font uninstalled
@@ -393,6 +410,42 @@ mod tests {
         assert!(after.contains(&("fonts/Roboto-Regular.ttf".into(), dejavu.clone())), "{after:?}");
         assert!(after.contains(&("fonts/DroidSans.ttf".into(), dejavu)), "{after:?}");
         assert!(after.iter().all(|(_, t)| t == "-" || Path::new(t).exists()), "{after:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_running_client_never_sees_a_font_link_missing_while_another_builds() {
+        // Two profiles' clients share the tree: one reads it while the next
+        // one starts and rebuilds it, here with the link changing target.
+        let base = scratch("shared");
+        touch(&base.join("a/DejaVuSans.ttf"));
+        touch(&base.join("b/DejaVuSans.ttf"));
+        let root = base.join("root");
+        let one = FontIndex::build(&[base.join("a")]);
+        let two = FontIndex::build(&[base.join("b")]);
+        build(&root, &one);
+        let link = root.join("fonts/DejaVuSans.ttf");
+        let done = std::sync::atomic::AtomicBool::new(false);
+        let missing = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                    if std::fs::symlink_metadata(&link).is_err() {
+                        missing.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            });
+            s.spawn(|| {
+                for i in 0..400 {
+                    build(&root, if i % 2 == 0 { &two } else { &one });
+                }
+                done.store(true, std::sync::atomic::Ordering::Relaxed);
+            });
+        });
+        assert_eq!(missing.into_inner(), 0, "the link was missing while it was replaced");
+        assert_eq!(std::fs::read_link(&link).unwrap(), base.join("a/DejaVuSans.ttf"));
+        let strays: Vec<_> = listing(&root).into_iter().filter(|(p, _)| p.contains(".tmp")).collect();
+        assert!(strays.is_empty(), "{strays:?}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

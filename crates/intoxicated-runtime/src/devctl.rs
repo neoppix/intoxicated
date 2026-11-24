@@ -125,10 +125,19 @@ fn bind(path: &Path) -> std::io::Result<UnixListener> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    // A socket a killed client left behind. Removing it is safe because this
-    // process already holds the profile's lock. Anything that is not a
-    // socket is left where it is, and the bind below reports it.
+    // A socket a killed client left behind: nothing answers on it. One that
+    // does answer belongs to a live client, which an
+    // INTOXICATED_DEV_CONTROL_SOCKET shared by two profiles (from
+    // settings.conf, say) would otherwise take away from it; that one is
+    // left alone and the bind refused. Anything that is not a socket is left
+    // where it is too, and the bind below reports it.
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket()) {
+        if UnixStream::connect(path).is_ok() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "another client is listening there; give each profile its own socket",
+            ));
+        }
         let _ = std::fs::remove_file(path);
     }
     let listener = UnixListener::bind(path)?;
@@ -739,6 +748,24 @@ mod tests {
         std::fs::write(&file, b"keep").unwrap();
         assert!(bind(&file).is_err());
         assert_eq!(std::fs::read(&file).unwrap(), b"keep");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_socket_a_live_client_listens_on_is_not_taken_over() {
+        // Two profiles pointed at one INTOXICATED_DEV_CONTROL_SOCKET: the
+        // second client must not unlink the first one's socket.
+        let dir = scratch("live");
+        let path = dir.join("shared.sock");
+        let first = bind(&path).unwrap();
+        let err = bind(&path).expect_err("a live socket must not be rebound");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
+        // The first client's socket still answers.
+        let _c = UnixStream::connect(&path).expect("the first socket is still there");
+        let (_s, _) = first.accept().unwrap();
+        drop(first);
+        // Once nothing listens it is stale, and replaced.
+        drop(bind(&path).expect("a stale socket is replaced"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
