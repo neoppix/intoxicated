@@ -47,6 +47,9 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform sampler2D color_tex;
 layout(set = 0, binding = 2, r32f) uniform readonly image2D depth_copy;
 layout(set = 0, binding = 3, r32ui) uniform uimage2D result_img;
+// The reflections' trace image, which holds the ray-traced glow above white
+// when flags has GLOW (`ssr.comp` GIAPPLY).
+layout(set = 0, binding = 5) uniform sampler2D glow_tex;
 // Set 1 is one per dispatch: what it reads, what it writes, a second input
 // and the focus.
 layout(set = 1, binding = 0) uniform sampler2D in_tex;
@@ -95,6 +98,7 @@ const uint NEAR_BLUR = 2u;
 const uint AUTOFOCUS = 4u;
 const uint FOCUS_RESET = 8u;
 const uint FOCUS_PAST = 16u;
+const uint GLOW = 32u;
 
 // The sky, in near-plane units: far enough to count as infinity.
 const float SKY_Z = 1e7;
@@ -367,6 +371,12 @@ void main() {
     for (int j = 0; j < 2; ++j) {
         for (int i = 0; i < 2; ++i) {
             vec3 c = src_at(2 * q + ivec2(i, j)).rgb;
+            if ((pc.flags & GLOW) != 0u) {
+                // What the ray-traced reflections and light have above
+                // white (reflected Neon, its light on a wall).
+                vec3 g = texelFetch(glow_tex, clamp(2 * q + ivec2(i, j), ivec2(0), ivec2(pc.size) - 1), 0).rgb;
+                c += any(isnan(g)) || any(isinf(g)) ? vec3(0.0) : g;
+            }
             float w = 1.0 / (1.0 + luma(c));
             sum += w * c;
             weight += w;

@@ -532,6 +532,10 @@ pub fn control(args: &[&str]) -> Result<String, String> {
             trace::set_gi(*w == "on")?;
             Ok(trace::stats_line())
         }
+        ["gi-gain", v] => {
+            trace::set_gi_gain(v.parse::<f32>().map_err(|_| format!("not a number: {v}"))?)?;
+            Ok(trace::stats_line())
+        }
         ["view", name] => {
             trace::set_view(name)?;
             Ok(trace::stats_line())
@@ -569,7 +573,7 @@ pub fn control(args: &[&str]) -> Result<String, String> {
                 trace::stats_line()
             ))
         }
-        _ => Err("rt [stats] | on | off | shade lit|own|mix|screen | env on|off | gi on|off | view off|normal|source|category | kind neon|terrain on|off | soft on|off | draws | dump <path> | dump-cache <path>".into()),
+        _ => Err("rt [stats] | on | off | shade lit|own|mix|screen | env on|off | gi on|off | gi-gain <0..4> | view off|normal|source|category | kind neon|terrain on|off | soft on|off | draws | dump <path> | dump-cache <path>".into()),
     }
 }
 

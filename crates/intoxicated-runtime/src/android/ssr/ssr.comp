@@ -56,11 +56,14 @@ layout(binding = 0) uniform sampler2D color_tex;
 layout(binding = 2, r32f) uniform readonly image2D depth_copy;
 #ifdef GIAPPLY
 layout(binding = 3, r32ui) uniform uimage2D result_img;
+// The reflections as the compose read them, then what the glow pass leaves
+// for the bloom (see GIAPPLY).
+layout(binding = 4, rgba16f) uniform image2D glow_img;
 #endif
 #ifdef COMPOSE
 layout(binding = 3, r32ui) uniform writeonly uimage2D out_img;
 layout(binding = 5) uniform sampler2D trace_tex;
-#elif !defined(RTEMPORAL) && !defined(RBLUR)
+#elif !defined(RTEMPORAL) && !defined(RBLUR) && !defined(GIAPPLY)
 layout(binding = 4, rgba16f) uniform writeonly image2D trace_img;
 #endif
 
@@ -549,6 +552,10 @@ layout(std430, set = 1, binding = 6) buffer Globals {
     // light's (`trace.rs`: by the output's width and the time budget).
     uint rscale;
     uint gscale;
+    // The indirect light's blocks the frame before (its history's grid).
+    uint prev_gscale;
+    // How strongly the indirect light's bounces show (`trace.rs` GI_GAIN).
+    float gi_gain;
 };
 // This frame's listed triangles that give off light (`rt/build.comp`).
 layout(std430, set = 1, binding = 17) readonly buffer Emitters { uint emitters[]; };
@@ -973,6 +980,20 @@ const float NEON_NEAR = 12.0;
 // GI_MOST_ADD (a stray sample cannot wash a wall out; a Neon glow stays).
 const float GI_MOST = 8.0;
 const float GI_MOST_ADD = 4.0;
+// Neon's exact light in the GI, as a share of its full engine brightness:
+// at full brightness a street of Neon facades (Jailbreak's city at night)
+// lit every wall white.
+const float NEON_GI = 0.5;
+
+// The indirect light `gi` held with a soft knee: what it brings above the
+// ambient `amb` rolls off towards GI_MOST times the ambient plus
+// GI_MOST_ADD instead of cutting at it, so a strong glow stays a glow and
+// stops short of white.
+vec3 gi_held(vec3 gi, vec3 amb) {
+    vec3 top = GI_MOST * amb + vec3(GI_MOST_ADD) - amb;
+    vec3 extra = max(gi - amb, vec3(0.0));
+    return min(gi, amb) + extra / (vec3(1.0) + extra / max(top, vec3(1e-3)));
+}
 
 vec3 emitter_light(vec3 X, vec3 n, uint seed) {
     uint count = min(emitters_n, MAX_EMITTERS);
@@ -1042,16 +1063,24 @@ vec3 emitter_light(vec3 X, vec3 n, uint seed) {
 }
 
 // Per screen tile of LIGHT_TILE pixels a side, the Neon triangles that light
-// it most (`-DRT -DLIGHTS`): LIGHTS_PER_TILE entries, each the triangle's
-// index with bit 31 set where a ray from the tile's middle reaches it, or
-// ~0 for none.
-layout(std430, set = 1, binding = 20) buffer Tiles { uint tiles[]; };
+// it most (`-DRT -DLIGHTS`): LIGHTS_PER_TILE entries of two words, the
+// triangle's index with bit 31 set where a ray from the tile's middle
+// reaches it (or ~0 for none) and a hash of where its middle is (to know it
+// again the next frame); this frame's half and the last one's in turn (by
+// the frame's parity).
+layout(std430, set = 1, binding = 20) buffer Tiles { uvec2 tiles[]; };
 const int LIGHT_TILE = 16;
 const int LIGHTS_PER_TILE = 8;
 const uint NO_LIGHT = 0xffffffffu;
 
 uvec2 light_tiles() {
     return (pc.size + uint(LIGHT_TILE) - 1u) / uint(LIGHT_TILE);
+}
+
+// Where this frame's (or, `last`, the last frame's) half of `tiles` starts.
+uint tiles_half(bool last) {
+    uvec2 lt = light_tiles();
+    return (((frame & 1u) != 0u) != last ? 1u : 0u) * lt.x * lt.y * uint(LIGHTS_PER_TILE);
 }
 
 // The Neon triangle's colour at its middle.
@@ -1101,10 +1130,10 @@ vec3 polygon_light(uint tri, vec3 X, vec3 n) {
 vec3 tile_light(uvec2 at, vec3 X, vec3 n) {
     uvec2 lt = light_tiles();
     uvec2 t = min(at / uint(LIGHT_TILE), lt - 1u);
-    uint base = (t.y * lt.x + t.x) * uint(LIGHTS_PER_TILE);
+    uint base = tiles_half(false) + (t.y * lt.x + t.x) * uint(LIGHTS_PER_TILE);
     vec3 sum = vec3(0.0);
     for (int k = 0; k < LIGHTS_PER_TILE; ++k) {
-        uint e = tiles[base + uint(k)];
+        uint e = tiles[base + uint(k)].x;
         if (e == NO_LIGHT) {
             break;
         }
@@ -1306,7 +1335,7 @@ vec4 reflection_rt(ivec2 p, vec3 P, vec3 N, float wet) {
         // screen does.
         vec3 amb = engine_ambient(n);
         if (gi.x >= 0.0) {
-            lin = max(lin + albedo * (min(gi, GI_MOST * amb + vec3(GI_MOST_ADD)) - amb), 0.5 * lin);
+            lin = max(lin + albedo * (gi_held(gi, amb) - amb), 0.5 * lin);
         } else if ((pc.flags & 16384u) != 0u) {
             lin += albedo * min(emitter_light(Hw + n * 0.02, n, hash(uint(p.x) * 7919u + uint(p.y) * 104729u + frame * 31u)), GI_MOST * amb + vec3(GI_MOST_ADD));
         }
@@ -1326,7 +1355,7 @@ vec4 reflection_rt(ivec2 p, vec3 P, vec3 N, float wet) {
         vec3 ambient = engine_ambient(n);
         vec3 to_sun = -frame_block[16].xyz;
         vec3 light = ambient + frame_block[15].xyz * max(dot(n, to_sun), 0.0) + frame_block[17].xyz * max(-dot(n, to_sun), 0.0);
-        lin = max(lin + lin / max(light, vec3(0.02)) * (min(gi, GI_MOST * ambient + vec3(GI_MOST_ADD)) - ambient), 0.5 * lin);
+        lin = max(lin + lin / max(light, vec3(0.02)) * (gi_held(gi, ambient) - ambient), 0.5 * lin);
         screen = sqrt(clamp(lin * exposure_, 0.0, 1.0));
     }
     vec3 c = mix(own, screen, screen_share * on_screen);
@@ -1436,13 +1465,62 @@ const uint S_EMIT = 31u;
 // ambient light on it explain, kept as a quarter in 8 bits a channel.
 const float EMIT_SCALE = 4.0;
 
-// The GI pass (`-DRT -DGI`): one ray a 2 by 2 block from its leader pixel
-// (every other frame, see below),
-// cosine-weighted around the surface's normal, its hit lit as the engine
-// lights it (one bounce; a miss takes the sky), accumulated over frames at
-// the same place in the world (the block's point found in the last frame's
-// view and its block there, accepted where it is the same point and
-// facing), into this frame's buffer.
+// The GI pass (`-DRT -DGI`), per block of the indirect light's grid (from
+// its leader pixel), every other frame in a checkerboard (otherwise it keeps
+// what it had): a hybrid of screen space and the traced scene.
+//
+// Screen space first, with a visibility bitmask (after Therrien, Levesque
+// and Gilet, "Screen Space Indirect Lighting with Visibility Bitmask",
+// 2023): SS_SLICES slices around the view direction, each marched
+// SS_STEPS samples out on both sides along the screen; each sample's
+// surface is taken as a slab SS_THICKNESS deep behind what depth shows, and
+// the angles its front and back span over the pixel's horizon mark the
+// sectors of the slice it hides, out of 32 (spaced evenly in the sine of the
+// angle from the normal, so each sector counts the same towards the cosine
+// weighted light). A sample's screen colour (the opaque copy, back to linear
+// through the exposure) lights the sectors it is first to hide. So nearby
+// walls, floors and lit panels light the pixel from the screen, with their
+// textures and the engine's own lights, and what is behind them stays
+// hidden.
+//
+// What no sample hid (the ray left the screen, or went past everything)
+// continues through the traced scene: one ray, its direction in a sector
+// left open (a slice picked by how much it left open and its weight), its
+// hit lit as the engine lights it (the screen's colour where the screen
+// shows it) or the sky, weighted by the share left open. Neon light comes
+// in exactly from the tile's lights (`tile_light`), not from either.
+//
+// Then accumulated over frames at the same place in the world (the leader's
+// point found in the last frame's view on that frame's grid, which may be
+// coarser or finer: the history carries over a change of the grid), into
+// this frame's buffer.
+const int SS_SLICES = 2;
+const int SS_STEPS = 8;
+// How far the march reaches (studs), and how deep a surface is taken to be
+// (studs, plus 2% of its distance).
+const float SS_RADIUS = 12.0;
+const float SS_THICKNESS = 0.75;
+const float PI = 3.14159265;
+
+// The sectors from a to b (0 to 1).
+uint sectors(float a, float b) {
+    uint i0 = uint(clamp(floor(a * 32.0), 0.0, 32.0));
+    uint i1 = uint(clamp(ceil(b * 32.0), 0.0, 32.0));
+    if (i1 <= i0) {
+        return 0u;
+    }
+    uint n = i1 - i0;
+    return n >= 32u ? 0xffffffffu : ((1u << n) - 1u) << i0;
+}
+
+// A direction's place in a slice (V towards the camera, `ortho` along the
+// screen direction, `gamma` the projected normal's angle from V): the sine
+// of its angle from the normal, mapped to 0 to 1.
+float sector_of(vec3 w, vec3 V, vec3 ortho, float gamma) {
+    float a = atan(dot(w, ortho), dot(w, V)) - gamma;
+    return 0.5 + 0.5 * sin(clamp(a, -0.5 * PI, 0.5 * PI));
+}
+
 void main() {
     camera_from_fit();
     ivec2 b = ivec2(gl_GlobalInvocationID.xy);
@@ -1474,19 +1552,19 @@ void main() {
     vec3 n = normalize(world_dir(nv));
     vec3 X = to_world(P);
     float dist = length(P) * g_near;
-    // The last frame's light at this point, found first: a block traces a
-    // new ray every other frame (in a checkerboard) and otherwise keeps
-    // what it had, which halves the cost.
+    // The last frame's light at this point, on the last frame's grid.
     vec3 r = X - prev_pos.xyz;
     vec3 v = vec3(dot(r, prev_right.xyz), dot(r, prev_up.xyz), dot(r, prev_forward.xyz));
     float frames = 0.0;
     vec3 old = vec3(0.0);
     vec2 moments_old = vec2(0.0);
     if (prev_camera.w > 0.0 && v.z > 0.0) {
+        uint ps = clamp(prev_gscale, 1u, 16u);
+        uvec2 phs = (pc.size + ps - 1u) / ps;
         vec2 ndc = vec2(v.x / (v.z * prev_camera.x), -v.y / (v.z * prev_camera.y));
-        ivec2 q = ivec2((ndc * 0.5 + 0.5) * vec2(pc.size)) / int(grid_scale());
-        if (all(greaterThanEqual(q, ivec2(0))) && all(lessThan(uvec2(q), hs))) {
-            uint j = uint(q.y) * hs.x + uint(q.x);
+        ivec2 q = ivec2(floor((ndc * 0.5 + 0.5) * vec2(pc.size))) / int(ps);
+        if (all(greaterThanEqual(q, ivec2(0))) && all(lessThan(uvec2(q), phs))) {
+            uint j = uint(q.y) * phs.x + uint(q.x);
             uvec4 e0 = odd ? gi_a[2u * j] : gi_b[2u * j];
             uvec4 e1 = odd ? gi_a[2u * j + 1u] : gi_b[2u * j + 1u];
             vec3 Y = uintBitsToFloat(uvec3(e0.zw, e1.x));
@@ -1494,7 +1572,9 @@ void main() {
             vec2 bn = unpackHalf2x16(e0.y);
             vec3 o = vec3(unpackHalf2x16(e0.x), bn.x);
             vec2 mo = unpackHalf2x16(e1.z);
-            if (bn.y > 0.0 && distance(X, Y) < 0.02 * dist + 0.05 && dot(m, n) > 0.9
+            // The same point within its block's reach on that grid.
+            float reach_ = 0.02 * dist + 0.05 + 0.5 * float(max(ps, grid_scale())) * dist * 2.0 * g_tan.y / float(pc.size.y);
+            if (bn.y > 0.0 && distance(X, Y) < reach_ && dot(m, n) > 0.9
                 && !any(isnan(o)) && !any(isinf(o)) && !any(isnan(mo)) && !any(isinf(mo))) {
                 frames = bn.y;
                 old = o;
@@ -1504,75 +1584,174 @@ void main() {
     }
     vec3 acc = old;
     vec2 moments = moments_old;
-    // A block traces a new ray every other frame (in a checkerboard) and
-    // otherwise keeps what it had (as 44b08da6 did, whose look the owner
-    // prefers).
     if (frames < 1.0 || ((uint(b.x + b.y) + frame) & 1u) == 0u) {
-    // A cosine-weighted direction around n.
-    uint h = hash(i * 9781u + frame * 6271u);
-    float r1 = float(h & 0xffffu) / 65536.0, r2 = float(h >> 16) / 65536.0;
-    float phi = 6.2831853 * r1;
-    float sr = sqrt(r2);
-    vec3 t1 = normalize(abs(n.y) < 0.9 ? cross(n, vec3(0.0, 1.0, 0.0)) : cross(n, vec3(1.0, 0.0, 0.0)));
-    vec3 t2 = cross(n, t1);
-    vec3 dir = normalize(t1 * (cos(phi) * sr) + t2 * (sin(phi) * sr) + n * sqrt(max(1.0 - r2, 0.0)));
-    uint tri;
-    vec2 uv;
-    float t = trace_ray(X + n * (0.002 * dist + 0.02), dir, 0.01, 4096.0, tri, uv);
-    vec3 L;
     float exposure_ = max(frame_block[20].y, 1e-3);
-    if (t > 0.0 && emits(tri)) {
-        // A Neon part: its light comes in through `tile_light` instead
-        // (counted once).
-        L = vec3(0.0);
-    } else if (t > 0.0) {
-        vec3 Hw = X + n * (0.002 * dist + 0.02) + dir * t;
-        // A cached triangle's slot (`rt/build.comp` keeps it in the normal
-        // word's upper bits), for the light it gives off.
-        uint slot = floatBitsToUint(tris[TRI_VEC4 * tri + 5u].w) >> 1;
-        // Where the screen shows the hit, its light there, with everything
-        // the engine lit it with (its lamps, a neon part's glow); what that
-        // has beyond the engine's sun and ambient is learnt into the
-        // triangle's slot, so it still gives off light out of view.
-        bool shown = false;
-        vec3 H = to_view_space(Hw);
-        if ((pc.flags & 4u) != 0u && H.z > 1e-3) {
-            vec2 at = to_pixel(H);
-            if (all(greaterThanEqual(at, vec2(0.5))) && all(lessThan(at, vec2(pc.size) - 0.5))) {
-                float ds = depth_at(ivec2(at));
-                if (ds > 0.0 && abs(H.z - 1.0 / ds) < 0.02 * H.z) {
-                    vec3 c = textureLod(opaque_tex, at / vec2(pc.size), 0.0).rgb;
-                    L = c * c / exposure_;
-                    shown = true;
-                    uint ts = terrain_slot(tri);
-                    if (ts != 0u && ((i + frame) & 15u) == 0u) {
-                        learn_colour(ts, c, hit_normal(tri, uv, dir), Hw);
-                    }
-                    if (slot != 0u) {
-                        vec3 lit = lit_linear(hit_colour(tri, uv, t), hit_normal(tri, uv, dir), Hw);
-                        uint at_ = (slot - 1u) * SLOT_WORDS + S_EMIT;
-                        vec3 e = unpackUnorm4x8(slots[at_]).rgb * EMIT_SCALE;
-                        vec3 extra = max(L - lit, vec3(0.0));
-                        // Only a clear excess counts, else nothing.
-                        vec3 target = dot(extra, vec3(1.0)) > 0.5 * dot(lit, vec3(1.0)) + 0.05 ? extra : vec3(0.0);
-                        slots[at_] = packUnorm4x8(vec4(mix(e, target, 0.25) / EMIT_SCALE, 0.0));
+    uint h = hash(i * 9781u + frame * 6271u);
+    float jitter = float(h & 0xffffu) / 65536.0;
+    float rot = float(h >> 16) / 65536.0;
+    // The march in view space (near-plane units).
+    vec3 V = -normalize(P);
+    float radius_px = clamp(SS_RADIUS / max(dist, 1e-3) / g_tan.y * 0.5 * float(pc.size.y), 6.0, 0.35 * float(pc.size.y));
+    float thick = (SS_THICKNESS + 0.02 * dist) / g_near;
+    vec2 inv = 1.0 / vec2(pc.size);
+    vec3 screen_sum = vec3(0.0);
+    float weight_sum = 0.0;
+    float open_w[SS_SLICES];
+    uint open_bits[SS_SLICES];
+    float gammas[SS_SLICES];
+    vec3 orthos[SS_SLICES];
+    float open_total = 0.0;
+    for (int sl = 0; sl < SS_SLICES; ++sl) {
+        open_w[sl] = 0.0;
+        open_bits[sl] = 0u;
+        float phi = PI * (float(sl) + rot) / float(SS_SLICES);
+        vec2 d2 = vec2(cos(phi), sin(phi));
+        vec3 dirv = vec3(d2.x, -d2.y, 0.0);
+        vec3 ortho = dirv - dot(dirv, V) * V;
+        if (dot(ortho, ortho) < 1e-8) {
+            continue;
+        }
+        ortho = normalize(ortho);
+        vec3 axis = cross(ortho, V);
+        vec3 pn = nv - dot(nv, axis) * axis;
+        float pl = length(pn);
+        if (pl < 1e-3) {
+            continue;
+        }
+        float gamma = atan(dot(pn, ortho), dot(pn, V));
+        uint occ = 0u;
+        vec3 lit = vec3(0.0);
+        for (int side = 0; side < 2; ++side) {
+            vec2 dir2 = side == 0 ? d2 : -d2;
+            for (int k = 0; k < SS_STEPS; ++k) {
+                float f = (float(k) + jitter) / float(SS_STEPS);
+                vec2 at = vec2(p) + 0.5 + dir2 * (1.0 + f * f * radius_px);
+                if (any(lessThan(at, vec2(0.0))) || any(greaterThanEqual(at, vec2(pc.size)))) {
+                    break;
+                }
+                ivec2 q = ivec2(at);
+                float dq = depth_at(q);
+                if (dq <= 0.0) {
+                    continue;
+                }
+                vec3 S = view_pos(vec2(q) + 0.5, dq);
+                vec3 Sb = S + normalize(S) * thick;
+                vec3 wf = S - P, wb = Sb - P;
+                if (dot(wf, wf) < 1e-12) {
+                    continue;
+                }
+                float uf = sector_of(normalize(wf), V, ortho, gamma);
+                float ub = sector_of(normalize(wb), V, ortho, gamma);
+                uint bits = sectors(min(uf, ub), max(uf, ub));
+                uint fresh = bits & ~occ;
+                if (fresh != 0u) {
+                    vec3 c = textureLod(opaque_tex, (vec2(q) + 0.5) * inv, 0.0).rgb;
+                    lit += gi_gain * c * c / exposure_ * float(bitCount(fresh));
+                }
+                occ |= bits;
+            }
+        }
+        screen_sum += pl * lit / 32.0;
+        weight_sum += pl;
+        open_bits[sl] = ~occ;
+        open_w[sl] = pl * float(bitCount(~occ)) / 32.0;
+        open_total += open_w[sl];
+        gammas[sl] = gamma;
+        orthos[sl] = ortho;
+    }
+    vec3 L = weight_sum > 0.0 ? screen_sum / weight_sum : vec3(0.0);
+    vec3 Xo = X + n * (0.002 * dist + 0.02);
+    if (open_total > 0.0 && weight_sum > 0.0) {
+        // One ray into what the screen left open: a slice by its open
+        // weight, a sector among its open ones, a place within it.
+        uint h2 = hash(h ^ 0x68bc21ebu);
+        float pick = float(h2 & 0xffffu) / 65536.0 * open_total;
+        int sl = 0;
+        for (int k = 0; k < SS_SLICES - 1; ++k) {
+            if (pick < open_w[k]) {
+                break;
+            }
+            pick -= open_w[k];
+            sl = k + 1;
+        }
+        uint bits = open_bits[sl];
+        int count_ = bitCount(bits);
+        int nth = int(min(uint(float(h2 >> 16) / 65536.0 * float(count_)), uint(max(count_ - 1, 0))));
+        uint rest = bits;
+        for (int k = 0; k < nth; ++k) {
+            rest &= rest - 1u;
+        }
+        int sector = findLSB(rest);
+        float u = (float(sector) + float(hash(h2) & 0xffffu) / 65536.0) / 32.0;
+        float a = asin(clamp(2.0 * u - 1.0, -1.0, 1.0)) + gammas[sl];
+        vec3 dv = cos(a) * V + sin(a) * orthos[sl];
+        vec3 dir = normalize(world_dir(dv));
+        if (dot(dir, n) < 0.02) {
+            dir = normalize(dir + n * (0.02 - dot(dir, n)));
+        }
+        uint tri;
+        vec2 uv;
+        float t = trace_ray(Xo, dir, 0.01, 1024.0, tri, uv);
+        vec3 Lr;
+        if (t > 0.0 && emits(tri)) {
+            // A Neon part: its light comes in through `tile_light` instead
+            // (counted once).
+            Lr = vec3(0.0);
+        } else if (t > 0.0) {
+            vec3 Hw = Xo + dir * t;
+            // A cached triangle's slot (`rt/build.comp` keeps it in the
+            // normal word's upper bits), for the light it gives off.
+            uint slot = floatBitsToUint(tris[TRI_VEC4 * tri + 5u].w) >> 1;
+            // Where the screen shows the hit, its light there, with
+            // everything the engine lit it with (its lamps, a neon part's
+            // glow); what that has beyond the engine's sun and ambient is
+            // learnt into the triangle's slot, so it still gives off light
+            // out of view.
+            bool shown = false;
+            vec3 H = to_view_space(Hw);
+            if ((pc.flags & 4u) != 0u && H.z > 1e-3) {
+                vec2 at = to_pixel(H);
+                if (all(greaterThanEqual(at, vec2(0.5))) && all(lessThan(at, vec2(pc.size) - 0.5))) {
+                    float ds = depth_at(ivec2(at));
+                    if (ds > 0.0 && abs(H.z - 1.0 / ds) < 0.02 * H.z) {
+                        vec3 c = textureLod(opaque_tex, at * inv, 0.0).rgb;
+                        Lr = gi_gain * c * c / exposure_;
+                        shown = true;
+                        uint ts = terrain_slot(tri);
+                        if (ts != 0u && ((i + frame) & 15u) == 0u) {
+                            learn_colour(ts, c, hit_normal(tri, uv, dir), Hw);
+                        }
+                        if (slot != 0u) {
+                            vec3 lit = lit_linear(hit_colour(tri, uv, t), hit_normal(tri, uv, dir), Hw);
+                            uint at_ = (slot - 1u) * SLOT_WORDS + S_EMIT;
+                            vec3 e = unpackUnorm4x8(slots[at_]).rgb * EMIT_SCALE;
+                            vec3 extra = max(c * c / exposure_ - lit, vec3(0.0));
+                            // Only a clear excess counts, else nothing.
+                            vec3 target = dot(extra, vec3(1.0)) > 0.5 * dot(lit, vec3(1.0)) + 0.05 ? extra : vec3(0.0);
+                            slots[at_] = packUnorm4x8(vec4(mix(e, target, 0.25) / EMIT_SCALE, 0.0));
+                        }
                     }
                 }
             }
-        }
-        if (!shown) {
-            L = lit_linear(hit_colour(tri, uv, t), hit_normal(tri, uv, dir), Hw);
-            if (slot != 0u) {
-                L += unpackUnorm4x8(slots[(slot - 1u) * SLOT_WORDS + S_EMIT]).rgb * EMIT_SCALE;
+            if (!shown) {
+                Lr = lit_linear(hit_colour(tri, uv, t), hit_normal(tri, uv, dir), Hw);
+                if (slot != 0u) {
+                    Lr += unpackUnorm4x8(slots[(slot - 1u) * SLOT_WORDS + S_EMIT]).rgb * EMIT_SCALE;
+                }
+                Lr *= gi_gain;
             }
+        } else {
+            // Open sky: the engine's own ambient from that side. The sky's
+            // colour on the screen is far brighter than the light the
+            // engine gives with it, and taken as light it washed every
+            // open place out (the city's roads, Jailbreak).
+            Lr = engine_ambient(dir);
         }
-    } else {
-        vec4 env = environment(dir);
-        L = env.a > 0.0 ? env.rgb * env.rgb / exposure_ : engine_ambient(dir);
+        L += min(Lr, vec3(32.0)) * (open_total / weight_sum);
     }
     // The Neon parts' light, exactly, from the ones the tile lists (the
     // LIGHTS pass), in view or not.
-    L += tile_light(uvec2(p), X + n * (0.002 * dist + 0.02), n);
+    L += NEON_GI * tile_light(uvec2(p), Xo, n);
     L = min(L, vec3(32.0));
     // Accumulated over up to 32 frames, with the first two moments of its
     // brightness for the filter's variance. A sample far outside what the
@@ -1604,77 +1783,221 @@ void main() {
 #elif defined(RT) && defined(LIGHTS)
 
 // The light list pass (`-DRT -DLIGHTS`), per screen tile: from the tile's
-// middle pixel's surface, every listed Neon triangle (up to 4096 of them)
-// weighed by what it gives there (its brightness times its area times the
-// two cosines over the squared distance), the LIGHTS_PER_TILE strongest
-// kept, each with whether a ray from the surface reaches its middle. The
-// GI pass then takes their light exactly (`tile_light`), the same every
-// frame while nothing moves, so the glow beside a Neon panel is steady.
-void main() {
-    camera_from_fit();
-    uvec2 t = gl_GlobalInvocationID.xy;
-    uvec2 lt = light_tiles();
-    if (any(greaterThanEqual(t, lt))) {
+// middle pixel's surface, Neon triangles weighed by what they give there
+// (their brightness times their area times the two cosines over the squared
+// distance), the LIGHTS_PER_TILE strongest kept, each with whether a ray
+// from the surface reaches its middle. The GI pass then takes their light
+// exactly (`tile_light`). Candidates: every listed Neon triangle up to
+// LIGHT_CANDIDATES of them, else that many spread over the list from a
+// place that changes every frame; and the ones the tile's surface chose the
+// frame before (found through the last frame's camera), recognised by where
+// their middle is and weighed LIGHT_KEEP times up, so a choice holds from
+// frame to frame and a tile does not switch between two near equal lights
+// (temporal reuse of the choices, as in ReSTIR, but keeping the strongest
+// rather than resampling: the light is summed exactly, not estimated).
+const uint LIGHT_CANDIDATES = 1024u;
+const float LIGHT_KEEP = 1.5;
+// A kept choice's ray is cast again one frame in LIGHT_RECHECK, in turn.
+const uint LIGHT_RECHECK = 4u;
+
+uint centre_hash_at(vec3 mid) {
+    uvec3 q = uvec3(ivec3(round(mid * 8.0)));
+    return hash(q.x ^ hash(q.y ^ hash(q.z))) | 1u;
+}
+
+vec3 centre_of(uint tri) {
+    return (tri_world(3u * tri) + tri_world(3u * tri + 1u) + tri_world(3u * tri + 2u)) / 3.0;
+}
+
+// The emitters a workgroup weighs, 64 at a time, read once for its 64
+// tiles: middle and brightness (luma of its light), the normal and half
+// the area, the triangle and its hash.
+shared vec4 sh_mid[64];
+shared vec4 sh_nrm[64];
+shared uvec2 sh_id[64];
+
+float score_of(vec4 mp, vec4 na, vec3 X, vec3 n) {
+    vec3 dv = mp.xyz - X;
+    float d2 = max(dot(dv, dv), 0.25);
+    vec3 dir = dv * inversesqrt(d2);
+    float cx = dot(n, dir);
+    if (cx <= 0.0) {
+        return 0.0;
+    }
+    return mp.w * na.w * cx * max(abs(dot(na.xyz, dir)), 0.1) / d2;
+}
+
+vec4 power_of(uint tri, out vec4 na) {
+    vec3 A = tri_world(3u * tri), B = tri_world(3u * tri + 1u), C = tri_world(3u * tri + 2u);
+    vec3 e = cross(B - A, C - A);
+    float area2 = length(e);
+    na = area2 < 1e-8 ? vec4(0.0) : vec4(e / area2, 0.5 * area2);
+    return vec4((A + B + C) / 3.0, dot(emission_of(tri, emitter_colour(tri)), vec3(0.2126, 0.7152, 0.0722)));
+}
+
+uint best[LIGHTS_PER_TILE];
+uint best_hash[LIGHTS_PER_TILE];
+// 0: not known whether in view; 1 in view; 2 not, as the last frame found.
+uint best_seen[LIGHTS_PER_TILE];
+float score[LIGHTS_PER_TILE];
+
+void consider(uint tri, uint h, uint seen, float s) {
+    if (!(s > score[LIGHTS_PER_TILE - 1])) {
         return;
     }
-    uint base = (t.y * lt.x + t.x) * uint(LIGHTS_PER_TILE);
-    uint best[LIGHTS_PER_TILE];
-    float score[LIGHTS_PER_TILE];
     for (int k = 0; k < LIGHTS_PER_TILE; ++k) {
-        best[k] = NO_LIGHT;
-        score[k] = 0.0;
+        if (best[k] == tri) {
+            return;
+        }
+    }
+    // Into the sorted list, the weakest falling off its end.
+    int k = LIGHTS_PER_TILE - 1;
+    while (k > 0 && score[k - 1] < s) {
+        score[k] = score[k - 1];
+        best[k] = best[k - 1];
+        best_hash[k] = best_hash[k - 1];
+        best_seen[k] = best_seen[k - 1];
+        --k;
+    }
+    score[k] = s;
+    best[k] = tri;
+    best_hash[k] = h;
+    best_seen[k] = seen;
+}
+
+// The second dispatch (`steps` 1), one invocation per tile and choice: the
+// rays, which one invocation per tile cast too slowly one after another
+// (eight long rays each, too few invocations to hide their latency: 1.5 to
+// 2.8 ms in Jailbreak's city, measured). A choice whose hash word has bit 0
+// clear wants its ray (new, or its turn to be checked again).
+void cast_rays() {
+    uvec2 lt = light_tiles();
+    uvec2 t = uvec2(gl_GlobalInvocationID.x / uint(LIGHTS_PER_TILE), gl_GlobalInvocationID.y);
+    uint k = gl_GlobalInvocationID.x % uint(LIGHTS_PER_TILE);
+    if (any(greaterThanEqual(t, lt)) || !g_fit) {
+        return;
+    }
+    uint at = tiles_half(false) + (t.y * lt.x + t.x) * uint(LIGHTS_PER_TILE) + k;
+    uvec2 e = tiles[at];
+    if (e.x == NO_LIGHT || (e.y & 1u) != 0u) {
+        return;
     }
     ivec2 p = min(ivec2(t) * LIGHT_TILE + LIGHT_TILE / 2, ivec2(pc.size) - 1);
     float d = depth_at(p);
-    uint count = min(min(emitters_n, MAX_EMITTERS), 4096u);
+    bool seen = false;
+    if (d > 0.0) {
+        vec3 P = view_pos(vec2(p) + 0.5, d);
+        vec3 N = surface_at(p, P).n;
+        if (N != vec3(0.0)) {
+            vec3 n = normalize(world_dir(N));
+            vec3 X = to_world(P) + n * (0.002 * length(P) * g_near + 0.02);
+            vec3 mid = centre_of(e.x & 0x7fffffffu);
+            float len = distance(mid, X);
+            uint st;
+            vec2 su;
+            seen = trace_ray(X, (mid - X) / max(len, 1e-4), 0.01, len * 0.97, st, su) < 0.0;
+        }
+    }
+    tiles[at] = uvec2((e.x & 0x7fffffffu) | (seen ? 0x80000000u : 0u), e.y | 1u);
+}
+
+void main() {
+    camera_from_fit();
+    if (pc.steps == 1u) {
+        cast_rays();
+        return;
+    }
+    uvec2 t = gl_GlobalInvocationID.xy;
+    uvec2 lt = light_tiles();
+    bool inside = all(lessThan(t, lt));
+    for (int k = 0; k < LIGHTS_PER_TILE; ++k) {
+        best[k] = NO_LIGHT;
+        best_hash[k] = 0u;
+        best_seen[k] = 0u;
+        score[k] = 0.0;
+    }
+    ivec2 p = min(ivec2(t) * LIGHT_TILE + LIGHT_TILE / 2, ivec2(pc.size) - 1);
+    float d = inside ? depth_at(p) : 0.0;
+    uint count = min(emitters_n, MAX_EMITTERS);
     vec3 X = vec3(0.0), n = vec3(0.0);
+    bool lit_here = false;
     if (d > 0.0 && g_fit && count > 0u) {
         vec3 P = view_pos(vec2(p) + 0.5, d);
         vec3 N = surface_at(p, P).n;
         if (N != vec3(0.0)) {
+            lit_here = true;
             n = normalize(world_dir(N));
             X = to_world(P) + n * (0.002 * length(P) * g_near + 0.02);
-            for (uint i = 0u; i < count; ++i) {
-                uint tri = emitters[i];
-                vec3 A = tri_world(3u * tri), B = tri_world(3u * tri + 1u), C = tri_world(3u * tri + 2u);
-                vec3 mid = (A + B + C) / 3.0;
-                vec3 e = cross(B - A, C - A);
-                float area2 = length(e);
-                vec3 dv = mid - X;
-                float d2 = max(dot(dv, dv), 0.25);
-                vec3 dir = dv * inversesqrt(d2);
-                float cx = dot(n, dir);
-                if (cx <= 0.0 || area2 < 1e-8) {
-                    continue;
+            // The last frame's choices for this surface point.
+            vec3 r = X - prev_pos.xyz;
+            vec3 v = vec3(dot(r, prev_right.xyz), dot(r, prev_up.xyz), dot(r, prev_forward.xyz));
+            if (prev_camera.w > 0.0 && v.z > 0.0) {
+                vec2 ndc = vec2(v.x / (v.z * prev_camera.x), -v.y / (v.z * prev_camera.y));
+                ivec2 q = ivec2(floor((ndc * 0.5 + 0.5) * vec2(pc.size))) / LIGHT_TILE;
+                if (all(greaterThanEqual(q, ivec2(0))) && all(lessThan(uvec2(q), lt))) {
+                    uint old = tiles_half(true) + (uint(q.y) * lt.x + uint(q.x)) * uint(LIGHTS_PER_TILE);
+                    for (int k = 0; k < LIGHTS_PER_TILE; ++k) {
+                        uvec2 e = tiles[old + uint(k)];
+                        if (e.x == NO_LIGHT) {
+                            break;
+                        }
+                        uint tri = e.x & 0x7fffffffu;
+                        if (emits(tri)) {
+                            vec4 na;
+                            vec4 mp = power_of(tri, na);
+                            if (centre_hash_at(mp.xyz) == e.y) {
+                                consider(tri, e.y, (e.x >> 31) != 0u ? 1u : 2u, LIGHT_KEEP * score_of(mp, na, X, n));
+                            }
+                        }
+                    }
                 }
-                float s = dot(emission_of(tri, emitter_colour(tri)), vec3(0.2126, 0.7152, 0.0722)) * 0.5 * area2 * cx
-                    * max(abs(dot(e / area2, dir)), 0.1) / d2;
-                if (!(s > score[LIGHTS_PER_TILE - 1])) {
-                    continue;
-                }
-                // Into the sorted list, the weakest falling off its end.
-                int k = LIGHTS_PER_TILE - 1;
-                while (k > 0 && score[k - 1] < s) {
-                    score[k] = score[k - 1];
-                    best[k] = best[k - 1];
-                    --k;
-                }
-                score[k] = s;
-                best[k] = tri;
             }
         }
     }
+    // Every listed Neon triangle up to LIGHT_CANDIDATES, else that many
+    // spread over the list from a place that changes every frame; 64 at a
+    // time into shared memory, weighed by every tile of the workgroup.
+    uint take = min(count, LIGHT_CANDIDATES);
+    uint stride = max(count / max(take, 1u), 1u);
+    uint start = count > LIGHT_CANDIDATES ? hash(frame * 7919u) % count : 0u;
+    for (uint at = 0u; at < take; at += 64u) {
+        uint i = at + gl_LocalInvocationIndex;
+        if (i < take) {
+            uint tri = emitters[(start + i * stride) % count];
+            vec4 na;
+            vec4 mp = power_of(tri, na);
+            sh_mid[gl_LocalInvocationIndex] = mp;
+            sh_nrm[gl_LocalInvocationIndex] = na;
+            sh_id[gl_LocalInvocationIndex] = uvec2(tri, centre_hash_at(mp.xyz));
+        }
+        barrier();
+        if (lit_here) {
+            uint m = min(64u, take - at);
+            for (uint j = 0u; j < m; ++j) {
+                float s = score_of(sh_mid[j], sh_nrm[j], X, n);
+                if (s > score[LIGHTS_PER_TILE - 1]) {
+                    consider(sh_id[j].x, sh_id[j].y, 0u, s);
+                }
+            }
+        }
+        barrier();
+    }
+    if (!inside) {
+        return;
+    }
+    uint base = tiles_half(false) + (t.y * lt.x + t.x) * uint(LIGHTS_PER_TILE);
     for (int k = 0; k < LIGHTS_PER_TILE; ++k) {
         uint e = best[k];
+        uint h = best_hash[k];
         if (e != NO_LIGHT) {
-            vec3 mid = (tri_world(3u * e) + tri_world(3u * e + 1u) + tri_world(3u * e + 2u)) / 3.0;
-            float len = distance(mid, X);
-            uint st;
-            vec2 su;
-            bool seen = trace_ray(X, (mid - X) / max(len, 1e-4), 0.01, len * 0.97, st, su) < 0.0;
-            e |= seen ? 0x80000000u : 0u;
+            // A new choice wants its ray (`cast_rays`); a kept one keeps
+            // what its ray found and wants it again in turn.
+            e |= best_seen[k] == 1u ? 0x80000000u : 0u;
+            if (best_seen[k] == 0u || ((uint(k) + frame + t.x + t.y) % LIGHT_RECHECK) == 0u) {
+                h &= ~1u;
+            }
         }
-        tiles[base + uint(k)] = e;
+        tiles[base + uint(k)] = uvec2(e, h);
     }
 }
 
@@ -2032,17 +2355,40 @@ uint pack_result(vec4 c) {
     return q.r | (q.g << 10) | (q.b << 20) | (q.a << 30);
 }
 
-// The GI apply pass (`-DRT -DGIAPPLY`), on the finished reflections'
-// result: the filtered indirect light around each pixel (the blocks next to
-// its own that lie on its surface and face its way, by distance), in place
-// of the engine's ambient: the pixel's base colour estimated as its colour
-// over the engine's light without shadow, times the indirect light less the
+// The glow and GI apply pass (`-DRT -DGIAPPLY`), on the finished
+// reflections' result, every traced frame.
+//
+// The indirect light (flags bit 14, when it ran): the filtered indirect
+// light around each pixel (the blocks next to its own that lie on its
+// surface and face its way, a tent over their middles), in place of the
+// engine's ambient: the pixel's base colour estimated as its colour over
+// the engine's light without shadow, times the indirect light less the
 // ambient the engine already gave it; never darker than half, so corners
 // darken and walls tint what faces them.
+//
+// The glow: what the screen cannot show because it ends at white, the
+// reflections' share above it (reflected Neon is kept up to 4 times white)
+// and the indirect light's (a wall beside a Neon panel), as a colour above
+// white in the screen's encoding, into `glow_img` (the reflections' trace
+// image, which the compose has read), for the bloom to add to what it
+// blooms (`post.comp` BLOOM_PREFILTER, its flag GLOW), so reflected Neon and
+// its light on the walls glow as the engine's own Neon does.
 void main() {
     camera_from_fit();
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
-    if (any(greaterThanEqual(uvec2(p), pc.size)) || !g_fit) {
+    if (any(greaterThanEqual(uvec2(p), pc.size))) {
+        return;
+    }
+    // The reflections' excess: the compose blends the trace's colour over
+    // the scene by its strength; what that sum has above white.
+    vec4 r = imageLoad(glow_img, p);
+    vec3 glow = vec3(0.0);
+    if (!any(isnan(r)) && !any(isinf(r)) && r.a > 1.0 / 1024.0) {
+        vec3 base = texelFetch(color_tex, p, 0).rgb;
+        glow = max(base * (1.0 - clamp(r.a, 0.0, 1.0)) + r.rgb - 1.0, vec3(0.0));
+    }
+    imageStore(glow_img, p, vec4(glow, 1.0));
+    if (!g_fit || (pc.flags & 16384u) == 0u) {
         return;
     }
     float d = depth_at(p);
@@ -2060,6 +2406,7 @@ void main() {
     bool odd = (frame & 1u) != 0u;
     uvec2 hs = half_size();
     ivec2 b0 = p / int(grid_scale());
+    float gs = float(grid_scale());
     vec3 sum = vec3(0.0);
     float weights = 0.0;
     for (int j = -1; j <= 1; ++j) {
@@ -2078,7 +2425,11 @@ void main() {
             vec3 Y = uintBitsToFloat(uvec3(e0.zw, e1.x));
             vec3 m = unpackSnorm4x8(e1.y).xyz;
             float off_plane = abs(dot(n, Y - X)) / max(dist, 1e-3);
-            float w = (1.0 - smoothstep(0.004, 0.03, off_plane)) * max(dot(m, n), 0.0) * exp(-1.0 * float(i * i + j * j));
+            // A tent over the blocks' middles (bilinear between the four
+            // nearest), so a coarse grid shows no steps.
+            vec2 off = abs(vec2(p) + 0.5 - (vec2(b) + 0.5) * gs) / gs;
+            float tent = max(1.0 - off.x, 0.0) * max(1.0 - off.y, 0.0) + 0.01;
+            float w = (1.0 - smoothstep(0.004, 0.03, off_plane)) * max(dot(m, n), 0.0) * tent;
             // The filter's result (see GIFILTER).
             uvec2 f = gi_fa[k];
             vec3 L = vec3(unpackHalf2x16(f.x), unpackHalf2x16(f.y).x);
@@ -2091,8 +2442,8 @@ void main() {
     if (weights < 1e-3) {
         return;
     }
-    // Brightening held (GI_MOST).
-    vec3 indirect = min(sum / weights, GI_MOST * engine_ambient(n) + vec3(GI_MOST_ADD));
+    // Brightening held (GI_MOST, a soft knee).
+    vec3 indirect = gi_held(sum / weights, engine_ambient(n));
     uint packed = imageLoad(result_img, p).r;
     vec4 c = unpack(packed);
     float exposure_ = max(frame_block[20].y, 1e-3);
@@ -2101,9 +2452,12 @@ void main() {
     vec3 to_sun = -frame_block[16].xyz;
     vec3 light = ambient + frame_block[15].xyz * max(dot(n, to_sun), 0.0) + frame_block[17].xyz * max(-dot(n, to_sun), 0.0);
     vec3 albedo = lin / max(light, vec3(0.02));
-    vec3 now = max(lin + albedo * (indirect - ambient), 0.5 * lin);
-    c.rgb = sqrt(clamp(now * exposure_, 0.0, 1.0));
+    // Never darker than 70% (a corner darkens, a room does not go dim).
+    vec3 now = max(lin + albedo * (indirect - ambient), 0.7 * lin);
+    vec3 shown = sqrt(max(now * exposure_, vec3(0.0)));
+    c.rgb = clamp(shown, 0.0, 1.0);
     imageStore(result_img, p, uvec4(pack_result(c), 0u, 0u, 0u));
+    imageStore(glow_img, p, vec4(glow + max(min(shown, vec3(4.0)) - 1.0, vec3(0.0)), 1.0));
 }
 
 #elif defined(RT) && !defined(UPSAMPLE)

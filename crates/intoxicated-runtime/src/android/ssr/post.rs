@@ -254,6 +254,9 @@ pub(crate) const NEAR_BLUR: u32 = 0x2;
 pub(crate) const AUTOFOCUS: u32 = 0x4;
 pub(crate) const FOCUS_RESET: u32 = 0x8;
 pub(crate) const FOCUS_PAST: u32 = 0x10;
+/// The reflections' trace image holds the ray-traced glow above white
+/// (`ssr.comp` GIAPPLY), which the bloom adds.
+pub(crate) const GLOW: u32 = 0x20;
 
 fn value(fx: &Effect, values: &[[f32; 3]], name: &str) -> [f32; 3] {
     fx.knobs.iter().position(|k| k.name == name).map_or([0.0; 3], |i| values[i])

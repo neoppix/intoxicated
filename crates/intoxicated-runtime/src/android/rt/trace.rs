@@ -133,7 +133,7 @@ const BINDINGS: [u32; 20] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 
 /// Screen tiles of the Neon light lists (`LIGHT_TILE` in ssr.comp), and
 /// bytes a tile (`LIGHTS_PER_TILE` entries).
 const LIGHT_TILE: u32 = 16;
-const TILE_BYTES: u64 = 4 * 8;
+const TILE_BYTES: u64 = 8 * 8;
 /// Bytes of the reflections' history a pixel (`ssr.comp` `refl_a`).
 const REFL_BYTES: u64 = 16;
 /// Bytes of the indirect light a 2 by 2 block.
@@ -304,7 +304,24 @@ fn block_size() -> u32 {
 /// looked at every `BUDGET_FRAMES` frames; `MAX_COARSER` steps at most.
 const BUDGET_MS: f64 = 4.5;
 const BUDGET_FRAMES: u32 = 120;
-const MAX_COARSER: u32 = 1;
+const MAX_COARSER: u32 = 2;
+/// Looks in a row the budget must agree on before it steps.
+const BUDGET_HOLD: i32 = 3;
+
+/// The indirect light's blocks, pixels a side, for an output of `extent`:
+/// about 600,000 blocks at most (2 by 2 up to about 2.4 million pixels, 3
+/// by 3 up to about 5.4 million, as 3440x1440, else 4 by 4). Near a step
+/// the size `last` had is kept within 10% of it, so a window resized
+/// around the step does not swing between the two.
+pub(crate) fn gi_scale(extent: [u32; 2], last: u32) -> u32 {
+    let pixels = extent[0] as f64 * extent[1] as f64;
+    let pick = |p: f64| if p <= 2.4e6 { 2 } else if p <= 5.4e6 { 3 } else { 4 };
+    let now = pick(pixels);
+    if (2..=4).contains(&last) && (pick(pixels * 1.1) == last || pick(pixels / 1.1) == last) {
+        return last;
+    }
+    now
+}
 
 fn env_switch() -> &'static AtomicBool {
     ENV_ON.get_or_init(|| AtomicBool::new(std::env::var(ENV_ENV).map_or(true, |v| v.trim() != "0")))
@@ -347,6 +364,33 @@ fn reach() -> f32 {
 /// makes room for it and turns it on; devctl `rt gi on|off`.
 pub const GI_ENV: &str = "INTOXICATED_RT_GI";
 static GI_ON: OnceLock<AtomicBool> = OnceLock::new();
+
+/// How strongly the indirect light's bounces show: what the screen and the
+/// traced rays bring in (not the open sky, not Neon) is taken this many
+/// times over (`INTOXICATED_RT_GI_GAIN`, 0 to 4, 1.6 unless set; devctl
+/// `rt gi-gain <x>`).
+pub const GI_GAIN_ENV: &str = "INTOXICATED_RT_GI_GAIN";
+const GI_GAIN: f32 = 1.6;
+static GI_GAIN_BITS: OnceLock<std::sync::atomic::AtomicU32> = OnceLock::new();
+
+fn gi_gain_bits() -> &'static std::sync::atomic::AtomicU32 {
+    GI_GAIN_BITS.get_or_init(|| {
+        let v = std::env::var(GI_GAIN_ENV).ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| (0.0..=4.0).contains(v));
+        std::sync::atomic::AtomicU32::new(v.unwrap_or(GI_GAIN).to_bits())
+    })
+}
+
+pub(crate) fn gi_gain() -> f32 {
+    f32::from_bits(gi_gain_bits().load(Relaxed))
+}
+
+pub(crate) fn set_gi_gain(v: f32) -> Result<(), String> {
+    if !(0.0..=4.0).contains(&v) {
+        return Err("rt gi-gain takes 0 to 4".into());
+    }
+    gi_gain_bits().store(v.to_bits(), Relaxed);
+    Ok(())
+}
 
 pub(crate) fn gi_requested() -> bool {
     std::env::var(GI_ENV).is_ok_and(|v| v.trim() == "1")
@@ -470,7 +514,7 @@ impl Fns {
 }
 
 const RING: usize = 16;
-const STAMPS: usize = 3;
+const STAMPS: usize = 6;
 const WINDOW: usize = 512;
 
 #[derive(Default)]
@@ -481,6 +525,9 @@ pub(crate) struct Stats {
     /// Build and trace milliseconds, the last [`WINDOW`] frames.
     pub build_ms: std::collections::VecDeque<f64>,
     pub trace_ms: std::collections::VecDeque<f64>,
+    /// The trace's parts: the Neon tiles, the indirect light's rays, its
+    /// filter, the reflections (with their history and blur).
+    pub parts_ms: [std::collections::VecDeque<f64>; 4],
     pub keys: u32,
     /// The blocks' sizes in pixels a side: the reflections', the indirect
     /// light's.
@@ -556,6 +603,10 @@ struct Gpu {
     /// buffers' contents were made at.
     coarser: u32,
     budget_frames: u32,
+    /// Looks in a row that wanted the same step (+ coarser, - finer).
+    budget_votes: i32,
+    /// The indirect light's blocks before the budget's steps (`gi_scale`).
+    gi_base: u32,
     scales: (u32, u32),
     /// Host-visible: a copy of the globals (the camera FIT measured).
     readback: Owned,
@@ -666,8 +717,9 @@ impl Gpu {
         (self.buffers.pipeline_barrier)(cmd, src_stage, STAGE_COMPUTE, 0, 1, &b, 0, std::ptr::null(), 0, std::ptr::null());
     }
 
-    /// The build and trace milliseconds this slot held, when they are in.
-    fn collect(&mut self, slot: usize, period_ns: f64, mask: u64) -> Option<(f64, f64)> {
+    /// The build and trace milliseconds this slot held, when they are in,
+    /// and the trace's parts (see `Stats::parts_ms`).
+    fn collect(&mut self, slot: usize, period_ns: f64, mask: u64) -> Option<(f64, f64, [f64; 4])> {
         if !self.pending[slot] || self.query_pool == 0 {
             return None;
         }
@@ -687,7 +739,8 @@ impl Gpu {
             return None;
         }
         let ms = |a: u64, b: u64| super::super::ssr::ticks_to_ms(a, b, mask, period_ns);
-        Some((ms(out[0], out[2]), ms(out[2], out[4])))
+        let t = |i: usize| out[2 * i];
+        Some((ms(t(0), t(1)), ms(t(1), t(5)), [ms(t(1), t(2)), ms(t(2), t(3)), ms(t(3), t(4)), ms(t(4), t(5))]))
     }
 }
 
@@ -737,7 +790,9 @@ fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool, extent: [u32; 2]) -
         gi_filtered: [Owned::default(); 2],
         emitters: Owned::default(),
         refl: [Owned::default(); 2],
-        pixel_room: extent[0].max(2560) as u64 * extent[1].max(1440) as u64,
+        // Room for 3440x1440 at least, so a window made fullscreen there
+        // keeps its reflections' history.
+        pixel_room: extent[0].max(3440) as u64 * extent[1].max(1440) as u64,
         tiles: Owned::default(),
         tile_room: extent[0].max(ROOM_FOR[0]).div_ceil(LIGHT_TILE) as u64 * extent[1].max(ROOM_FOR[1]).div_ceil(LIGHT_TILE) as u64,
         last_slot: 0,
@@ -754,6 +809,8 @@ fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool, extent: [u32; 2]) -
         dummy_ready: false,
         blocks_cleared: false,
         coarser: 0,
+        budget_votes: 0,
+        gi_base: 0,
         budget_frames: 0,
         scales: (0, 0),
         readback: Owned::default(),
@@ -923,7 +980,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         make_buffer(&g.buffers, d, &types, REFL_BYTES * g.pixel_room, usage, false)?,
         make_buffer(&g.buffers, d, &types, REFL_BYTES * g.pixel_room, usage, false)?,
     ];
-    g.tiles = make_buffer(&g.buffers, d, &types, TILE_BYTES * g.tile_room, usage, false)?;
+    g.tiles = make_buffer(&g.buffers, d, &types, 2 * TILE_BYTES * g.tile_room, usage, false)?;
     g.no_frame_block = make_buffer(&g.buffers, d, &types, FRAME_BLOCK_BYTES, USAGE_UNIFORM | USAGE_TRANSFER_DST, false)?;
     make_textures(g, &types)?;
     g.readback = make_buffer(&g.buffers, d, &types, READBACK_BYTES, USAGE_TRANSFER_DST, true)?;
@@ -1050,7 +1107,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         DescriptorBufferInfo { buffer: g.emitters.buffer, offset: 0, range: EMITTERS_BYTES },
         DescriptorBufferInfo { buffer: g.refl[0].buffer, offset: 0, range: REFL_BYTES * g.pixel_room },
         DescriptorBufferInfo { buffer: g.refl[1].buffer, offset: 0, range: REFL_BYTES * g.pixel_room },
-        DescriptorBufferInfo { buffer: g.tiles.buffer, offset: 0, range: TILE_BYTES * g.tile_room },
+        DescriptorBufferInfo { buffer: g.tiles.buffer, offset: 0, range: 2 * TILE_BYTES * g.tile_room },
     ];
     let writes: Vec<WriteDescriptorSet> = infos
         .iter()
@@ -1141,8 +1198,9 @@ pub(crate) fn record(
     let n = sort_size(triangles + cached_last, g.keys as u64);
     let slot = g.next_slot;
     g.next_slot = (slot + 1) % RING;
-    if let Some((b, t)) = g.collect(slot, period_ns, mask) {
-        for (q, v) in [(&mut st.stats.build_ms, b), (&mut st.stats.trace_ms, t)] {
+    if let Some((b, t, parts)) = g.collect(slot, period_ns, mask) {
+        let [p0, p1, p2, p3] = &mut st.stats.parts_ms;
+        for (q, v) in [(&mut st.stats.build_ms, b), (&mut st.stats.trace_ms, t), (p0, parts[0]), (p1, parts[1]), (p2, parts[2]), (p3, parts[3])] {
             if q.len() == WINDOW {
                 q.pop_front();
             }
@@ -1160,9 +1218,12 @@ pub(crate) fn record(
         g.cache_copy_ptr = mapped as usize;
     }
     // The blocks' size: the reflections' `INTOXICATED_RT_BLOCK` pixels a
-    // side (2 unless set to 1), never coarser; the indirect light's the
-    // same, twice that while the GPU time stays over the budget, back again
-    // well under it.
+    // side (2 unless set to 1), never coarser; the indirect light's from
+    // the output's size (`gi_scale`), a pixel coarser for each budget step.
+    // The budget steps only after it held for `BUDGET_HOLD` looks in a row
+    // (over it to coarsen, under 40% of it to refine), so it does not swing;
+    // the indirect light's history is carried across a change (the GI pass
+    // finds it on the last frame's grid), not cleared.
     g.budget_frames += 1;
     if g.budget_frames >= BUDGET_FRAMES {
         g.budget_frames = 0;
@@ -1171,18 +1232,26 @@ pub(crate) fn record(
         // the budget leaves it, never under 1 ms.
         let room = (BUDGET_MS - mean(&st.stats.build_ms)).max(1.0);
         let trace = mean(&st.stats.trace_ms);
-        if trace > room && g.coarser < MAX_COARSER {
-            g.coarser += 1;
-        } else if trace < 0.5 * room && g.coarser > 0 {
-            g.coarser -= 1;
+        let want: i32 = if trace > room && g.coarser < MAX_COARSER {
+            1
+        } else if trace < 0.4 * room && g.coarser > 0 {
+            -1
+        } else {
+            0
+        };
+        g.budget_votes = if want == 0 || want.signum() != g.budget_votes.signum() { want } else { g.budget_votes + want };
+        if g.budget_votes.abs() >= BUDGET_HOLD {
+            g.coarser = (g.coarser as i32 + g.budget_votes.signum()) as u32;
+            g.budget_votes = 0;
         }
     }
     let rscale = if soft_on() { SOFT_BLOCK } else { block_size() };
-    let scales = (rscale, rscale * (1 + g.coarser));
-    let rescaled = g.scales != scales;
+    g.gi_base = gi_scale(extent, g.gi_base);
+    let scales = (rscale, g.gi_base + g.coarser);
+    let previous = g.scales;
     g.scales = scales;
     st.stats.scales = scales;
-    let clear_blocks = !g.blocks_cleared || rescaled;
+    let clear_blocks = !g.blocks_cleared || previous.0 != scales.0;
     let first_clear = !g.blocks_cleared;
     g.blocks_cleared = true;
     let dummy_was_ready = g.dummy_ready;
@@ -1226,6 +1295,8 @@ pub(crate) fn record(
     // contents index the old grid).
     if clear_blocks {
         (f.cmd_fill_buffer)(cmd, g.blocks.buffer, 0, BLOCK_BYTES * g.block_room, 0);
+    }
+    if first_clear {
         (f.cmd_fill_buffer)(cmd, g.gi[0].buffer, 0, g.gi_room, 0);
         (f.cmd_fill_buffer)(cmd, g.gi[1].buffer, 0, g.gi_room, 0);
         (f.cmd_fill_buffer)(cmd, g.gi_filtered[0].buffer, 0, g.gi_room / 4, 0);
@@ -1235,6 +1306,9 @@ pub(crate) fn record(
     }
     (f.cmd_fill_buffer)(cmd, g.globals.buffer, GLOBALS_SCALES, 4, scales.0);
     (f.cmd_fill_buffer)(cmd, g.globals.buffer, GLOBALS_SCALES + 4, 4, scales.1);
+    (f.cmd_fill_buffer)(cmd, g.globals.buffer, GLOBALS_SCALES + 12, 4, gi_gain().to_bits());
+    // The grid the indirect light's history was made on (0 before any).
+    (f.cmd_fill_buffer)(cmd, g.globals.buffer, GLOBALS_SCALES + 8, 4, if first_clear { scales.1 } else { previous.1.max(1) });
     g.barrier(cmd, STAGE_TRANSFER | STAGE_COMPUTE, ACCESS_TRANSFER_WRITE | ACCESS_SHADER_WRITE);
     let current = (triangles.min(capacity / capture::TRIANGLE_BYTES)) as u32;
     // This frame's draws and textures: the draws' codes by first triangle,
@@ -1427,10 +1501,18 @@ pub(crate) fn record(
         let tiles = [extent[0].div_ceil(LIGHT_TILE), extent[1].div_ceil(LIGHT_TILE)];
         if tiles[0] as u64 * tiles[1] as u64 <= g.tile_room {
             (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[LIGHTS]);
+            push(&super::super::ssr::Params { steps: 0, ..tp });
             (f.cmd_dispatch)(cmd, tiles[0].div_ceil(8), tiles[1].div_ceil(8), 1);
             g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
+            // Then their rays, one invocation a tile and light (`steps` 1).
+            push(&super::super::ssr::Params { steps: 1, ..tp });
+            (f.cmd_dispatch)(cmd, (tiles[0] * 8).div_ceil(8), tiles[1].div_ceil(8), 1);
+            g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
+            push(&tp);
         }
+        stamp(2);
         half(GI);
+        stamp(3);
         for step in [1u32, 2, 4] {
             g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
             push(&super::super::ssr::Params { steps: step, ..tp });
@@ -1438,7 +1520,11 @@ pub(crate) fn record(
         }
         g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
         push(&tp);
+    } else {
+        stamp(2);
+        stamp(3);
     }
+    stamp(4);
     // One ray per 2 by 2 block, then every pixel from the blocks around it.
     half(TRACE);
     g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
@@ -1462,7 +1548,7 @@ pub(crate) fn record(
             }
         }
     }
-    stamp(2);
+    stamp(5);
     if timed {
         g.pending[slot] = true;
     }
@@ -1472,22 +1558,24 @@ pub(crate) fn record(
 }
 
 /// After the reflections' compose has written its result: the indirect
-/// light applied to it, when it is on and was traced this frame. The same
-/// sets as the trace; `params` the reflections' push constants.
-pub(crate) fn record_gi_apply(cmd: *mut c_void, device: usize, ssr_set: u64, params: &super::super::ssr::Params, extent: [u32; 2]) {
-    if !gi_on() {
-        return;
-    }
+/// light applied to it, when it is on and was traced this frame, and the
+/// glow above white the bloom is to add (`ssr.comp` GIAPPLY). The same
+/// sets as the trace; `params` the reflections' push constants. Whether it
+/// ran (the bloom then reads the glow).
+pub(crate) fn record_gi_apply(cmd: *mut c_void, device: usize, ssr_set: u64, params: &super::super::ssr::Params, extent: [u32; 2]) -> bool {
     let st = state();
-    let Some(g) = st.gpus.iter().find(|g| g.device == device) else { return };
-    if g.gi_room < GI_BYTES * blocks_of(extent) || !st.stats.light {
-        return;
-    }
+    let Some(g) = st.gpus.iter().find(|g| g.device == device) else { return false };
+    let gi = gi_on() && g.gi_room >= GI_BYTES * blocks_of(extent) && st.stats.light;
     let f = &g.fns;
     let sets = [ssr_set, g.set, g.tex_sets[g.last_slot]];
     (f.cmd_bind_descriptor_sets)(cmd, BIND_POINT_COMPUTE, g.trace_layout, 0, 3, sets.as_ptr(), 0, std::ptr::null());
     let mut tp = *params;
-    tp.flags |= FLAG_LIGHT;
+    if st.stats.light {
+        tp.flags |= FLAG_LIGHT;
+    }
+    if gi {
+        tp.flags |= FLAG_GI;
+    }
     (f.cmd_push_constants)(
         cmd,
         g.trace_layout,
@@ -1498,6 +1586,7 @@ pub(crate) fn record_gi_apply(cmd: *mut c_void, device: usize, ssr_set: u64, par
     );
     (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[GI_APPLY]);
     (f.cmd_dispatch)(cmd, extent[0].div_ceil(8), extent[1].div_ceil(8), 1);
+    true
 }
 
 /// devctl `rt dump-cache <path>`: the cache's live triangles after the next
@@ -1615,13 +1704,14 @@ pub(crate) fn stats_line() -> String {
     let st = state();
     let s = &st.stats;
     format!(
-        "on={} reflections={} shade={} engine_light={} environment={} gi={} view={} soft={} blocks={}x{} gi_blocks={}x{} traced={} skipped={} keys={} {} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} gpu_samples={}{}",
+        "on={} reflections={} shade={} engine_light={} environment={} gi={} gi_gain={:.2} view={} soft={} blocks={}x{} gi_blocks={}x{} traced={} skipped={} keys={} {} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} lights_ms={:.3} gi_ms={:.3} gi_filter_ms={:.3} reflections_ms={:.3} reflections_p95={:.3} gpu_samples={}{}",
         is_on(),
         if super::super::ssr::reflections_on() { "on" } else { "off" },
         SHADES[shade().load(Relaxed)],
         if s.light { "bound" } else { "none" },
         if env_on() { "on" } else { "off" },
         if gi_on() { "on" } else { "off" },
+        gi_gain(),
         VIEWS[VIEW.load(Relaxed) as usize],
         if soft_on() { "on" } else { "off" },
         s.scales.0,
@@ -1636,6 +1726,11 @@ pub(crate) fn stats_line() -> String {
         p95(&s.build_ms),
         mean(&s.trace_ms),
         p95(&s.trace_ms),
+        mean(&s.parts_ms[0]),
+        mean(&s.parts_ms[1]),
+        mean(&s.parts_ms[2]),
+        mean(&s.parts_ms[3]),
+        p95(&s.parts_ms[3]),
         s.build_ms.len(),
         s.last_skip.as_ref().map_or(String::new(), |w| format!(" last_skip={w:?}"))
     )
@@ -1677,6 +1772,18 @@ mod tests {
         assert_eq!(blocks_of([1667, 1349]), 834 * 675);
         assert_eq!(blocks_of([2, 2]), 1);
         assert!(blocks_of([1667, 1349]) <= blocks_of(ROOM_FOR));
+    }
+
+    #[test]
+    fn the_indirect_light_is_sized_by_the_output_and_holds_near_a_step() {
+        assert_eq!(gi_scale([1667, 1349], 0), 2);
+        assert_eq!(gi_scale([3440, 1440], 0), 3);
+        assert_eq!(gi_scale([3840, 2160], 0), 4);
+        // Just over the 2 by 2 step: kept at 2 by 2 when it was, else 3.
+        assert_eq!(gi_scale([1920, 1300], 2), 2);
+        assert_eq!(gi_scale([1920, 1300], 0), 3);
+        // Far from it, the size follows.
+        assert_eq!(gi_scale([3440, 1440], 2), 3);
     }
 
     #[test]

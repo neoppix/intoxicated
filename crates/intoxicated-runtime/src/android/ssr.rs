@@ -2195,6 +2195,9 @@ fn record(
         compute_barrier(fns, cmd);
     }
     stamp(1);
+    // The glow pass ran: the trace image holds what is above white (see
+    // `rt::trace::record_gi_apply`), for the bloom.
+    let mut glow = false;
     if ssr {
         // With `INTOXICATED_RT=1` and `rt on`, the reflections are ray traced
         // and nothing else: the build and the trace in place of the march,
@@ -2246,7 +2249,7 @@ fn record(
         compute_barrier(fns, cmd);
         if traced {
             // The indirect light, on the compose's result (see `rt::trace`).
-            super::rt::trace::record_gi_apply(cmd, g.device, set, &rt_params, [w, h]);
+            glow = super::rt::trace::record_gi_apply(cmd, g.device, set, &rt_params, [w, h]);
             compute_barrier(fns, cmd);
         }
     }
@@ -2267,6 +2270,9 @@ fn record(
         let mut pp = *post_p;
         if ssr || dof {
             pp.flags |= post::SRC_RESULT;
+        }
+        if glow {
+            pp.flags |= post::GLOW;
         }
         post::record_bloom(g, cmd, set, post_images.ok_or("no bloom images")?, &pp);
     }

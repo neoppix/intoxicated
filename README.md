@@ -377,8 +377,16 @@ where the engine draws them blending, so they show in reflections at their
 own brightness (above white, so even a faint reflection of them glows), in
 view or not. In the indirect light below, each 16 by 16 pixel tile lists the
 eight Neon triangles that light it most, with whether they are in sight, and
-their light is taken exactly (each triangle's form factor at full brightness,
-no random samples), so the glow beside a Neon panel is strong and steady.
+their light is taken exactly (each triangle's form factor at half its engine
+brightness, no random samples), so the glow beside a Neon panel is strong and
+steady. A tile keeps the lights it chose the frame before (found through the
+last frame's camera and favoured by half again) and weighs them against up to
+1024 more, so its choice holds from frame to frame; the sight rays are cast
+one invocation per tile and light, new choices at once and kept ones in turn
+every fourth frame. With the bloom on, what the ray-traced reflections and
+the indirect light have above white (reflected Neon, its glow on a wall) is
+added to what the bloom blooms (INFERRED: the pass runs, the glow itself was
+not yet looked at).
 Terrain (grass, rock, sand) is captured too, without its swaying decoration
 grass and without water: its shaders pass on no colour, so it is grey until
 the screen has shown it, then in the colour the screen showed it in; terrain
@@ -390,18 +398,34 @@ moves, dark blue nothing), and `rt kind neon|terrain on|off` leaves a kind
 out, for bisecting.
 
 Diffuse indirect light, more experimental still and off unless
-`INTOXICATED_RT_GI=1` at start (devctl `rt gi on|off` then): one ray per 2
-by 2 pixels every other frame (in a checkerboard) in a cosine-weighted
-direction. A hit the screen shows takes its light from the screen, with the
-engine's own lamps in it; any other hit is lit as the engine lights it (one
-bounce; a miss takes the sky); the Neon light is added as above. The rays
-are gathered over up to 32 frames at the same point in the world (sooner
-forgotten when the light there changes), smoothed by three a-trous filter
-passes that stop at edges in depth and normal and between light and dark
-(guided by the noise measured at each point, as SVGF does), and put in place
-of the engine's own ambient light, so corners darken and coloured walls tint
-what faces them. It is computed before the reflections, so they show it. It
-takes about 160 MB more video memory when on.
+`INTOXICATED_RT_GI=1` at start (devctl `rt gi on|off` then), a hybrid of
+screen space and the traced scene, per block of pixels every other frame (in
+a checkerboard). First two slices around the view direction are marched
+across the screen, eight samples a side out to about 12 studs, with a
+visibility bitmask (after Therrien, Levesque and Gilet, 2023): each sample is
+taken as a slab about 0.75 studs deep behind what depth shows, the 32 sectors
+of the slice it hides are marked, and its screen colour lights the sectors it
+is first to hide, so nearby walls, floors and lit panels light a pixel with
+their textures and the engine's own lamps while what is behind them stays
+hidden. What no sample hid (the ray left the screen or passed everything)
+continues as one traced ray into an open sector: a hit the screen shows takes
+its light from the screen, any other hit is lit as the engine lights it, and
+open sky gives the engine's own ambient from that side (the sky's colour on
+the screen, taken as light, washed open places out). The Neon light is added
+as above. The bounces count `INTOXICATED_RT_GI_GAIN` times over (1.6 unless
+set, 0 to 4; devctl `rt gi-gain <x>`). The result is gathered over up to 32
+frames at the same point in the world (sooner forgotten when the light there
+changes), smoothed by three a-trous filter passes that stop at edges in depth
+and normal and between light and dark (guided by the noise measured at each
+point, as SVGF does), spread back over the pixels between the blocks'
+middles, and put in place of the engine's own ambient light (what it adds
+rolls off softly towards eight times the ambient; a pixel gets at most 30%
+darker), so corners darken and coloured walls tint what faces them. It is
+computed before the reflections, so they show it. It takes about 160 MB more
+video memory when on. Measured at 1667x1349: in the Timebomb Duels lobby, 2
+by 2 blocks, 0.2 ms for the Neon tiles, 1.0 ms for the indirect light and 0.3
+ms for its filter; with the camera still, two screenshots a second apart
+differ by 0.2 to 0.5 of 255 on average.
 
 A soft look (`INTOXICATED_RT_SOFT=1`, devctl `rt soft on|off`) traces on 4
 by 4 blocks and blurs the reflections widely, stretched down the screen as a
@@ -415,11 +439,16 @@ block each frame; each pixel keeps a history, found where the reflected thing
 was a frame ago (its mirror image, by the hit distance), held to what the
 pixels around it show now and kept over up to 12 frames while the camera is
 still and 3 while it turns, so reflected edges come out smooth rather than in
-block steps. The indirect light traces on the same blocks, twice as wide
-while the trace takes more than the 4.5 ms budget
-leaves after the hierarchy's build (`rt stats`: `blocks`, `gi_blocks`). Only
-at 2 by 2 with the indirect light at its finest do near curved pixels trace
-their own rays. `rt stats` also reports the render thread's time in the
+block steps. The indirect light's blocks follow the output's size (2 by 2
+up to about 2.4 million pixels, 3 by 3 up to about 5.4 million, as
+3440x1440, else 4 by 4, held near a step so a resize does not swing them),
+one pixel wider per step, up to two, while the trace takes more than the 4.5
+ms budget leaves after the hierarchy's build for three looks in a row (two
+seconds each at 60 fps), and back after three looks well under it; their
+history is carried across a change, not cleared (`rt stats`: `blocks`,
+`gi_blocks`, and the trace's parts `lights_ms`, `gi_ms`, `gi_filter_ms`,
+`reflections_ms`). Only at 2 by 2 with the indirect light not coarsened by
+the budget do near curved pixels trace their own rays. `rt stats` also reports the render thread's time in the
 client's capture hooks (`cpu_us_frame`, `cpu_ns_draw`).
 
 devctl `rt on` and `rt off` switch it while the game runs (with

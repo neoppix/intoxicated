@@ -130,6 +130,8 @@ layout(std430, set = BUFSET, binding = 6) buffer Globals {
     // blocks (`trace.rs` sets them each frame; ssr.comp).
     uint rscale;
     uint gscale;
+    uint prev_gscale;
+    float gi_gain;
 };
 // This frame's listed triangles that give off light (Neon parts), by index,
 // for the trace's light sampling (ssr.comp `emitter_light`).
