@@ -132,6 +132,10 @@ layout(std430, set = BUFSET, binding = 6) buffer Globals {
     uint gscale;
     uint prev_gscale;
     float gi_gain;
+    // Captured triangles (one in 16 counted) whose move is known, and that
+    // moved (`rt/build.comp` INSERT, for `rt stats`).
+    uint motion_known;
+    uint motion_moving;
 };
 // This frame's listed triangles that give off light (Neon parts), by index,
 // for the trace's light sampling (ssr.comp `emitter_light`).
@@ -155,6 +159,15 @@ layout(std430, set = BUFSET, binding = 9) buffer Slots { uint slots[]; };
 // This frame's draws: first triangle, texture code, source, 1 when the
 // pipeline blends; by first triangle.
 layout(std430, set = BUFSET, binding = 10) readonly buffer Draws { uvec4 draws[]; };
+// The motion (`trace.rs` match_draws): this frame's captured draws, (first
+// triangle, triangles, the same draw's first triangle the frame before or
+// ~0, 0); each captured triangle's middle and size (the sum of its edges),
+// this frame's and the last one's by the frame's parity, `cap` apart; and
+// each listed triangle's move since the last frame (w 1 where known, 0
+// where not: a draw not found again, or a triangle that changed shape).
+layout(std430, set = BUFSET, binding = 21) readonly buffer MotionDraws { uvec4 motion_draws[]; };
+layout(std430, set = BUFSET, binding = 22) buffer TriMarks { vec4 tri_marks[]; };
+layout(std430, set = BUFSET, binding = 23) buffer TriMotion { vec4 tri_motion[]; };
 
 // std430; `trace::BuildParams` mirrors it.
 layout(push_constant) uniform Params {
@@ -177,7 +190,8 @@ layout(push_constant) uniform Params {
     uint draw_count;
     // How far cached triangles are traced, in studs (float bits).
     uint reach_bits;
-    uint pad1;
+    // Entries in `motion_draws`.
+    uint motion_draw_count;
     uint pad2;
 } pc;
 
@@ -364,6 +378,24 @@ uint mix_bits(uint h, uint v) {
     return h * 5u + 0xe6546b64u;
 }
 
+// The captured draw triangle `i` came from, for its motion.
+uvec4 motion_draw_of(uint i) {
+    if (pc.motion_draw_count == 0u || motion_draws[0].x > i) {
+        return uvec4(0u, 0u, 0xffffffffu, 0u);
+    }
+    uint lo = 0u, hi = pc.motion_draw_count - 1u;
+    while (lo < hi) {
+        uint mid = (lo + hi + 1u) / 2u;
+        if (motion_draws[mid].x <= i) {
+            lo = mid;
+        } else {
+            hi = mid - 1u;
+        }
+    }
+    uvec4 m = motion_draws[lo];
+    return i < m.x + m.y ? m : uvec4(0u, 0u, 0xffffffffu, 0u);
+}
+
 // The draw triangle `i` came from: the last entry starting at or before it.
 uvec4 draw_of(uint i) {
     if (pc.draw_count == 0u || draws[0].x > i) {
@@ -403,6 +435,34 @@ void main() {
         tris[TRI_VEC4 * i + k] = vec4(W[k].xyz, uintBitsToFloat(col[k]));
     }
     uvec4 d = draw_of(i);
+    // Its move since the last frame: the same triangle of the same draw
+    // then (its middle), where it kept its size and moved less than 16
+    // studs; a cached one that was drawn in the same place the frame
+    // before is found not to have moved (below).
+    {
+        vec3 c = (W[0].xyz + W[1].xyz + W[2].xyz) / 3.0;
+        float size = distance(W[0].xyz, W[1].xyz) + distance(W[1].xyz, W[2].xyz) + distance(W[2].xyz, W[0].xyz);
+        uint par = frame & 1u;
+        tri_marks[par * pc.cap + i] = vec4(c, size);
+        vec4 mv = vec4(0.0);
+        uvec4 md = motion_draw_of(i);
+        if (md.z != 0xffffffffu) {
+            uint j = md.z + (i - md.x);
+            if (j < pc.cap) {
+                vec4 o = tri_marks[(1u - par) * pc.cap + j];
+                if (abs(o.w - size) < 0.02 * size + 1e-3 && distance(o.xyz, c) < 16.0 && !any(isnan(o))) {
+                    mv = vec4(c - o.xyz, 1.0);
+                }
+            }
+        }
+        tri_motion[i] = mv;
+        if ((i & 15u) == 0u && mv.w > 0.0) {
+            atomicAdd(motion_known, 1u);
+            if (dot(mv.xyz, mv.xyz) > 1e-4) {
+                atomicAdd(motion_moving, 1u);
+            }
+        }
+    }
     // Terrain passes on no colour (`capture::MODE_TERRAIN`): grey until the
     // screen has shown its cached triangle (ssr.comp `learn_colour`).
     bool terrain = (d.y >> 30) == 3u;
@@ -456,6 +516,10 @@ void main() {
         uint base = ((h2 + p) & mask) * SLOT_WORDS;
         uint t = slots[base + S_TAG];
         if (t == tag && slots[base + S_KEY] == h2) {
+            if (slots[base + S_SEEN] + 1u == frame) {
+                // Drawn here, to the bit, the frame before too.
+                tri_motion[i] = vec4(0.0, 0.0, 0.0, 1.0);
+            }
             uint streak = slots[base + S_SEEN] + 1u == frame ? min(slots[base + S_STREAK] + 1u, 65535u) : 1u;
             slots[base + S_STREAK] = streak;
             if (streak >= STABLE) {
@@ -615,6 +679,8 @@ void main() {
     if (at >= pc.cap) {
         return;
     }
+    // A cached triangle stays where it is.
+    tri_motion[at] = vec4(0.0, 0.0, 0.0, 1.0);
     for (uint q = 0u; q < 3u; ++q) {
         tris[TRI_VEC4 * at + q] = vec4(W[q], uintBitsToFloat(slots[base + S_COL + q]));
     }

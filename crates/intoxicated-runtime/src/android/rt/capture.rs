@@ -155,8 +155,8 @@ pub(crate) fn dump_dir() -> Option<&'static str> {
 /// The triangles our buffers are sized for: `INTOXICATED_RT_TRIANGLES` when
 /// set, else what `INTOXICATED_RT_MEMORY` (MiB) allows, else what an eighth
 /// of the GPU's largest device-local heap allows, at most 1536 MiB; a power
-/// of two from 131072 to 4194304. Each triangle takes about 600 bytes over
-/// the capture, the list to trace, the hierarchy and the cache.
+/// of two from 131072 to 4194304. Each triangle takes about 650 bytes over
+/// the capture, the list to trace, the hierarchy, the cache and its motion.
 pub(crate) fn capacity_triangles() -> u64 {
     static N: OnceLock<u64> = OnceLock::new();
     if let Some(&n) = N.get() {
@@ -183,7 +183,7 @@ pub(crate) fn capacity_triangles() -> u64 {
 const DUMP_BYTES: u64 = 128 << 20;
 
 /// Bytes a triangle of room takes over every buffer sized by it.
-pub(crate) const BYTES_PER_TRIANGLE: u64 = 600;
+pub(crate) const BYTES_PER_TRIANGLE: u64 = 648;
 
 /// The power of two of triangles a budget of bytes allows.
 pub(crate) fn triangles_for(budget: u64) -> u64 {
@@ -306,6 +306,10 @@ struct Gpu {
     /// (serial, view, layout).
     draws: Vec<[u32; 4]>,
     textures: Vec<(u32, u64, u32)>,
+    /// Every captured draw this frame: (first triangle, triangles, a key
+    /// from its pipeline, index count and instances), for matching draws
+    /// across frames (the trace's motion).
+    motion_draws: Vec<[u32; 3]>,
     /// The per-frame uniform block a captured draw last read (buffer,
     /// offset, range): the engine's lighting, read by the trace.
     frame_block: Option<(u64, u64, u64)>,
@@ -1149,6 +1153,7 @@ pub(crate) fn pass_beginning(pass: &Pass) {
         g.overflowed = false;
         g.draws.clear();
         g.textures.clear();
+        g.motion_draws.clear();
         g.frame_block = None;
         g.frame = presents;
         st.stats.frames += 1;
@@ -1384,6 +1389,8 @@ pub(crate) fn drew(cmd: *mut c_void, kind: &'static str, count: u32, instances: 
                 if g.draws.last().map_or((0, 0, 0), |d| (d[1], d[2], d[3])) != (code, blended, emission) {
                     g.draws.push([(g.bytes / TRIANGLE_BYTES) as u32, code, blended, emission]);
                 }
+                let key = (bound ^ (bound >> 32)) as u32 ^ count.wrapping_mul(0x9e37_79b9) ^ instances.wrapping_mul(0x85eb_ca6b);
+                g.motion_draws.push([(g.bytes / TRIANGLE_BYTES) as u32, (bytes / TRIANGLE_BYTES) as u32, key]);
                 g.bytes += bytes;
                 st.stats.draws_captured += 1;
                 if code != 0 && !terrain {
@@ -1504,6 +1511,11 @@ pub(crate) fn frame_captured(device: usize) -> Option<Captured> {
 pub(crate) fn frame_textures(device: usize) -> (Vec<[u32; 4]>, Vec<(u32, u64, u32)>) {
     let st = state();
     st.gpus.iter().find(|g| g.device == device).map_or((Vec::new(), Vec::new()), |g| (g.draws.clone(), g.textures.clone()))
+}
+
+/// This frame's captured draws on `device`: (first triangle, triangles, key).
+pub(crate) fn frame_motion_draws(device: usize) -> Vec<[u32; 3]> {
+    state().gpus.iter().find(|g| g.device == device).map_or(Vec::new(), |g| g.motion_draws.clone())
 }
 
 /// The engine's per-frame uniform block this frame's captured draws read:
@@ -1796,6 +1808,7 @@ fn make_gpu(device: usize, triangles: u64) -> Result<Gpu, String> {
         overflowed: false,
         draws: Vec::new(),
         textures: Vec::new(),
+        motion_draws: Vec::new(),
         frame_block: None,
     };
     let made = (|| {

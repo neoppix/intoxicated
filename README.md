@@ -385,8 +385,26 @@ last frame's camera and favoured by half again) and weighs them against up to
 one invocation per tile and light, new choices at once and kept ones in turn
 every fourth frame. With the bloom on, what the ray-traced reflections and
 the indirect light have above white (reflected Neon, its glow on a wall) is
-added to what the bloom blooms (INFERRED: the pass runs, the glow itself was
-not yet looked at).
+added to what the bloom blooms (`INTOXICATED_RT_GLOW=0` or devctl `rt glow
+off` leaves it out; INFERRED: the pass runs, but in the Timebomb Duels lobby
+screenshots with it on and off did not differ, and no reflection bright
+enough was in view to show it).
+
+What moves is followed from frame to frame: each captured draw is matched to
+the same draw the frame before (the same pipeline, index count and
+instances, its same occurrence in the frame, as many triangles) and each of
+its triangles to the same triangle then, kept where it has the same size and
+moved less than 16 studs; a cached part drawn in the same place the frame
+before has not moved. The triangle under a pixel (found with the ray from the
+camera, within 48 studs) so gives its move, and the indirect light and the
+reflections find their history where the point was the frame before rather
+than where the camera alone puts it, and keep a short history while it moves
+(4 frames for the light, 3 for the reflections). `rt stats` counts the
+captured triangles whose move is known and that moved (`motion_known`,
+`motion_moving`; measured: in Jailbreak's menu flight nearly every captured
+triangle matched, in the Timebomb Duels lobby the walking players moved).
+Farther than 48 studs, and for what was not matched, only the camera's move
+is taken.
 Terrain (grass, rock, sand) is captured too, without its swaying decoration
 grass and without water: its shaders pass on no colour, so it is grey until
 the screen has shown it, then in the colour the screen showed it in; terrain

@@ -129,7 +129,9 @@ const PIPELINES: usize = 18;
 /// by serial, 12 the environment, 13 and 14 the indirect light, 15 and 16
 /// the filtered indirect light, 17 the triangles that give off light, 18
 /// and 19 the reflections' history, 20 the Neon lights per screen tile.
-const BINDINGS: [u32; 20] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+const BINDINGS: [u32; 24] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24];
+/// Captured draws a frame the motion can match (`capture::frame_motion_draws`).
+const MAX_MOTION_DRAWS: usize = 4096;
 /// Screen tiles of the Neon light lists (`LIGHT_TILE` in ssr.comp), and
 /// bytes a tile (`LIGHTS_PER_TILE` entries).
 const LIGHT_TILE: u32 = 16;
@@ -161,7 +163,9 @@ const TEXTURES: u32 = capture::MAX_TEXTURES as u32;
 /// Bytes of the globals (`build.comp`'s `Globals`) and of what `rt stats`
 /// reads back of them.
 const GLOBALS_BYTES: u64 = 512;
-const GLOBALS_READ: usize = 77;
+const GLOBALS_READ: usize = 83;
+/// The motion's counts in the globals (`motion_known`, `motion_moving`).
+const GLOBALS_MOTION: u64 = 324;
 /// Our mapped copy of the globals' first `GLOBALS_READ` words.
 const READBACK_BYTES: u64 = 512;
 /// Byte offset of `full_rate` in the globals.
@@ -308,6 +312,27 @@ const MAX_COARSER: u32 = 2;
 /// Looks in a row the budget must agree on before it steps.
 const BUDGET_HOLD: i32 = 3;
 
+/// This frame's captured draws (first triangle, triangles, key), each with
+/// the first triangle of the same draw the frame before (the same key, its
+/// same occurrence in the frame, as many triangles), or !0: at most
+/// `MAX_MOTION_DRAWS`, in order. `last` becomes this frame's.
+pub(crate) fn match_draws(now: &[[u32; 3]], last: &mut std::collections::HashMap<(u32, u32), (u32, u32)>) -> Vec<[u32; 4]> {
+    let mut seen: std::collections::HashMap<u32, u32> = std::collections::HashMap::with_capacity(now.len());
+    let mut out = Vec::with_capacity(now.len().min(MAX_MOTION_DRAWS));
+    let mut next = std::collections::HashMap::with_capacity(now.len());
+    for &[first, tris, key] in now {
+        let nth = seen.entry(key).or_insert(0);
+        let before = last.get(&(key, *nth)).filter(|&&(_, n)| n == tris).map_or(!0, |&(f, _)| f);
+        next.insert((key, *nth), (first, tris));
+        *nth += 1;
+        if out.len() < MAX_MOTION_DRAWS {
+            out.push([first, tris, before, 0]);
+        }
+    }
+    *last = next;
+    out
+}
+
 /// The indirect light's blocks, pixels a side, for an output of `extent`:
 /// about 600,000 blocks at most (2 by 2 up to about 2.4 million pixels, 3
 /// by 3 up to about 5.4 million, as 3440x1440, else 4 by 4). Near a step
@@ -390,6 +415,24 @@ pub(crate) fn set_gi_gain(v: f32) -> Result<(), String> {
     }
     gi_gain_bits().store(v.to_bits(), Relaxed);
     Ok(())
+}
+
+/// Whether the bloom adds what the ray-traced reflections and indirect
+/// light have above white (`INTOXICATED_RT_GLOW=0` or devctl `rt glow
+/// off` leaves it out).
+pub const GLOW_ENV: &str = "INTOXICATED_RT_GLOW";
+static GLOW_ON: OnceLock<AtomicBool> = OnceLock::new();
+
+fn glow_switch() -> &'static AtomicBool {
+    GLOW_ON.get_or_init(|| AtomicBool::new(std::env::var(GLOW_ENV).map_or(true, |v| v.trim() != "0")))
+}
+
+pub(crate) fn glow_on() -> bool {
+    glow_switch().load(Relaxed)
+}
+
+pub(crate) fn set_glow(on: bool) {
+    glow_switch().store(on, Relaxed);
 }
 
 pub(crate) fn gi_requested() -> bool {
@@ -579,6 +622,16 @@ struct Gpu {
     /// The Neon lights per screen tile, and the tiles it has room for.
     tiles: Owned,
     tile_room: u64,
+    /// The motion: this frame's draws with where each was the frame before
+    /// (16 bytes a draw), each captured triangle's middle and size this
+    /// frame and the last (by parity), its move since the last frame, and
+    /// the reflections' blocks' moves (`build.comp` INSERT, `ssr.comp`).
+    motion_draws: Owned,
+    tri_marks: Owned,
+    tri_motion: Owned,
+    block_motion: Owned,
+    /// The last frame's draws, (key, occurrence) to first triangle.
+    last_draws: std::collections::HashMap<(u32, u32), (u32, u32)>,
     /// The ring slot of the last trace, whose set 2 the apply pass binds.
     last_slot: usize,
     /// A zeroed stand-in for the engine's per-frame uniform block.
@@ -694,6 +747,10 @@ impl Gpu {
             self.refl[0],
             self.refl[1],
             self.tiles,
+            self.motion_draws,
+            self.tri_marks,
+            self.tri_motion,
+            self.block_motion,
             self.no_frame_block,
             self.readback,
             self.cache_copy,
@@ -794,6 +851,11 @@ fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool, extent: [u32; 2]) -
         // keeps its reflections' history.
         pixel_room: extent[0].max(3440) as u64 * extent[1].max(1440) as u64,
         tiles: Owned::default(),
+        motion_draws: Owned::default(),
+        tri_marks: Owned::default(),
+        tri_motion: Owned::default(),
+        block_motion: Owned::default(),
+        last_draws: std::collections::HashMap::new(),
         tile_room: extent[0].max(ROOM_FOR[0]).div_ceil(LIGHT_TILE) as u64 * extent[1].max(ROOM_FOR[1]).div_ceil(LIGHT_TILE) as u64,
         last_slot: 0,
         no_frame_block: Owned::default(),
@@ -981,6 +1043,10 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         make_buffer(&g.buffers, d, &types, REFL_BYTES * g.pixel_room, usage, false)?,
     ];
     g.tiles = make_buffer(&g.buffers, d, &types, 2 * TILE_BYTES * g.tile_room, usage, false)?;
+    g.motion_draws = make_buffer(&g.buffers, d, &types, 16 * MAX_MOTION_DRAWS as u64, usage, false)?;
+    g.tri_marks = make_buffer(&g.buffers, d, &types, 2 * 16 * listed(), usage, false)?;
+    g.tri_motion = make_buffer(&g.buffers, d, &types, 16 * listed(), usage, false)?;
+    g.block_motion = make_buffer(&g.buffers, d, &types, 8 * g.block_room, usage, false)?;
     g.no_frame_block = make_buffer(&g.buffers, d, &types, FRAME_BLOCK_BYTES, USAGE_UNIFORM | USAGE_TRANSFER_DST, false)?;
     make_textures(g, &types)?;
     g.readback = make_buffer(&g.buffers, d, &types, READBACK_BYTES, USAGE_TRANSFER_DST, true)?;
@@ -1108,6 +1174,10 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         DescriptorBufferInfo { buffer: g.refl[0].buffer, offset: 0, range: REFL_BYTES * g.pixel_room },
         DescriptorBufferInfo { buffer: g.refl[1].buffer, offset: 0, range: REFL_BYTES * g.pixel_room },
         DescriptorBufferInfo { buffer: g.tiles.buffer, offset: 0, range: 2 * TILE_BYTES * g.tile_room },
+        DescriptorBufferInfo { buffer: g.motion_draws.buffer, offset: 0, range: 16 * MAX_MOTION_DRAWS as u64 },
+        DescriptorBufferInfo { buffer: g.tri_marks.buffer, offset: 0, range: 2 * 16 * listed() },
+        DescriptorBufferInfo { buffer: g.tri_motion.buffer, offset: 0, range: 16 * listed() },
+        DescriptorBufferInfo { buffer: g.block_motion.buffer, offset: 0, range: 8 * g.block_room },
     ];
     let writes: Vec<WriteDescriptorSet> = infos
         .iter()
@@ -1284,6 +1354,7 @@ pub(crate) fn record(
     // `full_rate`: std430 puts the `sky` vec4 before it at 192, so 208.
     (f.cmd_fill_buffer)(cmd, g.globals.buffer, GLOBALS_FULL_RATE, 4, 0);
     (f.cmd_fill_buffer)(cmd, g.globals.buffer, GLOBALS_EMITTERS, 4, 0);
+    (f.cmd_fill_buffer)(cmd, g.globals.buffer, GLOBALS_MOTION, 8, 0);
     (f.cmd_fill_buffer)(cmd, g.flags.buffer, 0, 4 * n as u64, 0);
     if first_clear {
         (f.cmd_fill_buffer)(cmd, g.globals.buffer, 16, GLOBALS_BYTES - 16, 0);
@@ -1365,6 +1436,12 @@ pub(crate) fn record(
     if !draws.is_empty() {
         (f.cmd_update_buffer)(cmd, g.draws.buffer, 0, 16 * draws.len() as u64, draws.as_ptr().cast());
     }
+    // The draws matched to the last frame's (same key, same occurrence of
+    // it), for the motion of what moves.
+    let matched = match_draws(&capture::frame_motion_draws(device), &mut g.last_draws);
+    if !matched.is_empty() {
+        (f.cmd_update_buffer)(cmd, g.motion_draws.buffer, 0, 16 * matched.len() as u64, matched.as_ptr().cast());
+    }
     (f.cmd_update_buffer)(cmd, g.tex_map.buffer, 0, 8 * TEX_MAP as u64, map.as_ptr().cast());
     if !dummy_was_ready {
         // Our image, never written, in the layout its descriptors name.
@@ -1399,7 +1476,7 @@ pub(crate) fn record(
         slot_count: slots(),
         size: extent[0] | (extent[1] << 16),
         draw_count: draws.len() as u32,
-        pad: [reach().to_bits(), 0, 0],
+        pad: [reach().to_bits(), matched.len() as u32, 0],
     };
     let dispatch = |pipeline: usize, bp: &BuildParams, groups: u32, layout: u64| {
         (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[pipeline]);
@@ -1586,7 +1663,7 @@ pub(crate) fn record_gi_apply(cmd: *mut c_void, device: usize, ssr_set: u64, par
     );
     (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[GI_APPLY]);
     (f.cmd_dispatch)(cmd, extent[0].div_ceil(8), extent[1].div_ceil(8), 1);
-    true
+    glow_on()
 }
 
 /// devctl `rt dump-cache <path>`: the cache's live triangles after the next
@@ -1675,7 +1752,7 @@ fn fit_text(fit: Option<[u32; GLOBALS_READ]>) -> String {
     format!(
         "fit=ok fit_samples={} fov_x={:.2} fov_y={:.2} near={:.4} forward_len={:.4} world_up={:.3},{:.3},{:.3} exposure={:.3} \
          camera={:.1},{:.1},{:.1} cache_listed={} cache_new={} cache_dropped={} cache_full={} cache_generation={} \
-         list_cut={} fit_failures={} full_rate_pixels={} emitters={}",
+         list_cut={} fit_failures={} full_rate_pixels={} emitters={} motion_known={} motion_moving={}",
         w[1],
         2.0 * f(4).atan().to_degrees(),
         2.0 * f(5).atan().to_degrees(),
@@ -1696,7 +1773,9 @@ fn fit_text(fit: Option<[u32; GLOBALS_READ]>) -> String {
         w[40],
         w[41],
         w[GLOBALS_FULL_RATE as usize / 4],
-        w[GLOBALS_EMITTERS as usize / 4]
+        w[GLOBALS_EMITTERS as usize / 4],
+        16 * w[GLOBALS_MOTION as usize / 4],
+        16 * w[GLOBALS_MOTION as usize / 4 + 1]
     )
 }
 
@@ -1704,7 +1783,7 @@ pub(crate) fn stats_line() -> String {
     let st = state();
     let s = &st.stats;
     format!(
-        "on={} reflections={} shade={} engine_light={} environment={} gi={} gi_gain={:.2} view={} soft={} blocks={}x{} gi_blocks={}x{} traced={} skipped={} keys={} {} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} lights_ms={:.3} gi_ms={:.3} gi_filter_ms={:.3} reflections_ms={:.3} reflections_p95={:.3} gpu_samples={}{}",
+        "on={} reflections={} shade={} engine_light={} environment={} gi={} gi_gain={:.2} glow={} view={} soft={} blocks={}x{} gi_blocks={}x{} traced={} skipped={} keys={} {} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} lights_ms={:.3} gi_ms={:.3} gi_filter_ms={:.3} reflections_ms={:.3} reflections_p95={:.3} gpu_samples={}{}",
         is_on(),
         if super::super::ssr::reflections_on() { "on" } else { "off" },
         SHADES[shade().load(Relaxed)],
@@ -1712,6 +1791,7 @@ pub(crate) fn stats_line() -> String {
         if env_on() { "on" } else { "off" },
         if gi_on() { "on" } else { "off" },
         gi_gain(),
+        if glow_on() { "on" } else { "off" },
         VIEWS[VIEW.load(Relaxed) as usize],
         if soft_on() { "on" } else { "off" },
         s.scales.0,
@@ -1772,6 +1852,15 @@ mod tests {
         assert_eq!(blocks_of([1667, 1349]), 834 * 675);
         assert_eq!(blocks_of([2, 2]), 1);
         assert!(blocks_of([1667, 1349]) <= blocks_of(ROOM_FOR));
+    }
+
+    #[test]
+    fn draws_match_by_key_and_occurrence() {
+        let mut last = std::collections::HashMap::new();
+        assert_eq!(match_draws(&[[0, 10, 7], [10, 5, 7], [15, 3, 9]], &mut last), vec![[0, 10, !0, 0], [10, 5, !0, 0], [15, 3, !0, 0]]);
+        // The second frame: the key-9 draw first now, and the second key-7
+        // draw with another size matches nothing.
+        assert_eq!(match_draws(&[[0, 3, 9], [3, 10, 7], [13, 6, 7]], &mut last), vec![[0, 3, 15, 0], [3, 10, 0, 0], [13, 6, !0, 0]]);
     }
 
     #[test]

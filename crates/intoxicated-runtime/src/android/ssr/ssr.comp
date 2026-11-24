@@ -556,7 +556,16 @@ layout(std430, set = 1, binding = 6) buffer Globals {
     uint prev_gscale;
     // How strongly the indirect light's bounces show (`trace.rs` GI_GAIN).
     float gi_gain;
+    // Captured triangles (one in 16 counted) whose move is known, and that
+    // moved (`rt/build.comp` INSERT, for `rt stats`).
+    uint motion_known;
+    uint motion_moving;
 };
+// Each listed triangle's move since the last frame, in studs (w 1 where
+// known; `rt/build.comp` INSERT), and per reflection block the move of the
+// triangle under its ray's pixel (as halves: x, y; z, known).
+layout(std430, set = 1, binding = 23) readonly buffer TriMotion { vec4 tri_motion[]; };
+layout(std430, set = 1, binding = 24) buffer BlockMotion { uvec2 block_motion[]; };
 // This frame's listed triangles that give off light (`rt/build.comp`).
 layout(std430, set = 1, binding = 17) readonly buffer Emitters { uint emitters[]; };
 const uint MAX_EMITTERS = 16384u;
@@ -877,10 +886,14 @@ uint g_own_mode = 0u;
 // engine's decoration grass, particles: things that sway or change every
 // frame); true beyond it, where it is not looked for.
 bool g_own_found = true;
+// The move since the last frame of the triangle `rt_normal` found (w 1
+// where known; 0 where it found none or its move is not known).
+vec4 g_own_motion = vec4(0.0);
 
 vec3 rt_normal(vec3 P, vec3 N) {
     g_own_mode = 0u;
     g_own_found = true;
+    g_own_motion = vec4(0.0);
     float dist = length(P) * g_near;
     // Further away a triangle covers a few pixels and the evened-out normal
     // is as good, for no ray.
@@ -896,6 +909,10 @@ vec3 rt_normal(vec3 P, vec3 N) {
         return N;
     }
     g_own_mode = floatBitsToUint(tris[TRI_VEC4 * tri + 4u].z) >> 30;
+    g_own_motion = tri_motion[tri];
+    if (any(isnan(g_own_motion)) || any(isinf(g_own_motion))) {
+        g_own_motion = vec4(0.0);
+    }
     uvec4 packed = floatBitsToUint(tris[TRI_VEC4 * tri + 5u]);
     if ((packed.w & 1u) == 0u) {
         return N;
@@ -1552,8 +1569,12 @@ void main() {
     vec3 n = normalize(world_dir(nv));
     vec3 X = to_world(P);
     float dist = length(P) * g_near;
-    // The last frame's light at this point, on the last frame's grid.
-    vec3 r = X - prev_pos.xyz;
+    // The last frame's light at this point, on the last frame's grid:
+    // where the point was then (moved back by its triangle's move where
+    // known: a character, a car), a short history while it moves.
+    vec3 Xp = X - (g_own_motion.w > 0.0 ? g_own_motion.xyz : vec3(0.0));
+    bool moving = g_own_motion.w > 0.0 && dot(g_own_motion.xyz, g_own_motion.xyz) > 1e-4;
+    vec3 r = Xp - prev_pos.xyz;
     vec3 v = vec3(dot(r, prev_right.xyz), dot(r, prev_up.xyz), dot(r, prev_forward.xyz));
     float frames = 0.0;
     vec3 old = vec3(0.0);
@@ -1574,9 +1595,9 @@ void main() {
             vec2 mo = unpackHalf2x16(e1.z);
             // The same point within its block's reach on that grid.
             float reach_ = 0.02 * dist + 0.05 + 0.5 * float(max(ps, grid_scale())) * dist * 2.0 * g_tan.y / float(pc.size.y);
-            if (bn.y > 0.0 && distance(X, Y) < reach_ && dot(m, n) > 0.9
+            if (bn.y > 0.0 && distance(Xp, Y) < reach_ && dot(m, n) > 0.9
                 && !any(isnan(o)) && !any(isinf(o)) && !any(isnan(mo)) && !any(isinf(mo))) {
-                frames = bn.y;
+                frames = moving ? min(bn.y, 4.0) : bn.y;
                 old = o;
                 moments_old = mo;
             }
@@ -2169,16 +2190,27 @@ void main() {
     float t = unpackHalf2x16(blocks[hb.y * hs.x + hb.x].w).x;
     float far_ = 4096.0;
     float th = clamp(t, 0.0, far_);
-    // Mirror image for a mirror, the surface itself as it gets rough.
-    vec3 Y = mix(X + V * th, X, clamp(pc.roughness * 2.0, 0.0, 1.0));
+    // The move of the surface under the block since the last frame (a
+    // character, a car; 0 where not known), and the mirror image for a
+    // mirror, the surface itself as it gets rough, both moved back by it.
+    uvec2 bm = block_motion[hb.y * hs.x + hb.x];
+    vec4 mv = vec4(unpackHalf2x16(bm.x), unpackHalf2x16(bm.y));
+    if (any(isnan(mv)) || any(isinf(mv)) || mv.w <= 0.0) {
+        mv = vec4(0.0);
+    }
+    bool moving = dot(mv.xyz, mv.xyz) > 1e-4;
+    vec3 Y = mix(X + V * th, X, clamp(pc.roughness * 2.0, 0.0, 1.0)) - mv.xyz;
     float frames = 0.0;
     vec4 hist = vec4(0.0);
     float camera_turn = 1.0 - dot(forward.xyz, prev_forward.xyz);
     float moved = distance(cam_pos.xyz, prev_pos.xyz);
     float most = mix(12.0, 3.0, max(smoothstep(0.0002, 0.004, camera_turn), smoothstep(0.05, 1.0, moved)));
+    if (moving) {
+        most = min(most, 3.0);
+    }
     if (prev_camera.w > 0.0) {
         // Where the surface point was on the screen, and its depth then.
-        vec3 r = X - prev_pos.xyz;
+        vec3 r = X - mv.xyz - prev_pos.xyz;
         vec3 vs = vec3(dot(r, prev_right.xyz), dot(r, prev_up.xyz), dot(r, prev_forward.xyz));
         vec3 ry = Y - prev_pos.xyz;
         vec3 vy = vec3(dot(ry, prev_right.xyz), dot(ry, prev_up.xyz), dot(ry, prev_forward.xyz));
@@ -2502,6 +2534,7 @@ void main() {
         }
     }
     uint i = uint(b.y) * hs.x + uint(b.x);
+    block_motion[i] = uvec2(packHalf2x16(g_own_motion.xy), packHalf2x16(g_own_motion.zw));
     // The history is kept per pixel (RTEMPORAL); here the hit distance
     // for its reprojection, and whether the block is on a curved mesh.
     blocks[i] = uvec4(packHalf2x16(r.rg), packHalf2x16(r.ba), from, packHalf2x16(vec2(min(g_hit_t, 60000.0), curved ? 1.0 : 0.0)));
