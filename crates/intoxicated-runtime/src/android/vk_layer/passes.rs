@@ -6,10 +6,10 @@
 //!
 //! The hooks here, and the image and view hooks in `vulkan_etc` that feed
 //! the registry, are handed out only when [`wanted`]: `INTOXICATED_TRACE_PASSES`
-//! is set, `INTOXICATED_SSR=1`, `INTOXICATED_DOF=1` or `INTOXICATED_BLOOM=1`,
-//! or dev control is on (devctl `passes`, `depthshot`, `ssr`, `dof` and
-//! `bloom` need them). Otherwise the getters hand out exactly
-//! what they did before.
+//! is set, one of the effects drawn before the HUD is switched on at start
+//! (`INTOXICATED_SSR=1`, `_DOF`, `_BLOOM`, `_LENS` or `_SHARPEN`), or dev
+//! control is on (devctl `passes`, `depthshot` and the effects' verbs need
+//! them). Otherwise the getters hand out exactly what they did before.
 //!
 //! When they are handed out, the creation hooks (render passes,
 //! framebuffers, images, views) always describe what was created, which is
@@ -18,8 +18,8 @@
 //! begin and compute binds the reflections follow) cost one relaxed load of
 //! [`WATCH`] and the forward, until something is watching: a trace for one
 //! frame, a depth capture until it is taken, or the effects recorded before
-//! the swapchain pass (reflections, depth of field and bloom, all in
-//! `android::ssr`) while any of them is on.
+//! the swapchain pass (reflections, depth of field, bloom, lens and sharpen,
+//! all in `android::ssr`) while any of them is on.
 //!
 //! # The trace
 //!
@@ -56,7 +56,7 @@ const DEFAULT_TRACE_AT: u64 = 600;
 pub(crate) static WATCH: AtomicU32 = AtomicU32::new(0);
 pub(crate) const WATCH_TRACE: u32 = 0x1;
 pub(crate) const WATCH_DEPTH: u32 = 0x2;
-/// The reflections, the depth of field or the bloom (`android::ssr`).
+/// Any effect drawn before the HUD (`android::ssr`).
 pub(crate) const WATCH_POST: u32 = 0x4;
 
 /// The present count at which the next trace starts; `u64::MAX` for none.
@@ -1342,7 +1342,7 @@ extern "C" fn queue_submit2(queue: *mut c_void, count: u32, submits: *const c_vo
     submit(&QUEUE_SUBMIT2, (64, 32, 40, 32, 16), queue, count, submits, fence)
 }
 
-// ------------------------------------------------------------ for the reflections, depth of field and bloom
+// ------------------------------------------------------------ for the effects drawn before the HUD
 //
 // The start of a recording, and the engine's compute state, which our
 // dispatch disturbs and puts back (see `android::ssr`). Graphics binds are

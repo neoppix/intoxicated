@@ -282,6 +282,34 @@ crosshair is on; mode 2 can settle on the floor just behind the character when
 little else is in view (INFERRED); and the studs of the fixed focus assume a
 near plane of 0.1 studs, which was not measured.
 
+Lens effects and sharpening are two more, each off by default and drawn
+after the bloom, sharpening last, so the HUD is never split into colours or
+sharpened:
+
+- `INTOXICATED_LENS=1`: chromatic aberration, red and blue pulled apart
+  towards the screen edges and not at all in the middle
+  (`_ABERRATION`, pixels at 1080p in the corners, default 1.5), a vignette
+  (`_VIGNETTE`, 0.15) and a rainbow fringe just outside the brightest areas,
+  taken from the bloom's chain (`_HALO`, 0.15; the lens runs the chain
+  itself when the bloom is off). Looks: `subtle` (the default), `prism`,
+  `film`.
+- `INTOXICATED_SHARPEN=1`: contrast adaptive sharpening, written for
+  Intoxicated from the idea of AMD's FidelityFX CAS: fine texture detail is
+  raised most where the neighbourhood has room for it, edges already at full
+  contrast barely, and no pixel changes by more than `_LIMIT` (0.1).
+  `_STRENGTH` is 0.5; `_DEPTH_AWARE=1` (the default) keeps it from reaching
+  across depth edges, so outlines get no halo. Looks: `light` (the default),
+  `crisp`, `crunchy`.
+
+devctl takes `lens` and `sharpen` with the same words. At 3362x1349 on an
+RTX 4070 Ti on Timebomb Duels the sharpen took about 0.14 ms of GPU time per
+frame alone and about 0.2 ms after other effects (it copies the scene once
+first), the lens about 0.11 ms with the bloom on and about 0.15 ms when it
+runs the bloom chain itself; frame times did not change measurably (p50 4.2
+ms). Neither shows anything that is not drawn: the aberration moves drawn
+colours by a few pixels, the vignette only darkens and the fringe only adds
+light around what is already bright.
+
 When the disk holding the profile's Roblox data runs short, the client says so:
 below 2 GiB free as it hands Roblox its window, below 512 MiB again when the
 run ends. The engine itself never reports a full disk.

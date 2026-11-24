@@ -1,11 +1,14 @@
 //! Screen-space reflections: `INTOXICATED_SSR=1`, and devctl `ssr` to turn
 //! them on and off, change how they look and read their GPU cost while the
 //! game runs. The same point of the frame also takes the depth of field
-//! (`INTOXICATED_DOF=1`, devctl `dof`) and the bloom (`INTOXICATED_BLOOM=1`,
-//! devctl `bloom`) of [`post`], each switched on its own, recorded in the
-//! order of [`EFFECTS`]: reflections, depth of field, bloom. Everything
-//! below about the frame, the match, what is put back and our objects holds
-//! for all three; a frame that does not match gets none of them.
+//! (`INTOXICATED_DOF=1`, devctl `dof`), the bloom (`INTOXICATED_BLOOM=1`,
+//! devctl `bloom`), the lens effects (`INTOXICATED_LENS=1`, devctl `lens`)
+//! and the sharpening (`INTOXICATED_SHARPEN=1`, devctl `sharpen`) of
+//! [`post`], each switched on its own, recorded in the order of
+//! [`EFFECTS`]: reflections, depth of field, bloom, lens, sharpen.
+//! Everything below about the frame, the match, what is put back and our
+//! objects holds for all of them; a frame that does not match gets none of
+//! them.
 //!
 //! The engine's frame is not changed in any other way than this: a few
 //! commands of ours are recorded into its own command buffer, through the
@@ -55,16 +58,17 @@
 //! with `COMPOSE`) that blurs that over the pixel's own surface, blends it
 //! into the scene colour and writes every pixel, with a reflection blended in
 //! or unchanged, packed in the engine's colour format into a 32-bit image of
-//! ours; then the depth of field's and the bloom's dispatches when they are
-//! on ([`post`]), each reading the scene from that image (or from the
-//! engine's when nothing ran before it) and writing it back there; one copy
-//! of that image over the engine's; and a barrier that puts the engine's
-//! image back in the layout it was in. The depth copy is made when the
-//! reflections or the depth of field need it. Reading needs `SAMPLED` and the copy
+//! ours; then the depth of field's, the bloom's, the lens's and the
+//! sharpen's dispatches when they are on ([`post`]), each reading the scene
+//! from that image (or from the engine's when nothing ran before it) and
+//! writing it back there; one copy of that image over the engine's; and a
+//! barrier that puts the engine's image back in the layout it was in. The
+//! depth copy is made when the reflections, the depth of field or a
+//! depth-aware sharpen need it. Reading needs `SAMPLED` and the copy
 //! `TRANSFER_DST` on the engine's image; a resolve target has both (it was
 //! seen with `0x17`), and with SSR on, a candidate image created without them
 //! gets them added at `vkCreateImage` when its format supports them
-//! ([`widen_usage`]). Six timestamps (before, after the depth copy and
+//! ([`widen_usage`]). Eight timestamps (before, after the depth copy and
 //! after each effect, after the copy back) feed each effect's `stats`, and
 //! the whole for all of them.
 //!
@@ -347,8 +351,13 @@ pub(crate) static SSR: Effect = Effect {
 /// change the scene first, the depth of field then blurs it, reflections
 /// included, and the bloom glows over the result, so a light blurred out of
 /// focus glows as the soft disc it has become, not as the sharp point it
-/// was.
-pub(crate) static EFFECTS: [&Effect; 3] = [&SSR, &post::DOF, &post::BLOOM];
+/// was. The lens comes after them as a camera's lens would, over the whole
+/// picture, glow included, and its fringe reads the bloom's chain. The
+/// sharpen comes last, so the texture detail it raises is the final
+/// picture's and nothing after it softens it again; it holds back where
+/// contrast is already high (the bloom's and the fringe's smooth gradients
+/// have little to raise), so it does not sharpen the glow into rings.
+pub(crate) static EFFECTS: [&Effect; 5] = [&SSR, &post::DOF, &post::BLOOM, &post::LENS, &post::SHARPEN];
 
 /// The effect a devctl verb names.
 pub(crate) fn effect(name: &str) -> Option<&'static Effect> {
@@ -741,7 +750,8 @@ pub fn control(args: &[&str]) -> Result<String, String> {
     SSR.control(args)
 }
 
-/// devctl `ssr ...`, `dof ...` or `bloom ...`; `None` for another verb.
+/// devctl `ssr ...`, `dof ...`, `bloom ...`, `lens ...` or `sharpen ...`;
+/// `None` for another verb.
 pub fn control_verb(verb: &str, args: &[&str]) -> Option<Result<String, String>> {
     effect(verb).map(|fx| fx.control(args))
 }
@@ -1407,16 +1417,17 @@ pub(crate) fn ticks_to_ms(start: u64, end: u64, mask: u64, period_ns: f64) -> f6
 /// How many frames' timestamps can be in flight.
 const RING: usize = 16;
 /// Timestamps per frame: before everything, after the depth copy, after
-/// the reflections, after the depth of field, after the bloom, and after
-/// the copy back.
-const TIMESTAMPS: usize = 6;
+/// each effect of [`EFFECTS`], and after the copy back.
+const TIMESTAMPS: usize = 8;
 
-/// GPU milliseconds of one frame: the reflections, the depth of field and
-/// the bloom (0 for one that did not run), and everything, the depth copy
-/// and the copy back included.
+/// How many effects there are.
+const N: usize = 5;
+
+/// GPU milliseconds of one frame: each effect's (0 for one that did not
+/// run), and everything, the depth copy and the copy back included.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Stages {
-    pub effects: [f64; 3],
+    pub effects: [f64; N],
     pub total: f64,
 }
 /// Presents after which a replaced object can no longer be in use by any
@@ -1437,8 +1448,7 @@ struct Owned {
 /// Our images of the scene's size: the depth copy `depth.comp` writes
 /// (R32F), the trace (RGBA16F, written by the trace and sampled by the
 /// compose), the result the composes write (R32_UINT, copied to the
-/// engine's image), and the depth of field's and the bloom's when either is
-/// on.
+/// engine's image), and the post effects' when any of them is on.
 struct Output {
     depth: Owned,
     trace: Owned,
@@ -1480,11 +1490,11 @@ struct Gpu {
     pipelines: [u64; 4],
     descriptor_pool: u64,
     query_pool: u64,
-    /// The depth of field's and the bloom's.
+    /// The depth of field's, the bloom's, the lens's and the sharpen's.
     post: post::PostGpu,
     /// Which effects ran in the frame each timestamp slot holds, while its
     /// timestamps are still to be read.
-    pending: [Option<[bool; 3]>; RING],
+    pending: [Option<Run>; RING],
     next_slot: usize,
     output: Option<Output>,
     /// The engine's image to our view of it.
@@ -1582,8 +1592,8 @@ impl Gpu {
         Ok(v)
     }
 
-    /// Our images for `extent`, with the depth of field's and the bloom's
-    /// when `post` asks for them, made again when the size changed or they
+    /// Our images for `extent`, with the post effects' when `post` asks for
+    /// them, made again when the size changed or they
     /// are newly asked for. The view of the result, which names them in a
     /// [`SetKey`].
     fn output_for(&mut self, extent: [u32; 2], post: bool, presents: u64) -> Result<u64, String> {
@@ -1752,7 +1762,7 @@ impl Gpu {
 
     /// The previous use of timestamp slot `slot`, if its frame has finished:
     /// which effects ran in it and the GPU milliseconds of each stage.
-    fn collect(&mut self, slot: usize) -> Option<([bool; 3], Stages)> {
+    fn collect(&mut self, slot: usize) -> Option<(Run, Stages)> {
         let ran = self.pending[slot].take()?;
         // Each query's value followed by its availability.
         let mut t = [0u64; 2 * TIMESTAMPS];
@@ -1770,7 +1780,7 @@ impl Gpu {
             return None;
         }
         let ms = |a: usize, b: usize| ticks_to_ms(t[2 * a], t[2 * b], self.timestamp_mask, self.period_ns);
-        Some((ran, Stages { effects: [ms(1, 2), ms(2, 3), ms(3, 4)], total: ms(0, 5) }))
+        Some((ran, Stages { effects: [ms(1, 2), ms(2, 3), ms(3, 4), ms(4, 5), ms(5, 6)], total: ms(0, 7) }))
     }
 }
 
@@ -2032,13 +2042,16 @@ fn compute_barrier(fns: &Fns, cmd: *mut c_void) {
 }
 
 /// Which effects a frame gets, in the order of [`EFFECTS`].
-pub(crate) type Run = [bool; 3];
+pub(crate) type Run = [bool; N];
 
 /// Record the work into `cmd`, the engine's command buffer, outside any
 /// render pass (see the module doc), with timestamps in `slot`: the depth
-/// copy when the reflections or the depth of field need it, then each
-/// effect of `run` in turn, each reading the scene as the one before left
-/// it, and one copy of the result over the engine's image.
+/// copy when the reflections, the depth of field or a depth-aware sharpen
+/// need it, then each effect of `run` in turn, each reading the scene as the
+/// one before left it, and one copy of the result over the engine's image.
+/// `chain`: the lens reads the bloom chain, which it records itself when
+/// the bloom does not run; `depth_for_sharpen`: the sharpen reads the depth
+/// copy.
 #[allow(clippy::too_many_arguments)]
 fn record(
     g: &mut Gpu,
@@ -2049,13 +2062,15 @@ fn record(
     run: Run,
     p: &Params,
     post_p: &post::PostParams,
+    chain: bool,
+    depth_for_sharpen: bool,
     presents: u64,
 ) -> Result<(), String> {
-    let [ssr, dof, bloom] = run;
+    let [ssr, dof, bloom, lens, sharpen] = run;
     let (color, depth) = (&f.color, &f.depth);
     let color_read = color_read_layout(color.layout).ok_or("unusable colour layout")?;
     let depth_read = depth_read_layout(depth.layout).ok_or("unusable depth layout")?;
-    let output = g.output_for(color.att.extent, dof || bloom, presents)?;
+    let output = g.output_for(color.att.extent, dof || bloom || lens || sharpen, presents)?;
     g.view_of(color.att.image, color.att.format, ASPECT_COLOR)?;
     g.view_of(depth.att.image, depth.att.format, ASPECT_DEPTH)?;
     let set = g.set_for(SetKey {
@@ -2138,7 +2153,7 @@ fn record(
             (p as *const Params).cast(),
         );
     };
-    if ssr || dof {
+    if ssr || dof || (sharpen && depth_for_sharpen) {
         bind_ssr(if depth.att.samples > 1 { g.pipelines[0] } else { g.pipelines[1] });
         (fns.cmd_dispatch)(cmd, w.div_ceil(8), h.div_ceil(8), 1);
         compute_barrier(fns, cmd);
@@ -2174,6 +2189,30 @@ fn record(
         post::record_bloom(g, cmd, set, post_images.ok_or("no bloom images")?, &pp);
     }
     stamp(4);
+    if lens {
+        let mut pp = *post_p;
+        if ssr || dof || bloom {
+            pp.flags |= post::SRC_RESULT;
+        }
+        let images = post_images.ok_or("no lens images")?;
+        // The fringe reads the chain; the bloom made it already when it ran.
+        if chain && !bloom {
+            post::record_bloom_chain(g, cmd, set, images, &pp);
+        }
+        post::record_lens(g, cmd, set, images, &pp, !sharpen);
+    }
+    stamp(5);
+    if sharpen {
+        let mut pp = *post_p;
+        if ssr || dof || bloom || lens {
+            pp.flags |= post::SRC_RESULT;
+        }
+        if !depth_for_sharpen {
+            pp.flags &= !post::DEPTH_AWARE;
+        }
+        post::record_sharpen(g, cmd, set, post_images.ok_or("no sharpen images")?, &pp, lens);
+    }
+    stamp(6);
 
     // Our image to a copy source, the engine's to a copy destination, the
     // depth back; everything after (the copy, the swapchain pass, the next
@@ -2205,7 +2244,7 @@ fn record(
         ASPECT_COLOR,
     )];
     (fns.cmd_pipeline_barrier)(cmd, STAGE_TRANSFER, STAGE_ALL_COMMANDS, 0, 0, none.cast(), 0, none, 1, after.as_ptr());
-    stamp(5);
+    stamp(7);
 
     // The engine's compute state, as it was.
     if compute.pipeline != 0 {
@@ -2296,7 +2335,7 @@ struct State {
     reported: HashSet<String>,
     /// Each effect's, in the order of [`EFFECTS`]; its GPU time is its own
     /// dispatches'.
-    stats: [Stats; 3],
+    stats: [Stats; N],
     /// Every frame that got any effect; its GPU time is everything recorded,
     /// the depth copy and the copy back included.
     chain: Stats,
@@ -2354,24 +2393,26 @@ pub(crate) fn pass_begun(pass: &Pass) {
     let Some(h) = st.cmds.get_mut(&pass.cmd) else { return };
     let Some(outcome) = h.pass(&desc, &full) else { return };
     let compute = h.compute.clone();
-    let on: Run = [SSR.is_on(), post::DOF.is_on(), post::BLOOM.is_on()];
+    let on: Run = EFFECTS.map(|fx| fx.is_on());
     let found = match outcome {
         Ok(f) => f,
         Err(why) => return st.skipped(on, why),
     };
     let values = SSR.current();
-    let dof_values = post::DOF.current();
-    let bloom_values = post::BLOOM.current();
+    let post_values = post::PostValues::current();
     let run: Run = [
         on[0] && !changes_nothing(&values),
-        on[1] && !post::dof_changes_nothing(&dof_values),
-        on[2] && !post::bloom_changes_nothing(&bloom_values),
+        on[1] && !post::dof_changes_nothing(&post_values.dof),
+        on[2] && !post::bloom_changes_nothing(&post_values.bloom),
+        on[3] && !post::lens_changes_nothing(&post_values.lens),
+        on[4] && !post::sharpen_changes_nothing(&post_values.sharpen),
     ];
-    if run == [false; 3] {
+    if run == [false; N] {
         return st.skipped(
             on,
             "every effect that is on changes nothing (reflections: intensity 0 and wet surfaces neither darkened nor \
-             tinted; depth of field: strength 0; bloom: intensity 0 or a black tint)"
+             tinted; depth of field: strength 0; bloom: intensity 0 or a black tint; lens: no aberration, vignette \
+             or halo; sharpen: strength or limit 0)"
                 .into(),
         );
     }
@@ -2413,12 +2454,15 @@ pub(crate) fn pass_begun(pass: &Pass) {
     } else {
         0.0
     };
-    let post_p = post::post_params(extent, &dof_values, &bloom_values, mode, dt);
+    let post_p = post::post_params(extent, &post_values, mode, dt);
+    let chain = post::lens_wants_chain(&post_values.lens);
+    let depth_for_sharpen = post::sharpen_wants_depth(&post_values.sharpen);
     // The timestamps this slot held last time round, then the slot again.
     let slot = g.next_slot;
     g.next_slot = (slot + 1) % RING;
     let sample = g.collect(slot);
-    let recorded = record(g, pass.cmd as *mut c_void, slot, &found, &compute, run, &p, &post_p, presents);
+    let recorded =
+        record(g, pass.cmd as *mut c_void, slot, &found, &compute, run, &p, &post_p, chain, depth_for_sharpen, presents);
     if let Some((ran, ms)) = sample {
         for ((s, ran), ms) in st.stats.iter_mut().zip(ran).zip(ms.effects) {
             if ran {
@@ -3077,7 +3121,7 @@ mod tests {
     #[test]
     fn every_effect_has_its_own_variables_slots_looks_and_verbs() {
         let names: Vec<&str> = EFFECTS.iter().map(|fx| fx.name).collect();
-        assert_eq!(names, ["ssr", "dof", "bloom"], "recorded in this order");
+        assert_eq!(names, ["ssr", "dof", "bloom", "lens", "sharpen"], "recorded in this order");
         for (i, fx) in EFFECTS.iter().enumerate() {
             assert_eq!(fx.index, i, "{}", fx.name);
             assert_eq!(fx.env, format!("INTOXICATED_{}", fx.name.to_uppercase()));
@@ -3149,6 +3193,29 @@ mod tests {
         assert_eq!(bloom.values[post::BLOOM_KNOBS.iter().position(|k| k.name == "tint").unwrap()], [1.0, 0.9, 0.8]);
         assert_eq!(post::BLOOM.parse_command(&["intensity", "0.5"]), Ok(Command::Set("intensity", [0.5; 3])));
         assert_eq!(post::DOF.parse_command(&["intensity", "0.5"]), Err(post::DOF_USAGE.to_string()), "dof has no intensity");
+
+        // The lens and the sharpen likewise.
+        let env = |name: &str| {
+            Some(match name {
+                "INTOXICATED_LENS" => "1",
+                "INTOXICATED_LENS_LOOK" => "prism",
+                "INTOXICATED_LENS_VIGNETTE" => "0",
+                "INTOXICATED_SHARPEN" => "1",
+                "INTOXICATED_SHARPEN_LOOK" => "crunchy",
+                "INTOXICATED_SHARPEN_DEPTH_AWARE" => "2",
+                _ => return None,
+            }
+            .to_string())
+        };
+        let lens = post::LENS.parse_settings(env);
+        assert!(lens.on && lens.warnings.is_empty(), "{:?}", lens.warnings);
+        assert_eq!(lens.values, [[5.0; 3], [0.0; 3], [0.7; 3]], "the look, then the knob");
+        let sharpen = post::SHARPEN.parse_settings(env);
+        assert!(sharpen.on);
+        assert_eq!(sharpen.warnings.len(), 1, "{:?}", sharpen.warnings);
+        assert_eq!(sharpen.values, [[2.0; 3], [0.28; 3], [1.0; 3]], "the default for a value it does not take");
+        assert_eq!(post::LENS.parse_command(&["set", "halo", "0.3"]), Ok(Command::Set("halo", [0.3; 3])));
+        assert!(post::SHARPEN.parse_command(&["set", "strength", "4"]).is_err());
     }
 
     #[test]
@@ -3286,7 +3353,7 @@ mod tests {
                 .collect()
         };
         // The same list as build.rs's `SHADERS`.
-        let shaders: [(&str, &str, &[&str]); 14] = [
+        let shaders: [(&str, &str, &[&str]); 18] = [
             ("depth_capture/resolve.comp", "depth_capture/resolve_ms", &[]),
             ("depth_capture/resolve.comp", "depth_capture/resolve_1x", &["-DSINGLE_SAMPLE"]),
             ("ssr/depth.comp", "ssr/depth_ms", &[]),
@@ -3301,6 +3368,10 @@ mod tests {
             ("ssr/post.comp", "ssr/post_bloom_down", &["-DBLOOM_DOWN"]),
             ("ssr/post.comp", "ssr/post_bloom_up", &["-DBLOOM_UP"]),
             ("ssr/post.comp", "ssr/post_bloom_compose", &["-DBLOOM_COMPOSE"]),
+            ("ssr/post.comp", "ssr/post_lens", &["-DLENS"]),
+            ("ssr/post.comp", "ssr/post_stage_copy", &["-DSTAGE_COPY"]),
+            ("ssr/post.comp", "ssr/post_stage_store", &["-DSTAGE_STORE"]),
+            ("ssr/post.comp", "ssr/post_sharpen", &["-DSHARPEN"]),
         ];
         for (source, stem, defines) in shaders {
             let run = std::process::Command::new(GLSLC)

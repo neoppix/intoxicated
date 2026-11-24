@@ -21,8 +21,9 @@
 //!   the next frame's render passes to stderr. `ssr on|off|stats|get|reset|
 //!   look <name>|intensity <x>|set <name> <value>` drives the screen-space
 //!   reflections and answers with their state, their looks and their GPU
-//!   time; `dof ...` and `bloom ...` take the same words for the depth of
-//!   field and the bloom.
+//!   time; `dof ...`, `bloom ...`, `lens ...` and `sharpen ...` take the
+//!   same words for the depth of field, the bloom, the lens effects and the
+//!   sharpening.
 //! - `bussub`, `buslast` and `deeplink` reach the engine's message bus through
 //!   `deeplink::dev_request`, which blocks this thread for at most 5 s.
 //!
@@ -375,9 +376,10 @@ fn reply(line: &str) -> String {
             },
             None => "err depthshot <path>".into(),
         },
-        // Screen-space reflections, depth of field and bloom: on, off, their
-        // settings and GPU cost. See `android::ssr`.
-        verb @ ("ssr" | "dof" | "bloom") => {
+        // Screen-space reflections, depth of field, bloom, lens effects and
+        // sharpening: on, off, their settings and GPU cost. See
+        // `android::ssr`.
+        verb @ ("ssr" | "dof" | "bloom" | "lens" | "sharpen") => {
             let args: Vec<&str> = it.collect();
             match crate::android::ssr::control_verb(verb, &args) {
                 Some(Ok(state)) => format!("ok {state}"),

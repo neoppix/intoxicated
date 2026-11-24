@@ -265,7 +265,7 @@ fn default_flags_ssr_looks_and_version_come_from_the_client() {
     let doc: serde_json::Value = serde_json::from_str(&r.stdout).expect("JSON");
     let effects = doc["effects"].as_array().expect("a list of effects");
     let switches: Vec<&str> = effects.iter().map(|e| e["switch"].as_str().unwrap()).collect();
-    assert_eq!(switches, ["INTOXICATED_SSR", "INTOXICATED_DOF", "INTOXICATED_BLOOM"]);
+    assert_eq!(switches, ["INTOXICATED_SSR", "INTOXICATED_DOF", "INTOXICATED_BLOOM", "INTOXICATED_LENS", "INTOXICATED_SHARPEN"]);
     s.settings("INTOXICATED_DOF=1\nINTOXICATED_DOF_STRENGTH=20\nINTOXICATED_BLOOM_LOOK=neon\n");
     let r = s.run(&["--shader-looks"], &[]);
     assert_eq!(r.stdout, intoxicated_runtime::android::ssr::shader_looks_json() + "\n");

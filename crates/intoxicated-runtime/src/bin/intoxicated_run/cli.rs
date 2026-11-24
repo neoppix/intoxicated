@@ -240,7 +240,7 @@ pub fn print_ssr_looks() -> ExitCode {
 }
 
 /// `--print-shader-looks`: every effect drawn before the HUD (reflections,
-/// depth of field, bloom), each with its switch, knobs and named looks
+/// depth of field, bloom, lens, sharpen), each with its switch, knobs and named looks
 /// ([`intoxicated_runtime::android::ssr::shader_looks_json`]), as one JSON
 /// object on stdout. Nothing else runs. The launcher's `--shader-looks` runs
 /// it for Intoxicated Settings' Shaders page.
@@ -304,9 +304,9 @@ usage: intoxicated-run --lib-dir <dir> [options]
                     starts every knob at) as one JSON object, and exit 0.
                     Runs nothing else; the launcher's --ssr-looks runs it
   --print-shader-looks  the same for every effect drawn before the HUD
-                    (reflections, depth of field, bloom), as one JSON object
-                    with a list of effects, and exit 0. Runs nothing else;
-                    the launcher's --shader-looks runs it
+                    (reflections, depth of field, bloom, lens, sharpen), as
+                    one JSON object with a list of effects, and exit 0. Runs
+                    nothing else; the launcher's --shader-looks runs it
   --run <secs>      how long to let Roblox run after handover (default 15).
                     0 means no timer: run until the window is closed or the
                     process is sent SIGTERM/SIGINT. Closing the window ends the
@@ -521,6 +521,33 @@ env:
                                      threshold (0.5)
   INTOXICATED_BLOOM_RADIUS=<0..1>    0 a tight glow, 1 a wide one (0.7)
   INTOXICATED_BLOOM_TINT=<r,g,b>     colour of the glow, each 0 to 2 (1,1,1)
+  INTOXICATED_LENS=1                 lens effects (experimental): red and
+                                     blue split apart towards the screen
+                                     edges, a rainbow halo round the
+                                     brightest areas and darker corners,
+                                     drawn before the HUD. Off by default.
+                                     devctl's lens takes the same words as
+                                     ssr
+  INTOXICATED_LENS_LOOK=<name>       subtle (the defaults), prism or film
+  INTOXICATED_LENS_ABERRATION=<0..16>
+                                     how far red and blue are pulled apart
+                                     in the corners, in pixels at 1080p
+                                     (1.5); none at the centre
+  INTOXICATED_LENS_VIGNETTE=<0..1>   how much darker the corners are (0.15)
+  INTOXICATED_LENS_HALO=<0..2>       the rainbow fringe round the brightest
+                                     areas, from the bloom's chain (0.15)
+  INTOXICATED_SHARPEN=1              contrast adaptive sharpening
+                                     (experimental) of the 3D scene, drawn
+                                     before the HUD. Off by default.
+                                     devctl's sharpen takes the same words as
+                                     ssr
+  INTOXICATED_SHARPEN_LOOK=<name>    light (the defaults), crisp or crunchy
+  INTOXICATED_SHARPEN_STRENGTH=<0..3>
+                                     how strongly detail is raised (0.5)
+  INTOXICATED_SHARPEN_LIMIT=<0..1>   the most a pixel changes (0.1)
+  INTOXICATED_SHARPEN_DEPTH_AWARE=<0|1>
+                                     1 not across depth edges, so outlines
+                                     get no halo (1)
   INTOXICATED_FILES_DIR=<dir>        the engine's data root (default
                                      <profile>/data): its files/ and cache/
   INTOXICATED_EARLY_DIRS=<keys>      directory setters sent before
