@@ -397,8 +397,11 @@ impl Flow {
                     continue;
                 }
                 OP_LOAD if i.len >= 4 => {
+                    // What was stored there, and the pointer itself: an
+                    // access chain's indices (a bone index picking a
+                    // matrix) are what the loaded value depends on too.
                     let r = *root.get(&x[3]).unwrap_or(&x[3]);
-                    f.deps.insert(x[2], vec![Source::Memory(r)]);
+                    f.deps.insert(x[2], vec![Source::Memory(r), Source::Value(x[3])]);
                     f.defs.insert(x[2], (i.op, x[3..].to_vec()));
                     continue;
                 }
@@ -542,8 +545,9 @@ fn camera_vector_output(words: &[u32], list: &[Inst], flow: &Flow) -> Option<Cam
         }
         let world = flow.defs.get(&first)?.1[1];
         // Static: the world position depends on no vertex input but the
-        // position (so not on bone indices or weights).
-        let fixed = flow.memories(world).iter().all(|m| !any_input.contains(m) || position.contains(m));
+        // position and built-ins such as the instance index (so not on
+        // bone indices or weights).
+        let fixed = flow.memories(world).iter().all(|m| !any_input.contains(m) || position.contains(m) || flow.builtins.contains(m));
         Some(CameraVector { output: v, difference: first, world, fixed })
     })
 }
@@ -661,14 +665,31 @@ mod tests {
         assert!(added.contains(&&(OP_DECORATE, vec![world, DECORATION_OFFSET, WORLD_OFFSET])));
         assert!(after.iter().any(|(o, a)| *o == OP_ENTRY_POINT && a.last() == Some(&world)));
         assert!(after.iter().any(|(o, a)| *o == OP_STORE && a[0] == world));
-        // The test shader places its vertex by its own matrices: static.
-        assert!(after.iter().any(|(o, a)| *o == OP_CONSTANT && a[2] == 1.0f32.to_bits()));
+        // The test shader places its vertex by its instance's matrix:
+        // static, flag 1; skinned, by a bone a vertex input picks: flag 0.
+        assert_eq!(world_flag(&out), 1.0);
+        assert_eq!(world_flag(&instrument_vertex(SKINNED).unwrap()), 0.0);
+        validate(&instrument_vertex(SKINNED).unwrap());
         assert!(added.contains(&&(OP_CAPABILITY, vec![CAPABILITY_TRANSFORM_FEEDBACK])));
         assert!(added.iter().any(|(o, a)| *o == OP_EXECUTION_MODE && a[1] == EXECUTION_MODE_XFB));
         assert!(added.iter().any(|(o, a)| *o == OP_MEMBER_DECORATE && a[1] == 0 && a[2] == DECORATION_OFFSET && a[3] == 0));
         assert!(added.iter().any(|(o, a)| *o == OP_DECORATE && a[1] == DECORATION_XFB_STRIDE && a[2] == STRIDE));
         // Done once only.
         assert_eq!(instrument_vertex(&out), Err("it already declares Xfb"));
+    }
+
+    const SKINNED: &[u32] = include!("test_vs_skinned.spv.rs");
+
+    /// The static flag stored with the world position: the constant in the
+    /// vector made right before the store to our output.
+    fn world_flag(words: &[u32]) -> f32 {
+        let after = ops(words);
+        let world = output_at(words, 3);
+        let at = after.iter().position(|(o, a)| *o == OP_STORE && a[0] == world).unwrap();
+        let (_, c) = &after[at - 1];
+        let constant = c[3];
+        let (_, k) = after.iter().find(|(o, a)| *o == OP_CONSTANT && a[1] == constant).unwrap();
+        f32::from_bits(k[2])
     }
 
     /// The Output variable at `location`.

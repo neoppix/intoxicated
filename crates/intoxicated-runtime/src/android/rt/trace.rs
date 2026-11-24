@@ -653,7 +653,7 @@ pub(crate) fn record(
     // cache's drops and misses); the rest is kept, cleared once with the
     // cache and the blocks.
     (f.cmd_fill_buffer)(cmd, g.globals.buffer, 0, 16, 0);
-    (f.cmd_fill_buffer)(cmd, g.globals.buffer, 132, 8, 0);
+    (f.cmd_fill_buffer)(cmd, g.globals.buffer, 132, 12, 0);
     (f.cmd_fill_buffer)(cmd, g.flags.buffer, 0, 4 * n as u64, 0);
     if clear_blocks {
         (f.cmd_fill_buffer)(cmd, g.blocks.buffer, 0, BLOCK_BYTES * g.block_room, 0);
@@ -766,7 +766,7 @@ fn fit_text(fit: Option<[u32; GLOBALS_READ]>) -> String {
     }
     format!(
         "fit=ok fit_samples={} fov_x={:.2} fov_y={:.2} near={:.4} forward_len={:.4} world_up={:.3},{:.3},{:.3} exposure={:.3} \
-         camera={:.1},{:.1},{:.1} cache_listed={} cache_dropped={} cache_full={} cache_generation={}",
+         camera={:.1},{:.1},{:.1} cache_listed={} cache_new={} cache_dropped={} cache_full={} cache_generation={}",
         w[1],
         2.0 * f(4).atan().to_degrees(),
         2.0 * f(5).atan().to_degrees(),
@@ -780,6 +780,7 @@ fn fit_text(fit: Option<[u32; GLOBALS_READ]>) -> String {
         f(17),
         f(18),
         w[3],
+        w[35],
         w[33],
         w[34],
         w[32] & 0xff

@@ -306,15 +306,14 @@ captured triangles, 8 touched the space behind the camera), so the static parts
 it drew are kept in a cache in world space and still reflected once they leave
 the view, until the view shows their place again without them, they go unseen
 for about two minutes, the cache needs their room, or the camera jumps (a
-teleport); moving players come only from the frame itself (the cache and the
-opaque copy are not yet tried in game). In the Timebomb Duels lobby (50000 to
-190000 triangles a frame, 1667x1349, RTX 4070 Ti) it costs 0.2 to 0.3 ms of GPU
-time for the hierarchy and 0.4 to 0.7 ms for the rays with the default and
-floor mirror looks, about 1.3 ms for the rays when every surface is a mirror
-(all of the reflections' work about 1 ms, against 0.6 ms for the march); frame
-times did not change at the engine's 240 fps. NVIDIA's FreeBSD driver offers no
-hardware ray tracing: on the RTX 4070 Ti, drivers 580.142 and 620.70.06 list
-neither `VK_KHR_acceleration_structure` nor `VK_KHR_ray_query` nor
+teleport); moving players come only from the frame itself. In Timebomb Duels
+(30000 to 60000 triangles drawn a frame and 7000 to 19000 more from the cache,
+1667x1349, RTX 4070 Ti) it costs 0.2 to 0.3 ms of GPU time for the hierarchy
+and 0.5 to 0.7 ms for the rays with the default and mirror looks (all of the
+reflections' work 0.9 to 1.3 ms, against 0.6 ms for the march); frame times did
+not change at the engine's 240 fps. NVIDIA's FreeBSD driver offers no hardware
+ray tracing: on the RTX 4070 Ti, drivers 580.142 and 620.70.06 list neither
+`VK_KHR_acceleration_structure` nor `VK_KHR_ray_query` nor
 `VK_KHR_ray_tracing_pipeline` (vulkaninfo lists them for llvmpipe only) and the
 package ships no `libnvidia-rtcore`, so the hierarchy and the rays are compute
 shaders of the client's own running on the shader cores. devctl `rt on`, `rt

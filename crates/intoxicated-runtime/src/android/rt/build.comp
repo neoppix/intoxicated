@@ -60,8 +60,8 @@ layout(std430, binding = 2) buffer Sorted { uvec2 sorted[]; };
 layout(std430, binding = 3) coherent buffer Nodes { vec4 nodes[]; };
 layout(std430, binding = 4) buffer Parents { int parents[]; };
 layout(std430, binding = 5) buffer Flags { uint flags[]; };
-// `trace::GLOBALS_*` names the offsets; the first 16 bytes and `dropped`
-// and `full` are cleared every frame, the rest is kept.
+// `trace::GLOBALS_*` names the offsets; the first 16 bytes and `dropped`,
+// `full` and `inserted` are cleared every frame, the rest is kept.
 layout(std430, binding = 6) buffer Globals {
     // Listed triangles that are leaves (real geometry); FIT's vertices and
     // whether it found the camera; cached triangles listed this frame.
@@ -86,11 +86,12 @@ layout(std430, binding = 6) buffer Globals {
     vec4 forward;
     // The cache's generation (its low 8 bits tag live entries), entries
     // dropped this frame because the view showed them gone, triangles
-    // that found no room, and the camera's last position (w 1 once set).
+    // that found no room, triangles new to the cache this frame, and the
+    // camera's last position (w 1 once set).
     uint gen;
     uint dropped;
     uint full;
-    uint spare;
+    uint inserted;
     vec4 last_cam;
 };
 // Triangles to trace: three vertices, world xyz and the colour packed in w.
@@ -278,7 +279,10 @@ void main() {
     h1 ^= h1 >> 13;
     uint tag = ((gen & 0xffu) << 24) | max(h1 & 0xffffffu, 1u);
     uint mask = pc.slot_count - 1u;
-    uint best = 0xffffffffu, best_seen = 0xffffffffu;
+    // The whole probe window is searched for the triangle first: a slot
+    // before it may have been freed since it was put in, and taking that
+    // one would cache it twice.
+    uint free_at = 0xffffffffu, old_at = 0xffffffffu, old_seen = 0xffffffffu;
     for (uint p = 0u; p < PROBES; ++p) {
         uint base = ((h2 + p) & mask) * SLOT_WORDS;
         uint t = slots[base];
@@ -289,30 +293,34 @@ void main() {
             }
             return;
         }
-        bool free_ = t == 0u || (t >> 24) != (gen & 0xffu);
-        if (free_) {
-            if (atomicCompSwap(slots[base], t, tag) == t) {
-                best = base;
-                break;
+        if (t == 0u || (t >> 24) != (gen & 0xffu)) {
+            free_at = min(free_at, p);
+        } else {
+            uint seen = slots[base + 2u];
+            if (frame - seen > MIN_AGE && seen < old_seen) {
+                old_seen = seen;
+                old_at = p;
             }
-            continue;
-        }
-        uint seen = slots[base + 2u];
-        if (frame - seen > MIN_AGE && seen < best_seen) {
-            best_seen = seen;
-            best = 0x80000000u | base;
         }
     }
-    if (best != 0xffffffffu && (best & 0x80000000u) != 0u) {
-        // The least recently seen of those probed, taken over.
-        uint base = best & 0x7fffffffu;
+    // A free slot, else the least recently seen of those probed.
+    uint best = 0xffffffffu;
+    for (uint p = 0u; p < PROBES && best == 0xffffffffu; ++p) {
+        if (p != free_at && p != old_at) {
+            continue;
+        }
+        uint base = ((h2 + p) & mask) * SLOT_WORDS;
         uint t = slots[base];
-        best = atomicCompSwap(slots[base], t, tag) == t ? base : 0xffffffffu;
+        bool takeable = t == 0u || (t >> 24) != (gen & 0xffu) || frame - slots[base + 2u] > MIN_AGE;
+        if (takeable && atomicCompSwap(slots[base], t, tag) == t) {
+            best = base;
+        }
     }
     if (best == 0xffffffffu) {
         atomicAdd(full, 1u);
         return;
     }
+    atomicAdd(inserted, 1u);
     slots[best + 1u] = h2;
     slots[best + 2u] = frame;
     for (uint k = 0u; k < 3u; ++k) {
