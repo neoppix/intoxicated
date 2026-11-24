@@ -892,7 +892,7 @@ void testRayTracing() {
     check(!readAll(path).contains("INTOXICATED_RT"), "off removes the line");
     const QStringList warnings = rtWarnings();
     const QString all = warnings.join(QLatin1Char(' '));
-    for (const char *word : {"replaces", "textures", "leaderboards", "flicker", "never drawn", "400 MB", "1 ms",
+    for (const char *word : {"replaces", "textures", "leaderboards", "flicker", "never drawn", "1.6 GB", "1 to 2 ms",
                              "no hardware ray tracing", "RTX 4070 Ti", "620.70.06"})
         check(all.contains(QLatin1String(word)), QStringLiteral("the warnings say %1").arg(word));
     QFile::remove(path);

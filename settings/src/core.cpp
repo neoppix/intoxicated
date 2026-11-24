@@ -1147,7 +1147,7 @@ QStringList rtWarnings() {
         QStringLiteral("Interface drawn in the world, such as leaderboards and name tags, does not reflect."),
         QStringLiteral("Reflections can flicker while the camera moves."),
         QStringLiteral("Objects the game has never drawn cannot appear in a reflection."),
-        QStringLiteral("Uses about 400 MB more video memory and about 1 ms more GPU time a frame."),
+        QStringLiteral("Uses up to an eighth of the video memory (at most about 1.6 GB, INTOXICATED_RT_MEMORY in MiB sets it) and about 1 to 2 ms more GPU time a frame."),
         QStringLiteral("Runs as compute on the shader cores, because NVIDIA's FreeBSD driver has no hardware ray "
                        "tracing."),
         QStringLiteral("May crash or misbehave on other GPUs and drivers: only tested on an RTX 4070 Ti with NVIDIA "

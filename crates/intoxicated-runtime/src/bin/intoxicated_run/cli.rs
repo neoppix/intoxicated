@@ -531,8 +531,13 @@ env:
                                      (their look knobs apply) unless
                                      INTOXICATED_SSR says otherwise. Off by
                                      default. devctl rt on|off|stats
-  INTOXICATED_RT_TRIANGLES=<n>       triangles captured per frame at most
-                                     (524288)
+  INTOXICATED_RT_TRIANGLES=<n>       triangles captured per frame and
+                                     cached at most (else from the memory)
+  INTOXICATED_RT_MEMORY=<MiB>        video memory for them (an eighth of
+                                     the GPU's, at most 1536)
+  INTOXICATED_RT_REACH=<studs>       cached parts traced within (512)
+  INTOXICATED_RT_SHADE=<mode>        lit, own, mix or screen (lit)
+  INTOXICATED_RT_ENV=0               no sky environment for rays that miss
   INTOXICATED_RT_DUMP=<dir>          research: the engine's shader modules and
                                      pipelines to <dir>; devctl rt draws and
                                      rt dump <path> write a frame's draws and

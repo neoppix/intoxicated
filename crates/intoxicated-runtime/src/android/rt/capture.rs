@@ -128,6 +128,7 @@ const DEFAULT_TRIANGLES: u64 = 1 << 19;
 
 pub const DUMP_ENV: &str = "INTOXICATED_RT_DUMP";
 pub const TRIANGLES_ENV: &str = "INTOXICATED_RT_TRIANGLES";
+pub const MEMORY_ENV: &str = "INTOXICATED_RT_MEMORY";
 
 /// The dump directory, when the research switch is on.
 pub(crate) fn dump_dir() -> Option<&'static str> {
@@ -148,15 +149,59 @@ pub(crate) fn dump_dir() -> Option<&'static str> {
     .as_deref()
 }
 
+/// The triangles our buffers are sized for: `INTOXICATED_RT_TRIANGLES` when
+/// set, else what `INTOXICATED_RT_MEMORY` (MiB) allows, else what an eighth
+/// of the GPU's largest device-local heap allows, at most 1536 MiB; a power
+/// of two from 131072 to 4194304. Each triangle takes about 600 bytes over
+/// the capture, the list to trace, the hierarchy and the cache.
 pub(crate) fn capacity_triangles() -> u64 {
     static N: OnceLock<u64> = OnceLock::new();
+    if let Some(&n) = N.get() {
+        return n;
+    }
+    if let Some(n) = std::env::var(TRIANGLES_ENV).ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&n| (1024..=(16 << 20)).contains(&n)) {
+        return *N.get_or_init(|| n);
+    }
+    let asked = std::env::var(MEMORY_ENV).ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&m| m >= 64);
+    let budget = match (asked, device_local_heap()) {
+        (Some(mib), _) => mib << 20,
+        (None, Some(heap)) => (heap / 8).min(1536 << 20),
+        // No device yet: the default, not kept.
+        (None, None) => return DEFAULT_TRIANGLES,
+    };
+    let n = triangles_for(budget);
     *N.get_or_init(|| {
-        std::env::var(TRIANGLES_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|&n| (1024..=(16 << 20)).contains(&n))
-            .unwrap_or(DEFAULT_TRIANGLES)
+        println!("[android] vulkan: rt: room for {n} triangles ({} MiB of video memory; {MEMORY_ENV})", (n * BYTES_PER_TRIANGLE) >> 20);
+        n
     })
+}
+
+/// Bytes a triangle of room takes over every buffer sized by it.
+pub(crate) const BYTES_PER_TRIANGLE: u64 = 600;
+
+/// The power of two of triangles a budget of bytes allows.
+pub(crate) fn triangles_for(budget: u64) -> u64 {
+    let n = (budget / BYTES_PER_TRIANGLE).clamp(1 << 17, 1 << 22);
+    1 << (63 - n.leading_zeros())
+}
+
+/// The size of the GPU's largest device-local heap.
+fn device_local_heap() -> Option<u64> {
+    let (_, physical) = frame_capture::current_device()?;
+    let mp = super::super::vk_layer::host_instance_proc(c"vkGetPhysicalDeviceMemoryProperties");
+    if mp.is_null() {
+        return None;
+    }
+    // SAFETY: resolved by the host loader for exactly this name.
+    let mp: extern "C" fn(*mut c_void, *mut PhysicalDeviceMemoryProperties) = unsafe { std::mem::transmute(mp) };
+    let mut props = PhysicalDeviceMemoryProperties {
+        memory_type_count: 0,
+        memory_types: [[0; 2]; 32],
+        memory_heap_count: 0,
+        memory_heaps: [[0; 2]; 16],
+    };
+    mp(physical as *mut c_void, &mut props);
+    props.memory_heaps[..(props.memory_heap_count as usize).min(16)].iter().filter(|h| h[1] & 1 != 0).map(|h| h[0]).max()
 }
 
 /// Whether the hooks of this module are handed out.
@@ -1679,6 +1724,11 @@ mod tests {
         assert_eq!(xfb_vertices(4, 1, 1), 0);
         // Not triangles.
         assert_eq!(xfb_vertices(1, 100, 1), 0);
+        // Room from a budget: 1536 MiB is two million triangles; at least
+        // 131072, at most four million.
+        assert_eq!(triangles_for(1536 << 20), 2 << 20);
+        assert_eq!(triangles_for(1 << 20), 1 << 17);
+        assert_eq!(triangles_for(64 << 30), 4 << 20);
         // A scissor of the whole pass, or more, clips nothing.
         assert!(covers([0, 0, 1667, 1349], [1667, 1349]));
         assert!(covers([-10, 0, 4000, 4000], [1667, 1349]));

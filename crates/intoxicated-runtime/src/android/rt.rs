@@ -41,7 +41,7 @@ pub const ENV: &str = "INTOXICATED_RT";
 /// What is said once when the switch is on, and in `rt stats`.
 pub const WARNING: &str = "ray-traced reflections are experimental: they replace the screen-space ones, \
 off-screen hits show textures only where the game's shader samples them plainly (clothing) and flat colours elsewhere, in-world interface does not reflect, they can flicker while the camera moves, \
-they cost about 400 MB of video memory and about 1 ms of GPU time (compute on the shader cores; NVIDIA's FreeBSD \
+they cost up to an eighth of the video memory (at most about 1.6 GB, INTOXICATED_RT_MEMORY) and about 1 to 2 ms of GPU time (compute on the shader cores; NVIDIA's FreeBSD \
 driver has no hardware ray tracing), and they were only tried on an RTX 4070 Ti with NVIDIA 620.70.06";
 
 /// Whether the switch was on at start, read once; the first time it is on

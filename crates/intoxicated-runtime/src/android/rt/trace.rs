@@ -111,12 +111,17 @@ const PIPELINES: usize = 11;
 const BINDINGS: [u32; 12] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 /// The environment: 256 by 256 directions, 16 bytes each.
 const ENV_BYTES: u64 = 16 * 256 * 256;
-/// Slots in the cache of static triangles (128 bytes each).
-const SLOTS: u32 = 1 << 19;
+/// Slots in the cache of static triangles (128 bytes each): as many as the
+/// capture has room for (see `capture::capacity_triangles`).
+fn slots() -> u32 {
+    capture::capacity_triangles().next_power_of_two() as u32
+}
 const SLOT_BYTES: u64 = 128;
 /// Triangles the list to trace holds (96 bytes each): this frame's and the
 /// cache's.
-const LISTED: u64 = 1 << 19;
+fn listed() -> u64 {
+    capture::capacity_triangles()
+}
 const TRI_BYTES: u64 = 96;
 /// Draws a frame can tell the build about (16 bytes each), and the entries
 /// of the serial-to-texture table (8 bytes each).
@@ -247,6 +252,15 @@ pub(crate) fn set_view(name: &str) -> Result<(), String> {
 
 pub(crate) fn view_flags() -> u32 {
     VIEW.load(Relaxed) << 6
+}
+
+/// How far from the camera cached triangles are traced, in studs
+/// (`INTOXICATED_RT_REACH`, 512 unless set; twice it they are dropped).
+pub const REACH_ENV: &str = "INTOXICATED_RT_REACH";
+
+fn reach() -> f32 {
+    static R: OnceLock<f32> = OnceLock::new();
+    *R.get_or_init(|| std::env::var(REACH_ENV).ok().and_then(|v| v.trim().parse::<f32>().ok()).filter(|r| *r >= 16.0).unwrap_or(512.0))
 }
 
 /// devctl `rt dump-cache <path>`: armed for the next frame, then written.
@@ -555,7 +569,7 @@ fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool, extent: [u32; 2]) -
     let d = device as Dev;
     let c = capture::frame_captured(device).ok_or("the scene was not captured")?;
     let (xfb, capacity) = (c.xfb, c.capacity);
-    let keys = sort_size(LISTED, LISTED);
+    let keys = sort_size(listed(), listed());
     let mut g = Gpu {
         device,
         fns: Fns::resolve(d)?,
@@ -739,8 +753,8 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
     g.flags = make_buffer(&g.buffers, d, &types, 4 * n, usage, false)?;
     g.globals = make_buffer(&g.buffers, d, &types, GLOBALS_BYTES, usage, false)?;
     g.blocks = make_buffer(&g.buffers, d, &types, BLOCK_BYTES * g.block_room, usage, false)?;
-    g.tris = make_buffer(&g.buffers, d, &types, TRI_BYTES * LISTED, usage, false)?;
-    g.slots = make_buffer(&g.buffers, d, &types, SLOT_BYTES * SLOTS as u64, usage, false)?;
+    g.tris = make_buffer(&g.buffers, d, &types, TRI_BYTES * listed(), usage, false)?;
+    g.slots = make_buffer(&g.buffers, d, &types, SLOT_BYTES * slots() as u64, usage, false)?;
     g.draws = make_buffer(&g.buffers, d, &types, 16 * MAX_DRAWS as u64, usage, false)?;
     g.tex_map = make_buffer(&g.buffers, d, &types, 8 * TEX_MAP as u64, usage, false)?;
     g.env = make_buffer(&g.buffers, d, &types, ENV_BYTES, usage, false)?;
@@ -851,8 +865,8 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         DescriptorBufferInfo { buffer: g.flags.buffer, offset: 0, range: 4 * n },
         DescriptorBufferInfo { buffer: g.globals.buffer, offset: 0, range: GLOBALS_BYTES },
         DescriptorBufferInfo { buffer: g.blocks.buffer, offset: 0, range: BLOCK_BYTES * g.block_room },
-        DescriptorBufferInfo { buffer: g.tris.buffer, offset: 0, range: TRI_BYTES * LISTED },
-        DescriptorBufferInfo { buffer: g.slots.buffer, offset: 0, range: SLOT_BYTES * SLOTS as u64 },
+        DescriptorBufferInfo { buffer: g.tris.buffer, offset: 0, range: TRI_BYTES * listed() },
+        DescriptorBufferInfo { buffer: g.slots.buffer, offset: 0, range: SLOT_BYTES * slots() as u64 },
         DescriptorBufferInfo { buffer: g.draws.buffer, offset: 0, range: 16 * MAX_DRAWS as u64 },
         DescriptorBufferInfo { buffer: g.tex_map.buffer, offset: 0, range: 8 * TEX_MAP as u64 },
         DescriptorBufferInfo { buffer: g.env.buffer, offset: 0, range: ENV_BYTES },
@@ -958,9 +972,9 @@ pub(crate) fn record(
     let dump_cache = CACHE_DUMP_NEXT.swap(false, Relaxed);
     if dump_cache && g.cache_copy.buffer == 0 {
         let types = memory_types()?;
-        g.cache_copy = make_buffer(&g.buffers, g.device as Dev, &types, SLOT_BYTES * SLOTS as u64, USAGE_TRANSFER_DST, true)?;
+        g.cache_copy = make_buffer(&g.buffers, g.device as Dev, &types, SLOT_BYTES * slots() as u64, USAGE_TRANSFER_DST, true)?;
         let mut mapped = std::ptr::null_mut();
-        check((g.buffers.map_memory)(g.device as Dev, g.cache_copy.memory, 0, SLOT_BYTES * SLOTS as u64, 0, &mut mapped), "vkMapMemory")?;
+        check((g.buffers.map_memory)(g.device as Dev, g.cache_copy.memory, 0, SLOT_BYTES * slots() as u64, 0, &mut mapped), "vkMapMemory")?;
         g.cache_copy_ptr = mapped as usize;
     }
     let clear_blocks = !g.blocks_cleared;
@@ -998,7 +1012,7 @@ pub(crate) fn record(
     if clear_blocks {
         (f.cmd_fill_buffer)(cmd, g.blocks.buffer, 0, BLOCK_BYTES * g.block_room, 0);
         (f.cmd_fill_buffer)(cmd, g.globals.buffer, 16, GLOBALS_BYTES - 16, 0);
-        (f.cmd_fill_buffer)(cmd, g.slots.buffer, 0, SLOT_BYTES * SLOTS as u64, 0);
+        (f.cmd_fill_buffer)(cmd, g.slots.buffer, 0, SLOT_BYTES * slots() as u64, 0);
         (f.cmd_fill_buffer)(cmd, g.env.buffer, 0, ENV_BYTES, 0);
         (f.cmd_fill_buffer)(cmd, g.no_frame_block.buffer, 0, FRAME_BLOCK_BYTES, 0);
     }
@@ -1083,15 +1097,15 @@ pub(crate) fn record(
     g.barrier(cmd, STAGE_TRANSFER | STAGE_COMPUTE, ACCESS_TRANSFER_WRITE | ACCESS_SHADER_WRITE);
     let mut bp = BuildParams {
         n,
-        cap: LISTED as u32,
+        cap: listed() as u32,
         k: 0,
         j: 0,
         current,
         flags: u32::from(cap.whole),
-        slot_count: SLOTS,
+        slot_count: slots(),
         size: extent[0] | (extent[1] << 16),
         draw_count: draws.len() as u32,
-        pad: [0; 3],
+        pad: [reach().to_bits(), 0, 0],
     };
     let dispatch = |pipeline: usize, bp: &BuildParams, groups: u32, layout: u64| {
         (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[pipeline]);
@@ -1112,12 +1126,12 @@ pub(crate) fn record(
     dispatch(INSERT, &bp, current.div_ceil(256), g.build_layout);
     // GATHER reads the reflections' copy of the depth too.
     (f.cmd_bind_descriptor_sets)(cmd, BIND_POINT_COMPUTE, g.trace_layout, 0, 3, all_sets.as_ptr(), 0, std::ptr::null());
-    dispatch(GATHER, &bp, SLOTS.div_ceil(256), g.trace_layout);
+    dispatch(GATHER, &bp, slots().div_ceil(256), g.trace_layout);
     if dump_cache {
         // The cache as GATHER left it, for `rt dump-cache`.
         let to_copy = MemoryBarrier { s_type: ST_MEMORY_BARRIER, p_next: std::ptr::null(), src_access_mask: ACCESS_SHADER_WRITE, dst_access_mask: ACCESS_TRANSFER_READ };
         (g.buffers.pipeline_barrier)(cmd, STAGE_COMPUTE, STAGE_TRANSFER, 0, 1, &to_copy, 0, std::ptr::null(), 0, std::ptr::null());
-        let region = [0u64, 0, SLOT_BYTES * SLOTS as u64];
+        let region = [0u64, 0, SLOT_BYTES * slots() as u64];
         (g.buffers.copy_buffer)(cmd, g.slots.buffer, g.cache_copy.buffer, 1, region.as_ptr());
         st.stats.cache_dumped_at = st.stats.frames;
     }
@@ -1199,7 +1213,7 @@ pub(crate) fn dump_cache(path: &str) -> Result<String, String> {
     let g = st.gpus.first().ok_or("no trace on any device")?;
     let generation = st.stats.fit.map_or(0, |w| w[32]) & 0xff;
     // SAFETY: our mapping of the whole copy, written six frames ago.
-    let words = unsafe { std::slice::from_raw_parts(g.cache_copy_ptr as *const u32, (SLOT_BYTES / 4 * SLOTS as u64) as usize) };
+    let words = unsafe { std::slice::from_raw_parts(g.cache_copy_ptr as *const u32, (SLOT_BYTES / 4 * slots() as u64) as usize) };
     let mut text = String::from("born\tseen\tmisses\tsource\tcode\tedge\tA\tB\tC\n");
     let mut live = 0;
     for slot in words.chunks(32) {

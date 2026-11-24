@@ -334,8 +334,11 @@ What to know before turning it on:
 - Objects the game has never drawn cannot appear; a static part that moved
   while out of view stays in the reflections at its old place until the view
   shows that place again, and players only come from the current frame.
-- It costs about 400 MB more video memory and about 1 ms more GPU time a
-  frame. Measured in Timebomb Duels at 1667x1349 on an RTX 4070 Ti: 0.2 to
+- It takes up to an eighth of the video memory, at most about 1.6 GB
+  (room for two million triangles on a 12 GB card; `INTOXICATED_RT_MEMORY`
+  sets the budget in MiB, `INTOXICATED_RT_TRIANGLES` the triangles), and
+  about 1 to 2 ms more GPU time a frame. Cached parts are traced within
+  512 studs of the camera (`INTOXICATED_RT_REACH`). Measured in Timebomb Duels at 1667x1349 on an RTX 4070 Ti: 0.2 to
   0.3 ms for the hierarchy and 0.5 to 0.7 ms for the rays (all of the
   reflections' work 0.9 to 1.3 ms, against 0.6 ms for the screen-space
   ones); frame times did not change at the engine's 240 fps.

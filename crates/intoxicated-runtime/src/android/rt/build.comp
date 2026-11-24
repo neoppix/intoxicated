@@ -149,7 +149,8 @@ layout(push_constant) uniform Params {
     uint size;
     // Entries in `draws`.
     uint draw_count;
-    uint pad0;
+    // How far cached triangles are traced, in studs (float bits).
+    uint reach_bits;
     uint pad1;
     uint pad2;
 } pc;
@@ -187,9 +188,8 @@ const uint S_PROMOTED = 29u;
 const uint S_HIDDEN = 30u;
 const uint STABLE = 60u;
 const uint HIDDEN_FRAMES = 240u;
-// Cached triangles further than this from the camera are not traced, and
-// dropped beyond twice it.
-const float REACH = 256.0;
+// Cached triangles further than `pc.reach_bits` from the camera are not
+// traced, and dropped beyond twice it.
 
 bool usable(vec4 c) {
     return c.z > 0.0 && c.w > 0.0 && !any(isnan(c)) && !any(isinf(c));
@@ -526,7 +526,8 @@ void main() {
     }
     vec3 a = view_of(W[0]), b = view_of(W[1]), c = view_of(W[2]);
     float distance_ = length((a + b + c) / 3.0);
-    if (distance_ > 2.0 * REACH || (frame - seen > MAX_AGE && distance_ > FAR)) {
+    float reach = uintBitsToFloat(pc.reach_bits);
+    if (distance_ > 2.0 * reach || (frame - seen > MAX_AGE && distance_ > FAR)) {
         slots[base + S_TAG] = 0u;
         return;
     }
@@ -547,7 +548,7 @@ void main() {
         slots[base + S_MISSES] = 0u;
         slots[base + S_HIDDEN] = 0u;
     }
-    if (slots[base + S_PROMOTED] == 0u || distance_ > REACH) {
+    if (slots[base + S_PROMOTED] == 0u || distance_ > reach) {
         return;
     }
     uint k = atomicAdd(cached, 1u);
