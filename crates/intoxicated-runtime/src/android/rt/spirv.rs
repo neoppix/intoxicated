@@ -609,8 +609,21 @@ pub(crate) struct VertexInfo {
 
 /// Whether a vertex shader draws the engine's terrain: its position input
 /// (location 0) is a vector of integers (the voxel mesh's quantized
-/// positions), where every other mesh's is of floats.
+/// positions), where every other mesh's is of floats. Not its decoration
+/// grass, which thins its blades by their vertex index, nor what sways or
+/// waves (grass in the wind, water), which takes a sine: what changes from
+/// frame to frame flickers in the trace.
 fn is_terrain(words: &[u32], list: &[Inst], flow: &Flow) -> bool {
+    const BUILTIN_VERTEX_INDEX: u32 = 42;
+    const GLSL_SIN: u32 = 13;
+    let vertex_index = list.iter().any(|i| {
+        (i.op == OP_DECORATE && i.len >= 4 && words[i.at + 2] == DECORATION_BUILTIN && words[i.at + 3] == BUILTIN_VERTEX_INDEX)
+            || (i.op == OP_MEMBER_DECORATE && i.len >= 5 && words[i.at + 3] == DECORATION_BUILTIN && words[i.at + 4] == BUILTIN_VERTEX_INDEX)
+    });
+    let sine = list.iter().any(|i| i.op == OP_EXT_INST && i.len >= 5 && words[i.at + 4] == GLSL_SIN);
+    if vertex_index || sine {
+        return false;
+    }
     let pointee = |id: u32| list.iter().find(|i| i.op == OP_TYPE_VECTOR && i.len >= 4 && words[i.at + 1] == id).map(|i| words[i.at + 2]);
     let is_int = |id: u32| list.iter().any(|i| i.op == OP_TYPE_INT && i.len >= 3 && words[i.at + 1] == id);
     let inputs = flow.inputs_at(0);

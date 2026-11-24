@@ -374,29 +374,40 @@ cache, so what a moving player wears leaves no trail.
 Neon parts give off light: the client recognises the engine's Neon shader
 (its colour `4 * pow(colour * 1.35, 4)`, unlit) and captures those parts even
 where the engine draws them blending, so they show in reflections at their
-own brightness, in view or not, and light their surroundings in the indirect
-light below (taken at a quarter of their drawn brightness, falling off
-faster beyond 12 studs). Terrain (grass,
-rock, sand; not water) is captured too: its shaders pass on no colour, so it
-is grey until the screen has shown it, then in the colour the screen showed
-it in. devctl `rt view category` colours what each reflection ray hit (yellow
-Neon, green terrain, white a part that stays in place, grey one that moves,
-dark blue nothing), and `rt kind neon|terrain on|off` leaves a kind out, for
-bisecting.
+own brightness (above white, so even a faint reflection of them glows), in
+view or not. In the indirect light below, each 16 by 16 pixel tile lists the
+eight Neon triangles that light it most, with whether they are in sight, and
+their light is taken exactly (each triangle's form factor at full brightness,
+no random samples), so the glow beside a Neon panel is strong and steady.
+Terrain (grass, rock, sand) is captured too, without its swaying decoration
+grass and without water: its shaders pass on no colour, so it is grey until
+the screen has shown it, then in the colour the screen showed it in; terrain
+reflects nothing itself (it is rough), and pixels of things the capture
+leaves out (the decoration grass) get no indirect light, which would change
+every frame. devctl `rt view category` colours what each reflection ray hit
+(yellow Neon, green terrain, white a part that stays in place, grey one that
+moves, dark blue nothing), and `rt kind neon|terrain on|off` leaves a kind
+out, for bisecting.
 
 Diffuse indirect light, more experimental still and off unless
-`INTOXICATED_RT_GI=1` at start (devctl `rt gi on|off` then): one ray per
-block of pixels a frame in a cosine-weighted direction (a low-discrepancy
-sequence shifted per block), plus a ray towards one of the Neon parts. A hit
-the screen shows takes its light from the screen, with the engine's own lamps
-in it; any other hit is lit as the engine lights it (one bounce; a miss takes
-the sky). The rays are gathered over up to 32 frames at the same point in the
-world (sooner forgotten when the light there changes), smoothed by two small
-a-trous filter passes that stop at edges in depth and normal and between
-light and dark (guided by the noise measured at each point, as SVGF does),
-and put in place of the engine's own ambient light, so corners darken and
-coloured walls tint what faces them. It is computed before the reflections,
-so they show it. It takes about 160 MB more video memory when on.
+`INTOXICATED_RT_GI=1` at start (devctl `rt gi on|off` then): one ray per 2
+by 2 pixels every other frame (in a checkerboard) in a cosine-weighted
+direction. A hit the screen shows takes its light from the screen, with the
+engine's own lamps in it; any other hit is lit as the engine lights it (one
+bounce; a miss takes the sky); the Neon light is added as above. The rays
+are gathered over up to 32 frames at the same point in the world (sooner
+forgotten when the light there changes), smoothed by three a-trous filter
+passes that stop at edges in depth and normal and between light and dark
+(guided by the noise measured at each point, as SVGF does), and put in place
+of the engine's own ambient light, so corners darken and coloured walls tint
+what faces them. It is computed before the reflections, so they show it. It
+takes about 160 MB more video memory when on.
+
+A soft look (`INTOXICATED_RT_SOFT=1`, devctl `rt soft on|off`) traces on 4
+by 4 blocks and blurs the reflections widely, stretched down the screen as a
+glossy floor streaks them (up to 6 to 1, more the further the reflected thing
+and the more grazing the view), stopping only where the receiving surface
+changes, so it never bleeds onto walls or players and shows no steps.
 
 The reflections trace one ray per block of 2 by 2 pixels at any size
 (`INTOXICATED_RT_BLOCK=1` for one per pixel), from a different pixel of the
@@ -404,8 +415,8 @@ block each frame; each pixel keeps a history, found where the reflected thing
 was a frame ago (its mirror image, by the hit distance), held to what the
 pixels around it show now and kept over up to 12 frames while the camera is
 still and 3 while it turns, so reflected edges come out smooth rather than in
-block steps. The indirect light traces one ray per block twice as wide, and
-coarser by up to two steps while the trace takes more than the 4.5 ms budget
+block steps. The indirect light traces on the same blocks, twice as wide
+while the trace takes more than the 4.5 ms budget
 leaves after the hierarchy's build (`rt stats`: `blocks`, `gi_blocks`). Only
 at 2 by 2 with the indirect light at its finest do near curved pixels trace
 their own rays. `rt stats` also reports the render thread's time in the

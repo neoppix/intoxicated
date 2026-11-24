@@ -99,6 +99,10 @@ const SPIRV_GI_FILTER: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_gi_fi
 /// `ssr/ssr.comp` with `RT` and `RTEMPORAL`, and with `RT` and `RRESOLVE`.
 const SPIRV_TEMPORAL: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_temporal.spv.rs"));
 const SPIRV_RESOLVE: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_resolve.spv.rs"));
+/// `ssr/ssr.comp` with `RT` and `LIGHTS`.
+const SPIRV_LIGHTS: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_lights.spv.rs"));
+/// `ssr/ssr.comp` with `RT` and `RBLUR`.
+const SPIRV_BLUR: &[u32] = include!(concat!(env!("OUT_DIR"), "/ssr_rt_blur.spv.rs"));
 
 const PREP: usize = 0;
 const SORT_LOCAL: usize = 1;
@@ -116,14 +120,20 @@ const GI_APPLY: usize = 12;
 const GI_FILTER: usize = 13;
 const TEMPORAL: usize = 14;
 const RESOLVE: usize = 15;
-const PIPELINES: usize = 16;
+const LIGHTS: usize = 16;
+const BLUR: usize = 17;
+const PIPELINES: usize = 18;
 /// The bindings of our set: 0 the capture, 2 the sorted keys, 3 the nodes,
 /// 4 the parents, 5 the flags, 6 the globals, 7 the traced blocks, 8 the
 /// triangles to trace, 9 the cache, 10 this frame's draws, 11 its textures
 /// by serial, 12 the environment, 13 and 14 the indirect light, 15 and 16
 /// the filtered indirect light, 17 the triangles that give off light, 18
-/// and 19 the reflections' history.
-const BINDINGS: [u32; 19] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19];
+/// and 19 the reflections' history, 20 the Neon lights per screen tile.
+const BINDINGS: [u32; 20] = [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20];
+/// Screen tiles of the Neon light lists (`LIGHT_TILE` in ssr.comp), and
+/// bytes a tile (`LIGHTS_PER_TILE` entries).
+const LIGHT_TILE: u32 = 16;
+const TILE_BYTES: u64 = 4 * 8;
 /// Bytes of the reflections' history a pixel (`ssr.comp` `refl_a`).
 const REFL_BYTES: u64 = 16;
 /// Bytes of the indirect light a 2 by 2 block.
@@ -267,6 +277,25 @@ const FLAG_TEMPORAL: u32 = 1 << 16;
 /// (2 unless set).
 pub const BLOCK_ENV: &str = "INTOXICATED_RT_BLOCK";
 
+/// The soft look (`INTOXICATED_RT_SOFT=1`, devctl `rt soft on|off`): rays
+/// on blocks of `SOFT_BLOCK` pixels, then a wide blur stretched down the
+/// screen that stops only where the receiving surface changes.
+pub const SOFT_ENV: &str = "INTOXICATED_RT_SOFT";
+const SOFT_BLOCK: u32 = 4;
+static SOFT_ON: OnceLock<AtomicBool> = OnceLock::new();
+
+fn soft_switch() -> &'static AtomicBool {
+    SOFT_ON.get_or_init(|| AtomicBool::new(std::env::var(SOFT_ENV).is_ok_and(|v| v.trim() == "1")))
+}
+
+pub(crate) fn soft_on() -> bool {
+    soft_switch().load(Relaxed)
+}
+
+pub(crate) fn set_soft(on: bool) {
+    soft_switch().store(on, Relaxed);
+}
+
 fn block_size() -> u32 {
     static B: OnceLock<u32> = OnceLock::new();
     *B.get_or_init(|| if std::env::var(BLOCK_ENV).is_ok_and(|v| v.trim() == "1") { 1 } else { 2 })
@@ -275,7 +304,7 @@ fn block_size() -> u32 {
 /// looked at every `BUDGET_FRAMES` frames; `MAX_COARSER` steps at most.
 const BUDGET_MS: f64 = 4.5;
 const BUDGET_FRAMES: u32 = 120;
-const MAX_COARSER: u32 = 2;
+const MAX_COARSER: u32 = 1;
 
 fn env_switch() -> &'static AtomicBool {
     ENV_ON.get_or_init(|| AtomicBool::new(std::env::var(ENV_ENV).map_or(true, |v| v.trim() != "0")))
@@ -500,6 +529,9 @@ struct Gpu {
     /// pixels it has room for.
     refl: [Owned; 2],
     pixel_room: u64,
+    /// The Neon lights per screen tile, and the tiles it has room for.
+    tiles: Owned,
+    tile_room: u64,
     /// The ring slot of the last trace, whose set 2 the apply pass binds.
     last_slot: usize,
     /// A zeroed stand-in for the engine's per-frame uniform block.
@@ -610,6 +642,7 @@ impl Gpu {
             self.emitters,
             self.refl[0],
             self.refl[1],
+            self.tiles,
             self.no_frame_block,
             self.readback,
             self.cache_copy,
@@ -705,6 +738,8 @@ fn make_gpu(device: usize, ssr_set_layout: u64, timed: bool, extent: [u32; 2]) -
         emitters: Owned::default(),
         refl: [Owned::default(); 2],
         pixel_room: extent[0].max(2560) as u64 * extent[1].max(1440) as u64,
+        tiles: Owned::default(),
+        tile_room: extent[0].max(ROOM_FOR[0]).div_ceil(LIGHT_TILE) as u64 * extent[1].max(ROOM_FOR[1]).div_ceil(LIGHT_TILE) as u64,
         last_slot: 0,
         no_frame_block: Owned::default(),
         cache_copy: Owned::default(),
@@ -888,6 +923,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         make_buffer(&g.buffers, d, &types, REFL_BYTES * g.pixel_room, usage, false)?,
         make_buffer(&g.buffers, d, &types, REFL_BYTES * g.pixel_room, usage, false)?,
     ];
+    g.tiles = make_buffer(&g.buffers, d, &types, TILE_BYTES * g.tile_room, usage, false)?;
     g.no_frame_block = make_buffer(&g.buffers, d, &types, FRAME_BLOCK_BYTES, USAGE_UNIFORM | USAGE_TRANSFER_DST, false)?;
     make_textures(g, &types)?;
     g.readback = make_buffer(&g.buffers, d, &types, READBACK_BYTES, USAGE_TRANSFER_DST, true)?;
@@ -959,6 +995,8 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         SPIRV_GI_FILTER,
         SPIRV_TEMPORAL,
         SPIRV_RESOLVE,
+        SPIRV_LIGHTS,
+        SPIRV_BLUR,
     ];
     for (i, code) in codes.into_iter().enumerate() {
         g.shaders[i] = shader(f, d, code)?;
@@ -975,7 +1013,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
                 name: c"main".as_ptr(),
                 specialization: none,
             },
-            layout: if matches!(i, TRACE | UPSAMPLE | GATHER | ENV | GI | GI_APPLY | GI_FILTER | TEMPORAL | RESOLVE) { g.trace_layout } else { g.build_layout },
+            layout: if matches!(i, TRACE | UPSAMPLE | GATHER | ENV | GI | GI_APPLY | GI_FILTER | TEMPORAL | RESOLVE | LIGHTS | BLUR) { g.trace_layout } else { g.build_layout },
             base_pipeline: 0,
             base_pipeline_index: -1,
         };
@@ -1012,6 +1050,7 @@ fn fill_gpu(g: &mut Gpu, ssr_set_layout: u64, capacity: u64, timed: bool) -> Res
         DescriptorBufferInfo { buffer: g.emitters.buffer, offset: 0, range: EMITTERS_BYTES },
         DescriptorBufferInfo { buffer: g.refl[0].buffer, offset: 0, range: REFL_BYTES * g.pixel_room },
         DescriptorBufferInfo { buffer: g.refl[1].buffer, offset: 0, range: REFL_BYTES * g.pixel_room },
+        DescriptorBufferInfo { buffer: g.tiles.buffer, offset: 0, range: TILE_BYTES * g.tile_room },
     ];
     let writes: Vec<WriteDescriptorSet> = infos
         .iter()
@@ -1121,8 +1160,8 @@ pub(crate) fn record(
         g.cache_copy_ptr = mapped as usize;
     }
     // The blocks' size: the reflections' `INTOXICATED_RT_BLOCK` pixels a
-    // side (2 unless set to 1), never coarser; the indirect light's twice
-    // that, coarser while the GPU time stays over the budget, finer again
+    // side (2 unless set to 1), never coarser; the indirect light's the
+    // same, twice that while the GPU time stays over the budget, back again
     // well under it.
     g.budget_frames += 1;
     if g.budget_frames >= BUDGET_FRAMES {
@@ -1138,8 +1177,8 @@ pub(crate) fn record(
             g.coarser -= 1;
         }
     }
-    let rscale = block_size();
-    let scales = (rscale, rscale * (2 + 2 * g.coarser));
+    let rscale = if soft_on() { SOFT_BLOCK } else { block_size() };
+    let scales = (rscale, rscale * (1 + g.coarser));
     let rescaled = g.scales != scales;
     g.scales = scales;
     st.stats.scales = scales;
@@ -1382,10 +1421,17 @@ pub(crate) fn record(
     if gi_run {
         // The indirect light first, so the reflections can show it (flags
         // bit 14): one ray a block, accumulated over frames, then filtered
-        // by two a-trous passes 1 and 2 blocks apart (the step in `steps`);
-        // applied after the reflections' compose (see `record_gi_apply`).
+        // by three a-trous passes 1, 2 and 4 blocks apart (the step in
+        // `steps`); applied after the reflections' compose (see
+        // `record_gi_apply`). First the Neon lights each screen tile takes.
+        let tiles = [extent[0].div_ceil(LIGHT_TILE), extent[1].div_ceil(LIGHT_TILE)];
+        if tiles[0] as u64 * tiles[1] as u64 <= g.tile_room {
+            (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[LIGHTS]);
+            (f.cmd_dispatch)(cmd, tiles[0].div_ceil(8), tiles[1].div_ceil(8), 1);
+            g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
+        }
         half(GI);
-        for step in [1u32, 2] {
+        for step in [1u32, 2, 4] {
             g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
             push(&super::super::ssr::Params { steps: step, ..tp });
             half(GI_FILTER);
@@ -1405,6 +1451,15 @@ pub(crate) fn record(
             g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
             (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[pipeline]);
             (f.cmd_dispatch)(cmd, extent[0].div_ceil(8), extent[1].div_ceil(8), 1);
+        }
+        if soft_on() {
+            // The soft look's blur, across then down (`steps`).
+            (f.cmd_bind_pipeline)(cmd, BIND_POINT_COMPUTE, g.pipelines[BLUR]);
+            for step in [1u32, 2] {
+                g.barrier(cmd, STAGE_COMPUTE, ACCESS_SHADER_WRITE);
+                push(&super::super::ssr::Params { steps: step, ..tp });
+                (f.cmd_dispatch)(cmd, extent[0].div_ceil(8), extent[1].div_ceil(8), 1);
+            }
         }
     }
     stamp(2);
@@ -1560,7 +1615,7 @@ pub(crate) fn stats_line() -> String {
     let st = state();
     let s = &st.stats;
     format!(
-        "on={} reflections={} shade={} engine_light={} environment={} gi={} view={} blocks={}x{} gi_blocks={}x{} traced={} skipped={} keys={} {} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} gpu_samples={}{}",
+        "on={} reflections={} shade={} engine_light={} environment={} gi={} view={} soft={} blocks={}x{} gi_blocks={}x{} traced={} skipped={} keys={} {} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} gpu_samples={}{}",
         is_on(),
         if super::super::ssr::reflections_on() { "on" } else { "off" },
         SHADES[shade().load(Relaxed)],
@@ -1568,6 +1623,7 @@ pub(crate) fn stats_line() -> String {
         if env_on() { "on" } else { "off" },
         if gi_on() { "on" } else { "off" },
         VIEWS[VIEW.load(Relaxed) as usize],
+        if soft_on() { "on" } else { "off" },
         s.scales.0,
         s.scales.0,
         s.scales.1,

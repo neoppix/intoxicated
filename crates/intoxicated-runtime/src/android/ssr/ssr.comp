@@ -60,7 +60,7 @@ layout(binding = 3, r32ui) uniform uimage2D result_img;
 #ifdef COMPOSE
 layout(binding = 3, r32ui) uniform writeonly uimage2D out_img;
 layout(binding = 5) uniform sampler2D trace_tex;
-#elif !defined(RTEMPORAL)
+#elif !defined(RTEMPORAL) && !defined(RBLUR)
 layout(binding = 4, rgba16f) uniform writeonly image2D trace_img;
 #endif
 
@@ -861,7 +861,19 @@ const uint FULL_RATE_MAX = 65536u;
 // smooth where the engine shades smoothly. N (the depth's) where the ray
 // meets no triangle at the depth's distance, the triangle carries no
 // normals, or they turn more than 60 degrees from N.
+// The texture mode (`capture::MODE_*`) of the triangle `rt_normal` found
+// under the pixel, 0 where it found none: 3 is terrain, which is rough
+// (grass, sand, rock) and reflects nothing.
+uint g_own_mode = 0u;
+// Whether the pixel's surface is captured geometry: false where the ray
+// from the camera finds no triangle at its depth within NORMAL_REACH (the
+// engine's decoration grass, particles: things that sway or change every
+// frame); true beyond it, where it is not looked for.
+bool g_own_found = true;
+
 vec3 rt_normal(vec3 P, vec3 N) {
+    g_own_mode = 0u;
+    g_own_found = true;
     float dist = length(P) * g_near;
     // Further away a triangle covers a few pixels and the evened-out normal
     // is as good, for no ray.
@@ -873,8 +885,10 @@ vec3 rt_normal(vec3 P, vec3 N) {
     vec2 uv;
     float t = trace_ray(cam_pos.xyz, D, 0.5 * g_near, dist * 1.03, tri, uv);
     if (t < 0.0 || abs(t - dist) > 0.015 * dist) {
+        g_own_found = false;
         return N;
     }
+    g_own_mode = floatBitsToUint(tris[TRI_VEC4 * tri + 4u].z) >> 30;
     uvec4 packed = floatBitsToUint(tris[TRI_VEC4 * tri + 5u]);
     if ((packed.w & 1u) == 0u) {
         return N;
@@ -958,14 +972,14 @@ const float NEON_NEAR = 12.0;
 // The indirect light is held to GI_MOST times the engine's ambient plus
 // GI_MOST_ADD (a stray sample cannot wash a wall out; a Neon glow stays).
 const float GI_MOST = 8.0;
-const float GI_MOST_ADD = 1.5;
+const float GI_MOST_ADD = 4.0;
 
 vec3 emitter_light(vec3 X, vec3 n, uint seed) {
     uint count = min(emitters_n, MAX_EMITTERS);
     if (count == 0u) {
         return vec3(0.0);
     }
-    const int M = 4;
+    const int M = 8;
     float wsum = 0.0, chosen_p = 0.0;
     vec3 chosen_f = vec3(0.0), chosen_y = vec3(0.0);
     uint pick = hash(seed ^ 0x5bd1e995u);
@@ -1027,6 +1041,80 @@ vec3 emitter_light(vec3 X, vec3 n, uint seed) {
     return min(chosen_f / chosen_p * (wsum / float(M)), vec3(4.0));
 }
 
+// Per screen tile of LIGHT_TILE pixels a side, the Neon triangles that light
+// it most (`-DRT -DLIGHTS`): LIGHTS_PER_TILE entries, each the triangle's
+// index with bit 31 set where a ray from the tile's middle reaches it, or
+// ~0 for none.
+layout(std430, set = 1, binding = 20) buffer Tiles { uint tiles[]; };
+const int LIGHT_TILE = 16;
+const int LIGHTS_PER_TILE = 8;
+const uint NO_LIGHT = 0xffffffffu;
+
+uvec2 light_tiles() {
+    return (pc.size + uint(LIGHT_TILE) - 1u) / uint(LIGHT_TILE);
+}
+
+// The Neon triangle's colour at its middle.
+vec3 emitter_colour(uint tri) {
+    uint at = TRI_VEC4 * tri;
+    return (unpackUnorm4x8(floatBitsToUint(tris[at].w)).rgb + unpackUnorm4x8(floatBitsToUint(tris[at + 1u].w)).rgb
+        + unpackUnorm4x8(floatBitsToUint(tris[at + 2u].w)).rgb) / 3.0;
+}
+
+// The light a Neon triangle gives a point X with normal n, exactly, in the
+// GI's units (the cosine-weighted average of the light coming in): its
+// radiance, at the engine's full Neon brightness, times its form factor
+// (Lambert's polygon formula: the sum over its edges of the angle each
+// spans times the normal's share of that edge's plane, over 2 pi). Smooth,
+// no samples, no noise.
+vec3 polygon_light(uint tri, vec3 X, vec3 n) {
+    vec3 v[3];
+    for (uint k = 0u; k < 3u; ++k) {
+        vec3 d = tri_world(3u * tri + k) - X;
+        float l = length(d);
+        if (l < 1e-4) {
+            return vec3(0.0);
+        }
+        v[k] = d / l;
+    }
+    float sum = 0.0;
+    for (int k = 0; k < 3; ++k) {
+        vec3 a = v[k], b = v[(k + 1) % 3];
+        vec3 c = cross(a, b);
+        float lc = length(c);
+        if (lc < 1e-6) {
+            continue;
+        }
+        sum += acos(clamp(dot(a, b), -1.0, 1.0)) * dot(n, c / lc);
+    }
+    // The winding decides the sign; a triangle behind the surface (both
+    // signs cancel only partly) is left out where it lies below it.
+    float ff = abs(sum) / 6.2831853;
+    vec3 mid = (tri_world(3u * tri) + tri_world(3u * tri + 1u) + tri_world(3u * tri + 2u)) / 3.0;
+    if (dot(mid - X, n) <= 0.0) {
+        return vec3(0.0);
+    }
+    return emission_of(tri, emitter_colour(tri)) * min(ff, 1.0);
+}
+
+// All the Neon light the tile around pixel `at` lists, at X with normal n.
+vec3 tile_light(uvec2 at, vec3 X, vec3 n) {
+    uvec2 lt = light_tiles();
+    uvec2 t = min(at / uint(LIGHT_TILE), lt - 1u);
+    uint base = (t.y * lt.x + t.x) * uint(LIGHTS_PER_TILE);
+    vec3 sum = vec3(0.0);
+    for (int k = 0; k < LIGHTS_PER_TILE; ++k) {
+        uint e = tiles[base + uint(k)];
+        if (e == NO_LIGHT) {
+            break;
+        }
+        if ((e >> 31) != 0u) {
+            sum += polygon_light(e & 0x7fffffffu, X, n);
+        }
+    }
+    return sum;
+}
+
 // The filtered indirect light at pixel `at` (GIFILTER's last pass, on the
 // indirect light's grid), or -1 in x where there is none this frame (flags
 // bit 14: GI ran first).
@@ -1037,7 +1125,7 @@ vec3 gi_at(uvec2 at) {
     uint s = clamp(gscale, 1u, 16u);
     uvec2 gs = (pc.size + s - 1u) / s;
     uvec2 hb = min(at / s, gs - 1u);
-    uvec2 f = gi_fb[hb.y * gs.x + hb.x];
+    uvec2 f = gi_fa[hb.y * gs.x + hb.x];
     if (f == uvec2(0u)) {
         return vec3(-1.0);
     }
@@ -1196,8 +1284,12 @@ vec4 reflection_rt(ivec2 p, vec3 P, vec3 N, float wet) {
         gi = gi_at(uvec2(at));
     }
     if (emits(tri)) {
-        // A Neon part: the light it gives off, as the engine draws it.
-        own = sqrt(clamp(emission_of(tri, own) * frame_block[20].y, 0.0, 1.0));
+        // A Neon part: the light it gives off, as the engine draws it, and
+        // kept above white (the trace image holds halves): even a few
+        // percent of reflection at a steep angle shows it glowing, where a
+        // white of 1 would leave it dull grey. Held to 16 before the
+        // exposure's square root.
+        own = sqrt(clamp(emission_of(tri, own) * frame_block[20].y, 0.0, 16.0));
     } else if ((pc.flags & 12288u) == 12288u) {
         // Lit (flags bit 13, with the engine's light bound, bit 12; bits 8
         // to 11 are the colour format's): the hit's
@@ -1373,6 +1465,12 @@ void main() {
         return;
     }
     vec3 nv = surface_normal(p, P, N);
+    if (!g_own_found) {
+        // Not captured (the engine's swaying decoration grass): no
+        // indirect light there, which would change with every frame.
+        if (odd) { gi_b[2u * i] = uvec4(0u); } else { gi_a[2u * i] = uvec4(0u); }
+        return;
+    }
     vec3 n = normalize(world_dir(nv));
     vec3 X = to_world(P);
     float dist = length(P) * g_near;
@@ -1406,15 +1504,13 @@ void main() {
     }
     vec3 acc = old;
     vec2 moments = moments_old;
-    {
-    // A cosine-weighted direction around n, from a low-discrepancy
-    // sequence over frames (R2) shifted per block by interleaved gradient
-    // noise, so neighbouring blocks and frames sample apart (blue-noise-like,
-    // fewer clumps than random).
+    // A block traces a new ray every other frame (in a checkerboard) and
+    // otherwise keeps what it had (as 44b08da6 did, whose look the owner
+    // prefers).
+    if (frames < 1.0 || ((uint(b.x + b.y) + frame) & 1u) == 0u) {
+    // A cosine-weighted direction around n.
     uint h = hash(i * 9781u + frame * 6271u);
-    float ign = fract(52.9829189 * fract(0.06711056 * float(b.x) + 0.00583715 * float(b.y)));
-    vec2 u2 = fract(vec2(ign, fract(ign * 7.13 + 0.37)) + float(frame & 1023u) * vec2(0.7548776662, 0.5698402910));
-    float r1 = u2.x, r2 = u2.y;
+    float r1 = float(h & 0xffffu) / 65536.0, r2 = float(h >> 16) / 65536.0;
     float phi = 6.2831853 * r1;
     float sr = sqrt(r2);
     vec3 t1 = normalize(abs(n.y) < 0.9 ? cross(n, vec3(0.0, 1.0, 0.0)) : cross(n, vec3(1.0, 0.0, 0.0)));
@@ -1426,8 +1522,8 @@ void main() {
     vec3 L;
     float exposure_ = max(frame_block[20].y, 1e-3);
     if (t > 0.0 && emits(tri)) {
-        // A Neon part: its light comes in through `emitter_light` instead,
-        // which aims at such parts (counted once).
+        // A Neon part: its light comes in through `tile_light` instead
+        // (counted once).
         L = vec3(0.0);
     } else if (t > 0.0) {
         vec3 Hw = X + n * (0.002 * dist + 0.02) + dir * t;
@@ -1474,11 +1570,10 @@ void main() {
         vec4 env = environment(dir);
         L = env.a > 0.0 ? env.rgb * env.rgb / exposure_ : engine_ambient(dir);
     }
-    // The Neon parts' light, wherever they are, in view or not.
-    // Two samples of it (each resampled from four), averaged.
-    vec3 Xo = X + n * (0.002 * dist + 0.02);
-    L += 0.5 * (emitter_light(Xo, n, h ^ 0x68e31da4u) + emitter_light(Xo, n, h ^ 0x1b873593u));
-    L = min(L, vec3(16.0));
+    // The Neon parts' light, exactly, from the ones the tile lists (the
+    // LIGHTS pass), in view or not.
+    L += tile_light(uvec2(p), X + n * (0.002 * dist + 0.02), n);
+    L = min(L, vec3(32.0));
     // Accumulated over up to 32 frames, with the first two moments of its
     // brightness for the filter's variance. A sample far outside what the
     // history's moments allow (the light changed) halves the history, so it
@@ -1506,18 +1601,95 @@ void main() {
     }
 }
 
+#elif defined(RT) && defined(LIGHTS)
+
+// The light list pass (`-DRT -DLIGHTS`), per screen tile: from the tile's
+// middle pixel's surface, every listed Neon triangle (up to 4096 of them)
+// weighed by what it gives there (its brightness times its area times the
+// two cosines over the squared distance), the LIGHTS_PER_TILE strongest
+// kept, each with whether a ray from the surface reaches its middle. The
+// GI pass then takes their light exactly (`tile_light`), the same every
+// frame while nothing moves, so the glow beside a Neon panel is steady.
+void main() {
+    camera_from_fit();
+    uvec2 t = gl_GlobalInvocationID.xy;
+    uvec2 lt = light_tiles();
+    if (any(greaterThanEqual(t, lt))) {
+        return;
+    }
+    uint base = (t.y * lt.x + t.x) * uint(LIGHTS_PER_TILE);
+    uint best[LIGHTS_PER_TILE];
+    float score[LIGHTS_PER_TILE];
+    for (int k = 0; k < LIGHTS_PER_TILE; ++k) {
+        best[k] = NO_LIGHT;
+        score[k] = 0.0;
+    }
+    ivec2 p = min(ivec2(t) * LIGHT_TILE + LIGHT_TILE / 2, ivec2(pc.size) - 1);
+    float d = depth_at(p);
+    uint count = min(min(emitters_n, MAX_EMITTERS), 4096u);
+    vec3 X = vec3(0.0), n = vec3(0.0);
+    if (d > 0.0 && g_fit && count > 0u) {
+        vec3 P = view_pos(vec2(p) + 0.5, d);
+        vec3 N = surface_at(p, P).n;
+        if (N != vec3(0.0)) {
+            n = normalize(world_dir(N));
+            X = to_world(P) + n * (0.002 * length(P) * g_near + 0.02);
+            for (uint i = 0u; i < count; ++i) {
+                uint tri = emitters[i];
+                vec3 A = tri_world(3u * tri), B = tri_world(3u * tri + 1u), C = tri_world(3u * tri + 2u);
+                vec3 mid = (A + B + C) / 3.0;
+                vec3 e = cross(B - A, C - A);
+                float area2 = length(e);
+                vec3 dv = mid - X;
+                float d2 = max(dot(dv, dv), 0.25);
+                vec3 dir = dv * inversesqrt(d2);
+                float cx = dot(n, dir);
+                if (cx <= 0.0 || area2 < 1e-8) {
+                    continue;
+                }
+                float s = dot(emission_of(tri, emitter_colour(tri)), vec3(0.2126, 0.7152, 0.0722)) * 0.5 * area2 * cx
+                    * max(abs(dot(e / area2, dir)), 0.1) / d2;
+                if (!(s > score[LIGHTS_PER_TILE - 1])) {
+                    continue;
+                }
+                // Into the sorted list, the weakest falling off its end.
+                int k = LIGHTS_PER_TILE - 1;
+                while (k > 0 && score[k - 1] < s) {
+                    score[k] = score[k - 1];
+                    best[k] = best[k - 1];
+                    --k;
+                }
+                score[k] = s;
+                best[k] = tri;
+            }
+        }
+    }
+    for (int k = 0; k < LIGHTS_PER_TILE; ++k) {
+        uint e = best[k];
+        if (e != NO_LIGHT) {
+            vec3 mid = (tri_world(3u * e) + tri_world(3u * e + 1u) + tri_world(3u * e + 2u)) / 3.0;
+            float len = distance(mid, X);
+            uint st;
+            vec2 su;
+            bool seen = trace_ray(X, (mid - X) / max(len, 1e-4), 0.01, len * 0.97, st, su) < 0.0;
+            e |= seen ? 0x80000000u : 0u;
+        }
+        tiles[base + uint(k)] = e;
+    }
+}
+
 #elif defined(RT) && defined(GIFILTER)
 
-// The GI filter (`-DRT -DGIFILTER`), run twice after the GI pass, `pc.steps`
-// 1 and 2 blocks apart (an a-trous wavelet filter, as in SVGF, kept small so
-// the few samples are not smeared into blobs): each block the 3 by 3 blocks
-// that far apart around it, weighted by a B-spline, by how near they lie to
-// its surface's plane, by how alike their normals are and by how alike
-// their light is, measured against the noise its variance (from the moments
-// the GI pass keeps, or the last pass's) leaves; the variance filtered along
-// with the light. Step 1 reads the GI pass's result into `gi_fa`, 2 that
-// into `gi_fb`, which the apply and the reflections take.
-const float KERNEL[2] = float[](0.5, 0.25);
+// The GI filter (`-DRT -DGIFILTER`), run three times after the GI pass,
+// `pc.steps` 1, 2 and 4 blocks apart (an a-trous wavelet filter, as in
+// SVGF): each block the 5 by 5 blocks that far apart around it, weighted by
+// a B-spline, by how near they lie to its surface's plane, by how alike
+// their normals are and by how alike their light is, measured against the
+// noise its variance (from the moments the GI pass keeps, or the last
+// pass's) leaves; the variance filtered along with the light. Step 1 reads
+// the GI pass's result into `gi_fa`, 2 that into `gi_fb`, 4 that into
+// `gi_fa` again, which the apply and the reflections take.
+const float KERNEL[3] = float[](0.375, 0.25, 0.0625);
 
 void light_of(uint k, bool odd, out vec3 L, out float variance) {
     if (pc.steps <= 1u) {
@@ -1533,7 +1705,7 @@ void light_of(uint k, bool odd, out vec3 L, out float variance) {
             variance = max(variance, m.x * m.x);
         }
     } else {
-        uvec2 f = gi_fa[k];
+        uvec2 f = pc.steps == 2u ? gi_fa[k] : gi_fb[k];
         vec2 bv = unpackHalf2x16(f.y);
         L = vec3(unpackHalf2x16(f.x), bv.x);
         variance = bv.y;
@@ -1569,8 +1741,8 @@ void main() {
         vec3 sum = vec3(0.0);
         float sv = 0.0, ws = 0.0;
         int step_ = int(max(pc.steps, 1u));
-        for (int y = -1; y <= 1; ++y) {
-            for (int x = -1; x <= 1; ++x) {
+        for (int y = -2; y <= 2; ++y) {
+            for (int x = -2; x <= 2; ++x) {
                 ivec2 q = b + ivec2(x, y) * step_;
                 if (any(greaterThanEqual(uvec2(q), hs))) {
                     continue;
@@ -1603,7 +1775,7 @@ void main() {
             result = uvec2(packHalf2x16(o.rg), packHalf2x16(vec2(o.b, min(sv / (ws * ws), 1000.0))));
         }
     }
-    if (pc.steps >= 2u) {
+    if (pc.steps == 2u) {
         gi_fb[i] = result;
     } else {
         gi_fa[i] = result;
@@ -1738,6 +1910,96 @@ void main() {
     imageStore(trace_img, p, vec4(unpackHalf2x16(e.x), unpackHalf2x16(e.y)));
 }
 
+#elif defined(RT) && defined(RBLUR)
+
+// The soft look's blur (`-DRT -DRBLUR`, devctl `rt soft on`): a separable
+// gaussian over the reflections, across (`steps` 1) then down (2, longer:
+// streaks), its radius growing with the roughness and with how far the
+// reflected thing is (sharper where it touches the surface, very soft far
+// off), stopped only
+// where the receiving surface changes (a tap off this pixel's plane, or
+// turned away), never by what is reflected, so no block can show as a
+// step. Across: the trace image into the free history buffer (the one the
+// temporal pass read from); down: that into the trace image.
+layout(binding = 4, rgba16f) uniform image2D trace_rw;
+
+vec4 tap(ivec2 q, bool across) {
+    uint at = uint(q.y) * pc.size.x + uint(q.x);
+    if (across) {
+        return imageLoad(trace_rw, q);
+    }
+    // The free buffer: the one the temporal pass read (last frame's).
+    uvec4 e = (frame & 1u) != 0u ? refl_a[at] : refl_b[at];
+    return vec4(unpackHalf2x16(e.x), unpackHalf2x16(e.y));
+}
+
+void main() {
+    camera_from_fit();
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(p), pc.size))) {
+        return;
+    }
+    bool across = pc.steps <= 1u;
+    uint at = uint(p.y) * pc.size.x + uint(p.x);
+    vec4 own = tap(p, across);
+    vec4 o = own;
+    float d = depth_at(p);
+    if (d > 0.0 && g_fit) {
+        vec3 P = view_pos(vec2(p) + 0.5, d);
+        vec3 N = surface_at(p, P).n;
+        if (N != vec3(0.0)) {
+            uint s = grid_scale();
+            uvec2 hs = half_size();
+            uvec2 hb = min(uvec2(p) / s, hs - 1u);
+            float t = min(unpackHalf2x16(blocks[hb.y * hs.x + hb.x].w).x, 4096.0);
+            float dist = length(P) * g_near;
+            float spread = t / (t + dist + 1.0);
+            float radius = clamp((2.0 + 12.0 * spread) * (0.5 + pc.roughness), 1.5, 16.0);
+            // Stretched down the screen (along a floor's reflections, as a
+            // glossy floor streaks them), more the further the reflected
+            // thing and the more grazing the view: up to 6 to 1.
+            float grazing = 1.0 - abs(dot(N, normalize(P)));
+            if (!across) {
+                radius = min(radius * clamp(1.5 + 6.0 * spread * grazing, 1.0, 6.0), 64.0);
+            }
+            ivec2 axis = across ? ivec2(1, 0) : ivec2(0, 1);
+            float plane = dot(N, P);
+            vec4 sum = vec4(0.0);
+            float ws = 0.0;
+            for (int k = -6; k <= 6; ++k) {
+                vec2 off = vec2(axis) * (float(k) * radius / 6.0);
+                ivec2 q = clamp(p + ivec2(round(off)), ivec2(0), ivec2(pc.size) - 1);
+                float w = exp(-2.0 * float(k * k) / 36.0 * 4.0);
+                if (k != 0) {
+                    float dq = depth_at(q);
+                    if (dq <= 0.0) {
+                        continue;
+                    }
+                    vec3 Q = view_pos(vec2(q) + 0.5, dq);
+                    float off_plane = abs(dot(N, Q) - plane) / P.z;
+                    w *= 1.0 - smoothstep(0.004, 0.03, off_plane);
+                }
+                if (w > 0.0) {
+                    vec4 c = tap(q, across);
+                    if (!any(isnan(c)) && !any(isinf(c))) {
+                        sum += w * c;
+                        ws += w;
+                    }
+                }
+            }
+            if (ws > 1e-4) {
+                o = sum / ws;
+            }
+        }
+    }
+    if (across) {
+        uvec4 e = uvec4(packHalf2x16(o.rg), packHalf2x16(o.ba), 0u, 0u);
+        if ((frame & 1u) != 0u) { refl_a[at] = e; } else { refl_b[at] = e; }
+    } else {
+        imageStore(trace_rw, p, o);
+    }
+}
+
 #elif defined(RT) && defined(GIAPPLY)
 
 // The engine's colour format, read back (the inverse of `pack` in the
@@ -1818,7 +2080,7 @@ void main() {
             float off_plane = abs(dot(n, Y - X)) / max(dist, 1e-3);
             float w = (1.0 - smoothstep(0.004, 0.03, off_plane)) * max(dot(m, n), 0.0) * exp(-1.0 * float(i * i + j * j));
             // The filter's result (see GIFILTER).
-            uvec2 f = gi_fb[k];
+            uvec2 f = gi_fa[k];
             vec3 L = vec3(unpackHalf2x16(f.x), unpackHalf2x16(f.y).x);
             if (w > 0.0 && !any(isnan(L)) && !any(isinf(L))) {
                 sum += w * L;
@@ -1879,7 +2141,8 @@ void main() {
             curved = g_source > 1.5 && dot(n, N) < 0.9995;
             if (debug_) {
                 r = debug_view(n);
-            } else if (wet > 0.0) {
+            } else if (wet > 0.0 && (g_own_mode != 3u || view_ == 3u)) {
+                // (Not on terrain: grass, sand and rock are rough.)
                 r = reflection_rt(p, P, n, wet);
             }
         }
@@ -1955,7 +2218,10 @@ void main() {
                 if (curved && atomicAdd(full_rate, 1u) < FULL_RATE_MAX) {
                     vec3 n = surface_normal(p, P, N);
                     uint view_ = (pc.flags >> 6) & 3u;
-                    imageStore(trace_img, p, view_ == 1u || view_ == 2u ? debug_view(n) : reflection_rt(p, P, n, view_ == 3u ? 1.0 : wet));
+                    // Terrain is rough (grass, sand, rock): no reflection.
+                    bool rough_ = g_own_mode == 3u && view_ != 3u;
+                    imageStore(trace_img, p, view_ == 1u || view_ == 2u ? debug_view(n)
+                        : rough_ ? vec4(0.0) : reflection_rt(p, P, n, view_ == 3u ? 1.0 : wet));
                     return;
                 }
             }

@@ -537,6 +537,7 @@ env:
                                      the GPU's, at most 1536)
   INTOXICATED_RT_REACH=<studs>       cached parts traced within (512)
   INTOXICATED_RT_BLOCK=1|2           reflection rays per 1x1 or 2x2 pixels (2)
+  INTOXICATED_RT_SOFT=1              soft look: coarse rays, streaked blur
   INTOXICATED_RT_SHADE=<mode>        lit, own, mix or screen (lit)
   INTOXICATED_RT_ENV=0               no sky environment for rays that miss
   INTOXICATED_RT_GI=1                experimental diffuse indirect light
