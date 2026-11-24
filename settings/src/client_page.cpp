@@ -52,7 +52,7 @@ bool isOn(const SettingsConf &conf, const QString &key) {
 QWidget *group(QVBoxLayout *page, const QString &title, QVBoxLayout **rows) {
     Section s = section(title);
     auto *v = new QVBoxLayout(s.body);
-    v->setContentsMargins(8, 2, 8, 4);
+    v->setContentsMargins(0, 0, 0, 0);
     v->setSpacing(0);
     *rows = v;
     page->addWidget(s.box);
@@ -127,6 +127,7 @@ ClientPage::ClientPage(AppState *state) : m_state(state) {
     auto *resetRow = new QHBoxLayout;
     resetRow->addStretch(1);
     auto *reset = new QPushButton(QStringLiteral("Reset client options"));
+    setButtonIcon(reset, QStringLiteral("arrow-counter-clockwise"));
     reset->setCursor(Qt::PointingHandCursor);
     reset->setFocusPolicy(Qt::NoFocus);
     resetRow->addWidget(reset);

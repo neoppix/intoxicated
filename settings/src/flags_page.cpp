@@ -293,6 +293,7 @@ FlagsPage::FlagsPage(AppState *state) : m_state(state) {
             edit([&](FlagMap &flags) { applyQualityPreset(preset, flags); });
         });
     }
+    linkSegments(row, m_qualityButtons);
     qv->addLayout(row);
     m_qualityDesc = new QLabel;
     m_qualityDesc->setObjectName(QStringLiteral("note"));
@@ -311,7 +312,7 @@ FlagsPage::FlagsPage(AppState *state) : m_state(state) {
     Section presets = section(QStringLiteral("Presets"));
     m_presets = presets.box;
     auto *pv = new QVBoxLayout(presets.body);
-    pv->setContentsMargins(8, 2, 8, 4);
+    pv->setContentsMargins(0, 0, 0, 0);
     pv->setSpacing(0);
     m_fps = new Combo;
     connect(m_fps, &QComboBox::activated, this, &FlagsPage::fpsChosen);
@@ -337,7 +338,7 @@ FlagsPage::FlagsPage(AppState *state) : m_state(state) {
     m_defaultsNote = new QLabel;
     m_defaultsNote->setObjectName(QStringLiteral("error"));
     m_defaultsNote->setWordWrap(true);
-    m_defaultsNote->setContentsMargins(6, 4, 6, 4);
+    m_defaultsNote->setContentsMargins(14, 4, 14, 8);
     pv->addWidget(m_defaultsNote);
     b->addWidget(m_presets);
     b->addSpacing(8);
@@ -345,8 +346,10 @@ FlagsPage::FlagsPage(AppState *state) : m_state(state) {
     // Custom flags.
     Section custom = section(QStringLiteral("Custom flags"));
     m_custom = custom.box;
+    // The table is its own rounded group; the buttons sit under it.
+    m_custom->setObjectName(QStringLiteral("plain"));
     auto *cv = new QVBoxLayout(custom.body);
-    cv->setContentsMargins(8, 8, 8, 6);
+    cv->setContentsMargins(0, 0, 0, 0);
     cv->setSpacing(8);
 
     m_table = new QTableWidget(0, 3);
@@ -374,7 +377,7 @@ FlagsPage::FlagsPage(AppState *state) : m_state(state) {
 
     m_empty = new QLabel(QStringLiteral("No flags in this profile's flags.json yet."));
     m_empty->setObjectName(QStringLiteral("note"));
-    m_empty->setContentsMargins(4, 6, 4, 6);
+    m_empty->setContentsMargins(2, 4, 2, 4);
     cv->addWidget(m_empty);
 
     m_tableError = new QLabel;
@@ -391,6 +394,10 @@ FlagsPage::FlagsPage(AppState *state) : m_state(state) {
     auto *import = new QPushButton(QStringLiteral("Import JSON..."));
     m_export = new QPushButton(QStringLiteral("Export JSON..."));
     m_reset = new QPushButton(QStringLiteral("Reset"));
+    setButtonIcon(add, QStringLiteral("plus"));
+    setButtonIcon(import, QStringLiteral("folder-open"));
+    setButtonIcon(m_export, QStringLiteral("export"));
+    setButtonIcon(m_reset, QStringLiteral("arrow-counter-clockwise"));
     for (QPushButton *button : {add, import, m_export, m_reset}) {
         button->setCursor(Qt::PointingHandCursor);
         button->setFocusPolicy(Qt::NoFocus);
@@ -532,8 +539,12 @@ void FlagsPage::fillTable() {
         auto *ch = new QHBoxLayout(cell);
         ch->setContentsMargins(0, 0, 10, 0);
         ch->addStretch(1);
-        auto *del = new QPushButton(QStringLiteral("Delete"));
+        auto *del = new QPushButton;
         del->setObjectName(QStringLiteral("deleteBtn"));
+        del->setIcon(icon(QStringLiteral("trash")));
+        del->setIconSize(QSize(18, 18));
+        del->setToolTip(QStringLiteral("Delete"));
+        del->setAccessibleName(QStringLiteral("Delete"));
         del->setCursor(Qt::PointingHandCursor);
         del->setFocusPolicy(Qt::NoFocus);
         ch->addWidget(del, 0, Qt::AlignVCenter);

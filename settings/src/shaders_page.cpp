@@ -135,7 +135,7 @@ QLabel *problemLabel() {
     auto *l = new QLabel;
     l->setObjectName(QStringLiteral("error"));
     l->setWordWrap(true);
-    l->setContentsMargins(6, 0, 6, 4);
+    l->setContentsMargins(14, 0, 14, 6);
     l->hide();
     return l;
 }
@@ -218,6 +218,7 @@ ShadersPage::ShadersPage(AppState *state) : m_state(state) {
             else
                 connect(btn, &QPushButton::clicked, this, [this, i] { modeChosen(i); });
         }
+        linkSegments(row, m_modeButtons);
         v->addLayout(row);
         m_modeDesc = note(QString());
         v->addWidget(m_modeDesc);
@@ -235,7 +236,7 @@ void ShadersPage::buildEffect(QVBoxLayout *page, int index) {
     EffectUi &fx = m_effects[index];
     Section s = section(fx.table.title);
     auto *v = new QVBoxLayout(s.body);
-    v->setContentsMargins(8, 2, 8, 4);
+    v->setContentsMargins(0, 0, 0, 0);
     v->setSpacing(0);
     page->addWidget(s.box);
     page->addSpacing(8);
@@ -264,7 +265,7 @@ void ShadersPage::buildEffect(QVBoxLayout *page, int index) {
         d->addWidget(separator());
         auto *look = new QWidget;
         auto *lv = new QVBoxLayout(look);
-        lv->setContentsMargins(6, 8, 6, 8);
+        lv->setContentsMargins(14, 8, 14, 10);
         lv->setSpacing(6);
         auto *title = new QLabel(QStringLiteral("Look"));
         title->setObjectName(QStringLiteral("rowTitle"));
@@ -282,6 +283,7 @@ void ShadersPage::buildEffect(QVBoxLayout *page, int index) {
             fx.lookButtons.append(btn);
             connect(btn, &QPushButton::clicked, this, [this, index, i] { lookChosen(index, i); });
         }
+        linkSegments(row, fx.lookButtons);
         lv->addLayout(row);
         fx.lookDesc = note(QString());
         lv->addWidget(fx.lookDesc);
@@ -353,6 +355,7 @@ void ShadersPage::buildFineTune(QVBoxLayout *rows, int index) {
                     knobMoved(index, r);
                 });
             }
+            linkSegments(row, kr.choices);
             h->addLayout(row);
         } else if (knob.kind == SsrKind::Switch) {
             kr.toggle = new Switch;

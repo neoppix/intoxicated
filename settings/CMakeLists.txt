@@ -45,5 +45,12 @@ set(logo "${CMAKE_CURRENT_SOURCE_DIR}/../packaging/branding/intoxicated-logo.png
 set_source_files_properties("${logo}" PROPERTIES QT_RESOURCE_ALIAS intoxicated-logo.png)
 qt_add_resources(intoxicated-settings branding PREFIX / FILES "${logo}")
 
+# Icons from Phosphor Icons (MIT, icons/LICENSE). icons/*.svg are the upstream
+# files; the .png beside each is that SVG rendered white at 64x64, so the app
+# needs no SVG module (style.cpp tints them):
+#   sed 's/currentColor/#ffffff/' NAME-WEIGHT.svg | rsvg-convert -w 64 -h 64 -o NAME.png
+file(GLOB icons RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}" CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/icons/*.png")
+qt_add_resources(intoxicated-settings icons PREFIX / FILES ${icons})
+
 enable_testing()
 add_test(NAME self-test COMMAND intoxicated-settings --self-test)

@@ -24,6 +24,7 @@
 #include <QVBoxLayout>
 
 #include <cstdio>
+#include <iterator>
 
 namespace intox {
 
@@ -204,7 +205,7 @@ QWidget *MainWindow::sidebar() {
     side->setObjectName(QStringLiteral("sidebar"));
     side->setFixedWidth(200);
     auto *lay = new QVBoxLayout(side);
-    lay->setContentsMargins(14, 24, 14, 16);
+    lay->setContentsMargins(8, 24, 8, 16);
     lay->setSpacing(0);
 
     auto *mark = new QLabel;
@@ -225,10 +226,18 @@ QWidget *MainWindow::sidebar() {
     m_nav->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_nav->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     m_nav->setSpacing(2);
+    m_nav->setIconSize(QSize(18, 18));
     m_nav->setCursor(Qt::PointingHandCursor);
+    // One icon per page, in pageNames() order.
+    static const char *const icons[] = {"play",  "gauge", "monitor",      "magic-wand",
+                                        "keyboard", "users", "puzzle-piece", "info"};
+    int i = 0;
     for (const QString &name : pageNames()) {
         auto *item = new QListWidgetItem(name, m_nav);
-        item->setSizeHint(QSize(0, 34));
+        item->setSizeHint(QSize(0, 36));
+        if (i < int(std::size(icons)))
+            item->setIcon(icon(QString::fromLatin1(icons[i])));
+        ++i;
     }
     lay->addWidget(m_nav, 1);
     return side;
@@ -238,7 +247,7 @@ QWidget *MainWindow::bottomBar() {
     auto *bar = new QFrame;
     bar->setObjectName(QStringLiteral("bottomBar"));
     auto *h = new QHBoxLayout(bar);
-    h->setContentsMargins(28, 10, 28, 10);
+    h->setContentsMargins(12, 9, 12, 9);
     h->setSpacing(14);
 
     m_profiles = new Combo;

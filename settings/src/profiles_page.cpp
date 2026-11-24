@@ -31,8 +31,10 @@ ProfilesPage::ProfilesPage(AppState *state) : m_state(state) {
                                 QStringLiteral("Each profile is its own Roblox account and storage. One client runs "
                                                "per profile, so two different profiles can play at the same time."));
     Section s = section(QStringLiteral("Profiles"));
+    // The table is its own rounded group; the buttons sit under it.
+    s.box->setObjectName(QStringLiteral("plain"));
     auto *v = new QVBoxLayout(s.body);
-    v->setContentsMargins(8, 8, 8, 6);
+    v->setContentsMargins(0, 0, 0, 0);
     v->setSpacing(8);
 
     m_table = new QTableWidget(0, 4);
@@ -71,6 +73,11 @@ ProfilesPage::ProfilesPage(AppState *state) : m_state(state) {
     m_import->setToolTip(QStringLiteral("Make a new profile from an exported profile file"));
     m_export->setToolTip(QStringLiteral("Save this profile's name and flags to a file. The sign-in is not included."));
     m_delete = new QPushButton(QStringLiteral("Delete..."));
+    setButtonIcon(m_new, QStringLiteral("plus"));
+    setButtonIcon(m_setDefault, QStringLiteral("star"));
+    setButtonIcon(m_import, QStringLiteral("folder-open"));
+    setButtonIcon(m_export, QStringLiteral("export"));
+    setButtonIcon(m_delete, QStringLiteral("trash"));
     for (QPushButton *button : {m_new, m_setDefault, m_import, m_export, m_delete}) {
         button->setCursor(Qt::PointingHandCursor);
         button->setFocusPolicy(Qt::NoFocus);

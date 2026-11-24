@@ -34,6 +34,15 @@ libroblox.so makes into what it believes is a Java VM. Statically linked
 (cargo:rustc-link-lib=static=jnivm). The MIT text is at
 third_party/libjnivm/LICENSE.
 -------------------------------------------------------------------------------
+Phosphor Icons
+Copyright (c) 2023 Phosphor Icons
+Licensed under the MIT License.
+https://github.com/phosphor-icons/core
+
+settings/icons/ holds the Phosphor SVGs Intoxicated Settings uses, with a white
+PNG rendered from each; the PNGs are compiled into intoxicated-settings. The
+MIT text is at settings/icons/LICENSE.
+-------------------------------------------------------------------------------
 mocktail
 Copyright 2026 komaruworld
 Licensed under the Apache License, Version 2.0.
