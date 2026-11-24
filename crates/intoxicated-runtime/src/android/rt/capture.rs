@@ -192,6 +192,9 @@ pub(crate) struct Pipeline {
     /// passes on and multiplies it with the colour it passes on, both of
     /// which are captured.
     pub albedo: Option<(u32, u32, bool)>,
+    /// It blends: its triangles count only where their colour's alpha says
+    /// they are opaque (see `build.comp` INSERT).
+    pub blends: bool,
 }
 
 /// One command buffer's recording, as far as capture goes.
@@ -236,9 +239,10 @@ struct Gpu {
     frame: u64,
     /// The bytes this frame's draws write, as counted when recorded.
     bytes: u64,
-    /// This frame's base colour textures: (first triangle, serial and mode)
-    /// each time it changes, and the views (serial, view, layout).
-    draws: Vec<[u32; 2]>,
+    /// This frame's base colour textures: (first triangle, serial and mode,
+    /// whether the pipeline blends) each time either changes, and the views
+    /// (serial, view, layout).
+    draws: Vec<[u32; 3]>,
     textures: Vec<(u32, u64, u32)>,
     /// A draw to capture found no room this frame.
     overflowed: bool,
@@ -473,7 +477,7 @@ unsafe fn is_dynamic(dynamic: *const c_void, which: &[u32]) -> bool {
 /// # Safety
 /// `info` must be a valid `VkGraphicsPipelineCreateInfo`.
 unsafe fn describe_pipeline(info: *const c_void, device: usize, modules: &HashMap<(usize, u64), Module>) -> Pipeline {
-    let mut p = Pipeline { vs: 0, fs: 0, capture: Ok(()), topology: u32::MAX, scissor: None, albedo: None };
+    let mut p = Pipeline { vs: 0, fs: 0, capture: Ok(()), topology: u32::MAX, scissor: None, albedo: None, blends: false };
     let mut fragment = None;
     let fail = |p: &mut Pipeline, why: &'static str| {
         if p.capture.is_ok() {
@@ -565,6 +569,7 @@ unsafe fn describe_pipeline(info: *const c_void, device: usize, modules: &HashMa
     // and other meshes this way, opaque or nearly): captured as opaque.
     // One without, the interface drawn in the world, is not.
     let lit_mesh = matches!(vertex, Some(Some(m)) if m.outputs.is_some_and(|o| o.normal));
+    p.blends = blends;
     if blends && !lit_mesh {
         fail(&mut p, "it blends and passes on no normal (interface drawn in the world)");
     }
@@ -1142,8 +1147,9 @@ pub(crate) fn drew(cmd: *mut c_void, kind: &'static str, count: u32, instances: 
                     None => 0,
                 };
                 let g = st.gpus.iter_mut().find(|g| g.device == device).expect("found above");
-                if g.draws.last().map_or(0, |d| d[1]) != code {
-                    g.draws.push([(g.bytes / TRIANGLE_BYTES) as u32, code]);
+                let blended = u32::from(p.as_ref().is_some_and(|p| p.blends));
+                if g.draws.last().map_or((0, 0), |d| (d[1], d[2])) != (code, blended) {
+                    g.draws.push([(g.bytes / TRIANGLE_BYTES) as u32, code, blended]);
                 }
                 g.bytes += bytes;
                 st.stats.draws_captured += 1;
@@ -1251,7 +1257,7 @@ pub(crate) fn frame_captured(device: usize) -> Option<Captured> {
 
 /// This frame's base colour textures on `device`: the draws' codes by first
 /// triangle and the views.
-pub(crate) fn frame_textures(device: usize) -> (Vec<[u32; 2]>, Vec<(u32, u64, u32)>) {
+pub(crate) fn frame_textures(device: usize) -> (Vec<[u32; 3]>, Vec<(u32, u64, u32)>) {
     let st = state();
     st.gpus.iter().find(|g| g.device == device).map_or((Vec::new(), Vec::new()), |g| (g.draws.clone(), g.textures.clone()))
 }

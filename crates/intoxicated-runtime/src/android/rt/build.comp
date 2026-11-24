@@ -124,8 +124,8 @@ layout(std430, set = BUFSET, binding = 6) buffer Globals {
 layout(std430, set = BUFSET, binding = 8) buffer Tris { vec4 tris[]; };
 // The cache: `SLOT_WORDS` words a slot, at the `S_*` offsets.
 layout(std430, set = BUFSET, binding = 9) buffer Slots { uint slots[]; };
-// This frame's draws: first triangle, texture code, source; by first
-// triangle.
+// This frame's draws: first triangle, texture code, source, 1 when the
+// pipeline blends; by first triangle.
 layout(std430, set = BUFSET, binding = 10) readonly buffer Draws { uvec4 draws[]; };
 
 // std430; `trace::BuildParams` mirrors it.
@@ -366,6 +366,17 @@ void main() {
         tris[TRI_VEC4 * i + k] = vec4(W[k].xyz, uintBitsToFloat(col[k]));
     }
     uvec4 d = draw_of(i);
+    // A blending draw's triangle counts only where its colour says it is
+    // opaque: the engine's nearly invisible parts (zone markers, barriers)
+    // are drawn so too. One that is not is folded to a point, which the
+    // hierarchy leaves out, and kept out of the cache.
+    float alpha = min(xfb[VERTEX_VEC4 * 3u * i + 1u].a, min(xfb[VERTEX_VEC4 * (3u * i + 1u) + 1u].a, xfb[VERTEX_VEC4 * (3u * i + 2u) + 1u].a));
+    if (d.w != 0u && !(alpha >= 0.95)) {
+        for (uint k = 0u; k < 3u; ++k) {
+            tris[TRI_VEC4 * i + k] = vec4(W[0].xyz, uintBitsToFloat(col[k]));
+        }
+        fixed_ = false;
+    }
     tris[TRI_VEC4 * i + 3u] = vec4(uv[0], uv[1]);
     tris[TRI_VEC4 * i + 4u] = vec4(uv[2], uintBitsToFloat(d.y), uintBitsToFloat(d.z));
     tris[TRI_VEC4 * i + 5u] = uintBitsToFloat(uvec4(nrm[0], nrm[1], nrm[2], normals ? 1u : 0u));

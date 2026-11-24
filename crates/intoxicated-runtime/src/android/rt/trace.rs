@@ -965,7 +965,7 @@ pub(crate) fn record(
     // the views into set 2 (our image where there is none) and the table
     // from serial to place.
     let (draws, textures) = capture::frame_textures(device);
-    let draws: Vec<[u32; 4]> = draws.iter().take(MAX_DRAWS).map(|d| [d[0], d[1], 0, 0]).collect();
+    let draws: Vec<[u32; 4]> = draws.iter().take(MAX_DRAWS).map(|d| [d[0], d[1], 0, d[2]]).collect();
     let mut map = vec![[0u32; 2]; TEX_MAP];
     for (place, &(serial, _, _)) in textures.iter().enumerate() {
         if let Some(e) = (0..4).map(|i| (serial as usize + i) % TEX_MAP).find(|&e| map[e][0] == 0) {

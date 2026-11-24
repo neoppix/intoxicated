@@ -324,7 +324,8 @@ What to know before turning it on:
   the screen shows the hit, `screen` takes the screen's colour there (the
   first way); devctl `rt shade own|mix|screen`.
 - Interface drawn in the world, such as leaderboards, name tags and trophy
-  icons, does not reflect, nor do particles or transparent parts.
+  icons, does not reflect, nor do particles or see-through parts (only
+  parts the game draws with an alpha of at least 0.95 are traced).
 - Reflections can flicker while the camera moves.
 - Objects the game has never drawn cannot appear; a static part that moved
   while out of view stays in the reflections at its old place until the view
