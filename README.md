@@ -347,12 +347,17 @@ with a ray from the camera and its normal is taken from the vertex normals the
 engine's shader gave its corners; the screen-space reflections, which have no
 captured geometry, even out the depth's normals over a ring of neighbours on
 the same surface instead, which also applies to the ray-traced ones where no
-triangle is found. Rays that meet nothing take the sky in their direction from
-an environment the client builds from the sky the screen has shown, kept until
-a teleport; a direction the screen never showed sky in reflects nothing, since
-a ceiling the game never drew may be there (`INTOXICATED_RT_ENV=0` or devctl
-`rt env off` turns it off). Only parts that stayed in place for a second are
-kept in the cache, so what a moving player wears leaves no trail.
+triangle is found. Near the camera on a curved surface each pixel traces its
+own ray. devctl `rt view normal` and `rt view source` show the normals and
+where each came from (green the vertex normals, yellow evened out, red the
+depth's) in place of the reflections; `rt view off` ends it. Rays that meet
+nothing take the sky where the screen shows it in their direction now (through
+a window or an opening), else from an environment the client builds from the
+sky the screen has shown, kept until a teleport and blurred so its edges fade;
+a direction the screen never showed sky in reflects nothing, since a ceiling
+the game never drew may be there (`INTOXICATED_RT_ENV=0` or devctl `rt env off`
+turns it off). Only parts that stayed in place for a second are kept in the
+cache, so what a moving player wears leaves no trail.
 
 devctl `rt on` and `rt off` switch it while the game runs (with
 `INTOXICATED_RT=1` at start), `rt stats` reports the triangles, the textures,

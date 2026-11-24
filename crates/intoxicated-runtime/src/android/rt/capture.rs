@@ -560,8 +560,13 @@ unsafe fn describe_pipeline(info: *const c_void, device: usize, modules: &HashMa
                 get::<u32>(a, 0) != 0 && get::<u32>(a, 28) != 0
             })
     };
-    if blends {
-        fail(&mut p, "it blends (transparent, or interface drawn in the world)");
+    // A blending pipeline whose vertex shader passes on a vertex normal is a
+    // lit mesh that may be see-through (the engine draws characters' heads
+    // and other meshes this way, opaque or nearly): captured as opaque.
+    // One without, the interface drawn in the world, is not.
+    let lit_mesh = matches!(vertex, Some(Some(m)) if m.outputs.is_some_and(|o| o.normal));
+    if blends && !lit_mesh {
+        fail(&mut p, "it blends and passes on no normal (interface drawn in the world)");
     }
     if is_dynamic(dynamic, &[DYNAMIC_COLOR_WRITE_ENABLE, DYNAMIC_COLOR_WRITE_MASK]) {
         fail(&mut p, "its colour writes are dynamic");

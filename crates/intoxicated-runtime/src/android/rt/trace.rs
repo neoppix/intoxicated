@@ -220,6 +220,21 @@ pub(crate) fn set_env(on: bool) {
     env_switch().store(on, Relaxed);
 }
 
+/// A debug view in place of the reflections: devctl `rt view off|normal|source`
+/// (`ssr.comp`: flags bits 6 and 7).
+pub(crate) const VIEWS: [&str; 3] = ["off", "normal", "source"];
+static VIEW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn set_view(name: &str) -> Result<(), String> {
+    let i = VIEWS.iter().position(|v| *v == name).ok_or_else(|| format!("rt view {}", VIEWS.join("|")))?;
+    VIEW.store(i as u32, Relaxed);
+    Ok(())
+}
+
+pub(crate) fn view_flags() -> u32 {
+    VIEW.load(Relaxed) << 6
+}
+
 /// devctl `rt dump-cache <path>`: armed for the next frame, then written.
 static CACHE_DUMP_NEXT: AtomicBool = AtomicBool::new(false);
 
@@ -1205,11 +1220,12 @@ pub(crate) fn stats_line() -> String {
     let st = state();
     let s = &st.stats;
     format!(
-        "on={} reflections={} shade={} environment={} traced={} skipped={} keys={} {} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} gpu_samples={}{}",
+        "on={} reflections={} shade={} environment={} view={} traced={} skipped={} keys={} {} build_ms={:.3} build_p95={:.3} trace_ms={:.3} trace_p95={:.3} gpu_samples={}{}",
         is_on(),
         if super::super::ssr::reflections_on() { "on" } else { "off" },
         SHADES[shade().load(Relaxed)],
         if env_on() { "on" } else { "off" },
+        VIEWS[VIEW.load(Relaxed) as usize],
         s.frames,
         s.skipped,
         s.keys,

@@ -2203,7 +2203,10 @@ fn record(
         // it writes nothing but zeros. See `rt::trace`.
         let rt_only = super::rt::requested() && super::rt::trace::is_on();
         let rt_params = Params {
-            flags: p.flags | if g.opaque_at == presents { FLAG_OPAQUE } else { 0 } | super::rt::trace::shade_flags(),
+            flags: p.flags
+                | if g.opaque_at == presents { FLAG_OPAQUE } else { 0 }
+                | super::rt::trace::shade_flags()
+                | super::rt::trace::view_flags(),
             ..*p
         };
         let traced = rt_only
@@ -2227,7 +2230,7 @@ fn record(
             bind_ssr(g.pipelines[3]);
             // The compose told the trace measured the camera (see ssr.comp).
             let opaque = if g.opaque_at == presents { FLAG_OPAQUE } else { 0 };
-            push(&Params { flags: p.flags | FLAG_TRACED | opaque, ..*p });
+            push(&Params { flags: p.flags | FLAG_TRACED | opaque | super::rt::trace::view_flags(), ..*p });
         } else {
             bind_ssr(g.pipelines[2]);
             if rt_only {

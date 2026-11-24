@@ -567,13 +567,20 @@ fn normal_output(words: &[u32], list: &[Inst], flow: &Flow, camera: u32, colour:
 pub(crate) struct VertexInfo {
     pub colour: u32,
     pub uv: Option<u32>,
+    /// It passes on a vertex normal: a lit mesh, not a flat interface quad.
+    pub normal: bool,
 }
 
 pub(crate) fn vertex_info(words: &[u32]) -> Option<VertexInfo> {
     let list = instructions(words).ok()?;
     let flow = Flow::new(words, &list);
     let colour = colour_output(words, &list, &flow)?;
-    Some(VertexInfo { colour: *flow.loc.get(&colour)?, uv: uv_output(words, &list, &flow).map(|(l, _)| l) })
+    let camera = camera_vector_output(words, &list, &flow).map_or(0, |c| c.output);
+    Some(VertexInfo {
+        colour: *flow.loc.get(&colour)?,
+        uv: uv_output(words, &list, &flow).map(|(l, _)| l),
+        normal: normal_output(words, &list, &flow, camera, colour).is_some(),
+    })
 }
 
 /// How a fragment shader takes its base colour: a texture (by descriptor set
@@ -963,7 +970,7 @@ mod tests {
         assert_eq!(fragment_albedo(VS), None, "a vertex shader has none");
         // The test vertex shader passes its colour at 1 and has no texture
         // coordinates.
-        assert_eq!(vertex_info(VS), Some(VertexInfo { colour: 1, uv: None }));
+        assert_eq!(vertex_info(VS), Some(VertexInfo { colour: 1, uv: None, normal: true }));
     }
 
     #[test]
