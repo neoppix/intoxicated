@@ -2244,6 +2244,11 @@ fn record(
         }
         (fns.cmd_dispatch)(cmd, w.div_ceil(8), h.div_ceil(8), 1);
         compute_barrier(fns, cmd);
+        if traced {
+            // The indirect light, on the compose's result (see `rt::trace`).
+            super::rt::trace::record_gi_apply(cmd, g.device, set, &rt_params, [w, h]);
+            compute_barrier(fns, cmd);
+        }
     }
     stamp(2);
     let post_images = g.output.as_ref().and_then(|o| o.post.as_ref());
@@ -3430,7 +3435,7 @@ mod tests {
                 .collect()
         };
         // The same list as build.rs's `SHADERS`.
-        let shaders: [(&str, &str, &[&str]); 25] = [
+        let shaders: [(&str, &str, &[&str]); 27] = [
             ("depth_capture/resolve.comp", "depth_capture/resolve_ms", &[]),
             ("depth_capture/resolve.comp", "depth_capture/resolve_1x", &["-DSINGLE_SAMPLE"]),
             ("ssr/depth.comp", "ssr/depth_ms", &[]),
@@ -3448,6 +3453,8 @@ mod tests {
             ("ssr/ssr.comp", "ssr/rt_trace", &["-DRT"]),
             ("ssr/ssr.comp", "ssr/rt_upsample", &["-DRT", "-DUPSAMPLE"]),
             ("ssr/ssr.comp", "ssr/rt_env", &["-DRT", "-DENVMAP"]),
+            ("ssr/ssr.comp", "ssr/rt_gi", &["-DRT", "-DGI"]),
+            ("ssr/ssr.comp", "ssr/rt_gi_apply", &["-DRT", "-DGIAPPLY"]),
             ("rt/build.comp", "rt/build_fit", &["-DFIT"]),
             ("rt/build.comp", "rt/build_insert", &["-DINSERT"]),
             ("rt/build.comp", "rt/build_gather", &["-DGATHER"]),

@@ -538,6 +538,8 @@ env:
   INTOXICATED_RT_REACH=<studs>       cached parts traced within (512)
   INTOXICATED_RT_SHADE=<mode>        lit, own, mix or screen (lit)
   INTOXICATED_RT_ENV=0               no sky environment for rays that miss
+  INTOXICATED_RT_GI=1                experimental diffuse indirect light
+                                     with the ray tracing (devctl rt gi)
   INTOXICATED_RT_DUMP=<dir>          research: the engine's shader modules and
                                      pipelines to <dir>; devctl rt draws and
                                      rt dump <path> write a frame's draws and

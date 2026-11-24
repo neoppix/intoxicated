@@ -117,6 +117,13 @@ layout(std430, set = BUFSET, binding = 6) buffer Globals {
     vec4 sky;
     // Pixels that traced their own ray this frame (ssr.comp's upsample).
     uint full_rate;
+    // The camera the frame before: position, axes, (tan_x, tan_y, near, 1
+    // when there was one), for the indirect light's reprojection.
+    vec4 prev_pos;
+    vec4 prev_right;
+    vec4 prev_up;
+    vec4 prev_forward;
+    vec4 prev_camera;
 };
 // Triangles to trace, six vec4 each: three vertices (world xyz, the colour
 // packed in w), the texture coordinates of A and B, then those of C, the
@@ -255,6 +262,11 @@ void main() {
         return;
     }
     frame += 1u;
+    prev_pos = cam_pos;
+    prev_right = right;
+    prev_up = up;
+    prev_forward = forward;
+    prev_camera = vec4(camera.xyz, last_cam.w > 0.0 ? 1.0 : 0.0);
     if ((gen & 0xffu) == 0u) {
         gen += 1u;
     }

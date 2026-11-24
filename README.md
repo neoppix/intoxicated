@@ -367,6 +367,15 @@ the game never drew may be there (`INTOXICATED_RT_ENV=0` or devctl `rt env off`
 turns it off). Only parts that stayed in place for a second are kept in the
 cache, so what a moving player wears leaves no trail.
 
+Diffuse indirect light, more experimental still and off unless
+`INTOXICATED_RT_GI=1` at start (devctl `rt gi on|off` then): one ray per 2
+by 2 pixels in a cosine-weighted direction, its hit lit as the engine lights
+it (one bounce; a miss takes the sky), gathered over frames at the same
+point in the world and over the neighbouring blocks on the same surface, and
+put in place of the engine's own ambient light, so corners darken and
+coloured walls tint what faces them. It takes about 130 MB more video memory
+when on.
+
 devctl `rt on` and `rt off` switch it while the game runs (with
 `INTOXICATED_RT=1` at start), `rt stats` reports the triangles, the textures,
 the measured camera, the cache and the GPU time, and `rt dump-cache <path>`

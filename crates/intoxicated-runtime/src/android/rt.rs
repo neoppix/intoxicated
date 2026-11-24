@@ -528,6 +528,10 @@ pub fn control(args: &[&str]) -> Result<String, String> {
             trace::set_env(*w == "on");
             Ok(trace::stats_line())
         }
+        ["gi", w @ ("on" | "off")] => {
+            trace::set_gi(*w == "on")?;
+            Ok(trace::stats_line())
+        }
         ["view", name] => {
             trace::set_view(name)?;
             Ok(trace::stats_line())
@@ -557,7 +561,7 @@ pub fn control(args: &[&str]) -> Result<String, String> {
                 trace::stats_line()
             ))
         }
-        _ => Err("rt [stats] | on | off | shade lit|own|mix|screen | env on|off | view off|normal|source | draws | dump <path> | dump-cache <path>".into()),
+        _ => Err("rt [stats] | on | off | shade lit|own|mix|screen | env on|off | gi on|off | view off|normal|source | draws | dump <path> | dump-cache <path>".into()),
     }
 }
 
