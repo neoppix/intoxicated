@@ -1304,7 +1304,15 @@ pub(crate) fn record(
     // (over it to coarsen, under 40% of it to refine), so it does not swing;
     // the indirect light's history is carried across a change (the GI pass
     // finds it on the last frame's grid), not cleared.
-    g.budget_frames += 1;
+    // Only while the indirect light runs: with it off the trace is small
+    // and the budget would refine the light's blocks for nothing, to coarsen
+    // them again once it is back (seen in Work at a Pizza Place).
+    if gi_on() {
+        g.budget_frames += 1;
+    } else {
+        g.budget_frames = 0;
+        g.budget_votes = 0;
+    }
     if g.budget_frames >= BUDGET_FRAMES {
         g.budget_frames = 0;
         let mean = |q: &std::collections::VecDeque<f64>| q.iter().rev().take(60).sum::<f64>() / q.len().clamp(1, 60) as f64;

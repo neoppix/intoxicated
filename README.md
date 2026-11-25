@@ -505,6 +505,11 @@ What to know before turning it on:
   indirect light on, at 1667x1349: 120,000 to 260,000 triangles, 1.1 to 2.0
   ms for the hierarchy and 1.2 to 2.4 ms for the trace at 4 by 4 blocks (before the blocks were held at 2 by 2); the
   capture hooks cost the render thread about 0.5 ms a frame (0.6 us a draw).
+- Large scenes cost more: Blox Fruits captured 830,000 triangles a frame
+  and the hierarchy's build took 3.1 to 3.5 ms; Doors' many draws cost the
+  render thread 1.0 to 1.2 ms a frame in the capture hooks (measured at
+  1667x1349 in their menus and lobbies). Under the time budget the indirect
+  light's blocks then grow (`rt stats` `gi_blocks`).
 - It runs as compute on the shader cores because NVIDIA's FreeBSD driver
   has no hardware ray tracing: on the RTX 4070 Ti, drivers 580.142 and
   620.70.06 list neither `VK_KHR_acceleration_structure` nor
