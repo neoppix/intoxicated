@@ -387,17 +387,17 @@ ms); frame times did not change measurably (p50 4.2 ms either way, as with
 all off).
 
 To compare with and without, or to get the frame time back for a round,
-`INTOXICATED_EFFECTS_HOTKEY=1` (the Shaders page's "F9 turns all effects on
-and off in game") makes F9 a hotkey: pressed in game it turns every effect
+`INTOXICATED_EFFECTS_HOTKEY=1` (the Shaders page's "F8 turns all effects on
+and off in game") makes F8 a hotkey: pressed in game it turns every effect
 off, and pressed again puts back exactly the switches and looks they had,
 live, without a restart. While they are off nothing of theirs is recorded
 into the frame, so they cost no GPU time. It is off by default. While it is
-on, Roblox no longer sees F9, so F9 does not open Roblox's developer console;
-F9 still goes to Roblox while a text box such as the chat has focus, or with
+on, Roblox no longer sees F8;
+F8 still goes to Roblox while a text box such as the chat has focus, or with
 Shift, Ctrl or Alt held. A key name instead of `1` (`F1` to `F10` or `F12`)
 takes that key instead. Each press is one line in the log, and devctl
 `effects toggle|on|off|get` does the same without a key. A client built
-without the effects ignores the setting, says so once, and leaves F9 to
+without the effects ignores the setting, says so once, and leaves F8 to
 Roblox.
 
 ## Macros

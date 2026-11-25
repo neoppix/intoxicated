@@ -452,13 +452,12 @@ env:
                                      effect's variables below, says so once,
                                      and answers their devctl verbs with
                                      err not built
-  INTOXICATED_EFFECTS_HOTKEY=1       F9 in game turns every visual effect
+  INTOXICATED_EFFECTS_HOTKEY=1       F8 in game turns every visual effect
                                      off and back as configured, live. A key
                                      name (F1 to F10, F12) takes another key.
                                      Not while a text box has focus or with
                                      Shift, Ctrl or Alt held. Roblox no
-                                     longer sees the key, so its F9
-                                     developer console does not open. Off by
+                                     longer sees the key. Off by
                                      default; devctl's effects
                                      toggle|on|off|get does the same
   INTOXICATED_SSR=1                  screen-space reflections (experimental):
