@@ -163,7 +163,7 @@ const TEXTURES: u32 = capture::MAX_TEXTURES as u32;
 /// Bytes of the globals (`build.comp`'s `Globals`) and of what `rt stats`
 /// reads back of them.
 const GLOBALS_BYTES: u64 = 512;
-const GLOBALS_READ: usize = 83;
+const GLOBALS_READ: usize = 85;
 /// The motion's counts in the globals (`motion_known`, `motion_moving`).
 const GLOBALS_MOTION: u64 = 324;
 /// Our mapped copy of the globals' first `GLOBALS_READ` words.
@@ -1822,7 +1822,7 @@ fn fit_text(fit: Option<[u32; GLOBALS_READ]>) -> String {
     format!(
         "fit=ok fit_samples={} fov_x={:.2} fov_y={:.2} near={:.4} forward_len={:.4} world_up={:.3},{:.3},{:.3} exposure={:.3} \
          camera={:.1},{:.1},{:.1} cache_listed={} cache_new={} cache_dropped={} cache_full={} cache_generation={} \
-         list_cut={} fit_failures={} full_rate_pixels={} emitters={} motion_known={} motion_moving={}",
+         list_cut={} fit_failures={} stale_fits={} full_rate_pixels={} emitters={} motion_known={} motion_moving={}",
         w[1],
         2.0 * f(4).atan().to_degrees(),
         2.0 * f(5).atan().to_degrees(),
@@ -1842,6 +1842,7 @@ fn fit_text(fit: Option<[u32; GLOBALS_READ]>) -> String {
         w[32] & 0xff,
         w[40],
         w[41],
+        w[84],
         w[GLOBALS_FULL_RATE as usize / 4],
         w[GLOBALS_EMITTERS as usize / 4],
         16 * w[GLOBALS_MOTION as usize / 4],

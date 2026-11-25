@@ -567,6 +567,7 @@ layout(std430, set = 1, binding = 6) buffer Globals {
     uint motion_moving;
     // How strongly Neon lights the GI (`trace.rs` NEON_GAIN).
     float neon_gain;
+    uint stale_fits;
 };
 // Each listed triangle's move since the last frame, in studs (w 1 where
 // known; `rt/build.comp` INSERT), and per reflection block the move of the

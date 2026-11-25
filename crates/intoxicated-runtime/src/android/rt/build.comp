@@ -137,6 +137,8 @@ layout(std430, set = BUFSET, binding = 6) buffer Globals {
     uint motion_known;
     uint motion_moving;
     float neon_gain;
+    // Frames the camera could not be measured in and the last one was kept.
+    uint stale_fits;
 };
 // This frame's listed triangles that give off light (Neon parts), by index,
 // for the trace's light sampling (ssr.comp `emitter_light`).
@@ -245,20 +247,36 @@ uint pack_colour(vec4 c) {
 #ifdef FIT
 
 const uint FIT_THREADS = 128u;
-const uint FIT_SAMPLES = 4096u;
+// Vertices looked at, spread over the frame's: enough that a view of a
+// floor of a few huge triangles among terrain (which has no camera vector)
+// still leaves the main fit its minimum (only 44 of 4096 were left looking
+// straight down in first person in Jailbreak).
+const uint FIT_SAMPLES = 16384u;
 
 // Per thread: the normal matrix (6), the three right-hand sides (9), the
-// sum of clip z, the count and the camera's position (3).
-shared float red[20][FIT_THREADS];
+// sum of clip z, the count and the camera's position (3); then the
+// fallback's (see below): its normal matrix (10), right-hand sides (12),
+// sum of clip z and count.
+const int RED = 44;
+shared float red[RED][FIT_THREADS];
+// The fallback needs this many vertices, the main fit FIT_MIN (unit
+// directions from the camera span all three axes even when the vertices
+// all lie in one floor, so a few well spread ones are enough; the
+// determinant test below rejects a degenerate set).
+const float FIT_MIN = 16.0;
+const float FIT_MIN_WORLD = 16.0;
 
 void main() {
     uint t = gl_LocalInvocationID.x;
     uint vertices = 3u * pc.current;
     uint step_ = max(1u, vertices / FIT_SAMPLES);
-    float a[20];
-    for (int i = 0; i < 20; ++i) {
+    float a[RED];
+    for (int i = 0; i < RED; ++i) {
         a[i] = 0.0;
     }
+    // The fallback's origin: the camera the last good fit found.
+    vec3 o = cam_pos.xyz;
+    bool have_last = last_cam.w > 0.0;
     for (uint k = t; k < FIT_SAMPLES && k * step_ < vertices; k += FIT_THREADS) {
         uint v = k * step_;
         vec4 c = xfb[VERTEX_VEC4 * v];
@@ -267,8 +285,37 @@ void main() {
         vec3 W = W4.xyz;
         vec3 p = -V;
         float l = length(p);
+        // Any vertex with a finite clip position, in front of the camera or
+        // behind it: clip x, y and w are linear in the camera vector either
+        // way. Only those in front were taken before; looking straight down
+        // in first person, or straight ahead, at a floor of a few huge
+        // triangles most corners are behind the camera, and the 44 left
+        // were too few, so the frame had no reflections.
+        if (any(isnan(c)) || any(isinf(c)) || !(abs(c.w) > 1e-6) || any(isnan(W)) || any(isinf(W))) {
+            continue;
+        }
+        // The fallback, from the world position alone, which every vertex
+        // has (terrain too, which writes no camera vector): clip x, y and w
+        // are affine in it, clip = M (W - o) + t, fitted by least squares
+        // with each vertex scaled to unit distance from the last camera.
+        if (have_last) {
+            vec3 pw = W - o;
+            float lw_ = length(pw);
+            if (lw_ > 1e-3 && !isinf(lw_)) {
+                vec4 x = vec4(pw, 1.0) / lw_;
+                vec4 q = c / lw_;
+                a[20] += x.x * x.x; a[21] += x.x * x.y; a[22] += x.x * x.z; a[23] += x.x * x.w;
+                a[24] += x.y * x.y; a[25] += x.y * x.z; a[26] += x.y * x.w;
+                a[27] += x.z * x.z; a[28] += x.z * x.w; a[29] += x.w * x.w;
+                a[30] += x.x * q.x; a[31] += x.y * q.x; a[32] += x.z * q.x; a[33] += x.w * q.x;
+                a[34] += x.x * q.y; a[35] += x.y * q.y; a[36] += x.z * q.y; a[37] += x.w * q.y;
+                a[38] += x.x * q.w; a[39] += x.y * q.w; a[40] += x.z * q.w; a[41] += x.w * q.w;
+                a[42] += c.z;
+                a[43] += 1.0;
+            }
+        }
         // w 4 and up: no camera vector was written (terrain).
-        if (!usable(c) || !(l > 1e-3) || isinf(l) || any(isnan(W)) || any(isinf(W)) || W4.w >= 3.5) {
+        if (!(l > 1e-3) || isinf(l) || W4.w >= 3.5) {
             continue;
         }
         // Each vertex scaled to unit distance, so near and far weigh alike.
@@ -284,13 +331,13 @@ void main() {
         vec3 cam = W + V;
         a[17] += cam.x; a[18] += cam.y; a[19] += cam.z;
     }
-    for (int i = 0; i < 20; ++i) {
+    for (int i = 0; i < RED; ++i) {
         red[i][t] = a[i];
     }
     barrier();
     for (uint s = FIT_THREADS / 2u; s > 0u; s >>= 1) {
         if (t < s) {
-            for (int i = 0; i < 20; ++i) {
+            for (int i = 0; i < RED; ++i) {
                 red[i][t] += red[i][t + s];
             }
         }
@@ -329,25 +376,71 @@ void main() {
     fit_ok = 0u;
     // Counted as failed until it succeeds below.
     fit_failures += 1u;
-    if (n < 64.0) {
+    vec3 mx = vec3(0.0), my = vec3(0.0), mw = vec3(0.0), cam = vec3(0.0);
+    float near = 0.0;
+    bool solved = false;
+    if (n >= FIT_MIN) {
+        mat3 A = mat3(red[0][0], red[1][0], red[2][0],
+                      red[1][0], red[3][0], red[4][0],
+                      red[2][0], red[4][0], red[5][0]);
+        if (abs(determinant(A)) >= 1e-6 * n * n * n) {
+            mat3 inv = inverse(A);
+            mx = inv * vec3(red[6][0], red[7][0], red[8][0]);
+            my = inv * vec3(red[9][0], red[10][0], red[11][0]);
+            mw = inv * vec3(red[12][0], red[13][0], red[14][0]);
+            near = red[15][0] / n;
+            cam = vec3(red[17][0], red[18][0], red[19][0]) / n;
+            solved = true;
+        }
+    }
+    // Too few vertices with a camera vector (looking down at a floor of a
+    // few huge triangles, or at terrain, which writes none: 44 were left
+    // in Jailbreak): the fallback from every vertex's world position.
+    float n2 = red[43][0];
+    if (!solved && last_cam.w > 0.0 && n2 >= FIT_MIN_WORLD) {
+        mat4 B = mat4(red[20][0], red[21][0], red[22][0], red[23][0],
+                      red[21][0], red[24][0], red[25][0], red[26][0],
+                      red[22][0], red[25][0], red[27][0], red[28][0],
+                      red[23][0], red[26][0], red[28][0], red[29][0]);
+        float det = determinant(B);
+        if (abs(det) > 1e-12 * n2 * n2 * n2 * n2 && !isnan(det) && !isinf(det)) {
+            mat4 inv4 = inverse(B);
+            vec4 rx = inv4 * vec4(red[30][0], red[31][0], red[32][0], red[33][0]);
+            vec4 ry = inv4 * vec4(red[34][0], red[35][0], red[36][0], red[37][0]);
+            vec4 rw = inv4 * vec4(red[38][0], red[39][0], red[40][0], red[41][0]);
+            // The camera is where clip x, y and w are all 0.
+            mat3 Mt = mat3(rx.x, ry.x, rw.x, rx.y, ry.y, rw.y, rx.z, ry.z, rw.z);
+            if (abs(determinant(Mt)) > 1e-9) {
+                cam = cam_pos.xyz + inverse(Mt) * -vec3(rx.w, ry.w, rw.w);
+                mx = rx.xyz;
+                my = ry.xyz;
+                mw = rw.xyz;
+                near = red[42][0] / n2;
+                solved = true;
+                fit_samples = uint(n2);
+            }
+        }
+    }
+    if (!solved) {
+        // Nothing to measure: the last camera is kept (a frame or a few,
+        // at worst a little behind the real one) and the trace runs on
+        // with it, rather than leaving the frame without reflections.
+        if (last_cam.w > 0.0 && camera.w > 0.0) {
+            fit_ok = 1u;
+            fit_failures -= 1u;
+            stale_fits += 1u;
+        }
         return;
     }
-    mat3 A = mat3(red[0][0], red[1][0], red[2][0],
-                  red[1][0], red[3][0], red[4][0],
-                  red[2][0], red[4][0], red[5][0]);
-    if (abs(determinant(A)) < 1e-6 * n * n * n) {
-        return;
-    }
-    mat3 inv = inverse(A);
-    vec3 mx = inv * vec3(red[6][0], red[7][0], red[8][0]);
-    vec3 my = inv * vec3(red[9][0], red[10][0], red[11][0]);
-    vec3 mw = inv * vec3(red[12][0], red[13][0], red[14][0]);
     float lw = length(mw);
     vec2 tan_xy = vec2(lw / length(mx), lw / length(my));
-    float near = red[15][0] / n;
-    vec3 cam = vec3(red[17][0], red[18][0], red[19][0]) / n;
     if (any(isnan(vec4(tan_xy, near, lw))) || any(lessThan(tan_xy, vec2(0.02))) || any(greaterThan(tan_xy, vec2(50.0)))
         || !(near > 0.0) || abs(lw - 1.0) > 0.05 || any(isnan(cam)) || any(isinf(cam))) {
+        if (last_cam.w > 0.0 && camera.w > 0.0) {
+            fit_ok = 1u;
+            fit_failures -= 1u;
+            stale_fits += 1u;
+        }
         return;
     }
     // The camera's axes in the world: right, up (clip y is flipped), forward.
