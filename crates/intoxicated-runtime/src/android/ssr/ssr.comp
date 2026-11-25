@@ -56,6 +56,11 @@ layout(binding = 0) uniform sampler2D color_tex;
 layout(binding = 2, r32f) uniform readonly image2D depth_copy;
 #ifdef GIAPPLY
 layout(binding = 3, r32ui) uniform uimage2D result_img;
+// The upsampled indirect light per pixel, this frame's and the last one's
+// in turn (by the frame's parity): red and green, blue and frames as
+// halves, the view distance (studs).
+layout(std430, set = 1, binding = 25) buffer GiPxA { uvec4 gi_px_a[]; };
+layout(std430, set = 1, binding = 26) buffer GiPxB { uvec4 gi_px_b[]; };
 // The reflections as the compose read them, then what the glow pass leaves
 // for the bloom (see GIAPPLY).
 layout(binding = 4, rgba16f) uniform image2D glow_img;
@@ -560,6 +565,8 @@ layout(std430, set = 1, binding = 6) buffer Globals {
     // moved (`rt/build.comp` INSERT, for `rt stats`).
     uint motion_known;
     uint motion_moving;
+    // How strongly Neon lights the GI (`trace.rs` NEON_GAIN).
+    float neon_gain;
 };
 // Each listed triangle's move since the last frame, in studs (w 1 where
 // known; `rt/build.comp` INSERT), and per reflection block the move of the
@@ -903,7 +910,12 @@ vec3 rt_normal(vec3 P, vec3 N) {
     vec3 D = normalize(world_dir(P));
     uint tri;
     vec2 uv;
-    float t = trace_ray(cam_pos.xyz, D, 0.5 * g_near, dist * 1.03, tri, uv);
+    // Only around the depth's distance: a captured triangle nearer than the
+    // pixel is not what it shows (zoomed into first person the camera is
+    // inside the character's own head, which the engine hides but the
+    // capture still has), and stopping there made every pixel within
+    // NORMAL_REACH look uncaptured, so the GI left them all dark.
+    float t = trace_ray(cam_pos.xyz, D, max(0.5 * g_near, 0.95 * dist), dist * 1.03, tri, uv);
     if (t < 0.0 || abs(t - dist) > 0.015 * dist) {
         g_own_found = false;
         return N;
@@ -997,10 +1009,8 @@ const float NEON_NEAR = 12.0;
 // GI_MOST_ADD (a stray sample cannot wash a wall out; a Neon glow stays).
 const float GI_MOST = 8.0;
 const float GI_MOST_ADD = 4.0;
-// Neon's exact light in the GI, as a share of its full engine brightness:
-// at full brightness a street of Neon facades (Jailbreak's city at night)
-// lit every wall white.
-const float NEON_GI = 0.5;
+// Neon's exact light in the GI is taken `neon_gain` times its engine
+// brightness (`trace.rs` NEON_GAIN, devctl `rt neon-gain`).
 
 // The indirect light `gi` held with a soft knee: what it brings above the
 // ambient `amb` rolls off towards GI_MOST times the ambient plus
@@ -1437,6 +1447,18 @@ uint leader(ivec2 b) {
         }
     }
 #endif
+#if defined(GI)
+    // The indirect light's points move over their block from frame to
+    // frame too (an R2 sequence), so its history and the per-pixel one of
+    // the apply average a block edge out instead of showing it as a step.
+    if (s > 1) {
+        vec2 r2 = fract(vec2(0.5) + float(frame % 4096u) * vec2(0.7548777, 0.5698403));
+        ivec2 q = s * b + min(ivec2(r2 * float(s)), ivec2(e));
+        if (all(lessThan(uvec2(q), pc.size)) && depth_at(q) > 0.0) {
+            return uint(q.x) | (uint(q.y) << 16);
+        }
+    }
+#endif
     ivec2 order[5] = ivec2[5](ivec2(m, m), ivec2(0, 0), ivec2(e, e), ivec2(e, 0), ivec2(0, e));
     for (int i = 0; i < 5; ++i) {
         ivec2 q = s * b + order[i];
@@ -1516,7 +1538,7 @@ const float EMIT_SCALE = 4.0;
 // coarser or finer: the history carries over a change of the grid), into
 // this frame's buffer.
 const int SS_SLICES = 2;
-const int SS_STEPS = 8;
+const int SS_STEPS = 6;
 // How far the march reaches (studs), and how deep a surface is taken to be
 // (studs, plus 2% of its distance).
 const float SS_RADIUS = 12.0;
@@ -1598,8 +1620,12 @@ void main() {
             vec3 o = vec3(unpackHalf2x16(e0.x), bn.x);
             vec2 mo = unpackHalf2x16(e1.z);
             // The same point within its block's reach on that grid.
-            float reach_ = 0.02 * dist + 0.05 + 0.5 * float(max(ps, grid_scale())) * dist * 2.0 * g_tan.y / float(pc.size.y);
-            if (bn.y > 0.0 && distance(Xp, Y) < reach_ && dot(m, n) > 0.9
+            // The same surface within a block and a half on either grid (the
+            // points move over their block), on the point's plane.
+            float pix_ = dist * 2.0 * g_tan.y / float(pc.size.y);
+            float reach_ = 0.02 * dist + 0.05 + 1.5 * float(max(ps, grid_scale())) * pix_;
+            float plane_ = abs(dot(n, Xp - Y));
+            if (bn.y > 0.0 && distance(Xp, Y) < reach_ && plane_ < 0.01 * dist + 0.05 && dot(m, n) > 0.9
                 && !any(isnan(o)) && !any(isinf(o)) && !any(isnan(mo)) && !any(isinf(mo))) {
                 frames = moving ? min(bn.y, 4.0) : bn.y;
                 old = o;
@@ -1776,7 +1802,7 @@ void main() {
     }
     // The Neon parts' light, exactly, from the ones the tile lists (the
     // LIGHTS pass), in view or not.
-    L += NEON_GI * tile_light(uvec2(p), Xo, n);
+    L += neon_gain * tile_light(uvec2(p), Xo, n);
     L = min(L, vec3(32.0));
     // Accumulated over up to 32 frames, with the first two moments of its
     // brightness for the filter's variance. A sample far outside what the
@@ -2092,7 +2118,10 @@ void main() {
         float cv;
         light_of(i, odd, cL, cv);
         float lc = dot(cL, LUMA);
-        float sigma = 4.0 * sqrt(cv) + 1e-3;
+        // Never narrower than a quarter of the light itself: with a long
+        // history the noise left is small, and edge-stopping on it alone
+        // kept neighbouring blocks' small differences as hard steps.
+        float sigma = 4.0 * sqrt(cv) + 0.25 * lc + 0.02;
         vec3 sum = vec3(0.0);
         float sv = 0.0, ws = 0.0;
         int step_ = int(max(pc.steps, 1u));
@@ -2402,8 +2431,8 @@ uint pack_result(vec4 c) {
 // reflections' result, every traced frame.
 //
 // The indirect light (flags bit 14, when it ran): the filtered indirect
-// light around each pixel (the blocks next to its own that lie on its
-// surface and face its way, a tent over their middles), in place of the
+// light around each pixel (a joint bilateral upsample of the blocks around
+// it, then kept over frames per pixel; see below), in place of the
 // engine's ambient: the pixel's base colour estimated as its colour over
 // the engine's light without shadow, times the indirect light less the
 // ambient the engine already gave it; never darker than half, so corners
@@ -2448,12 +2477,25 @@ void main() {
     float dist = length(P) * g_near;
     bool odd = (frame & 1u) != 0u;
     uvec2 hs = half_size();
-    ivec2 b0 = p / int(grid_scale());
     float gs = float(grid_scale());
-    vec3 sum = vec3(0.0);
+    // The pixel's colour, the guide for the upsample.
+    vec3 guide = texelFetch(opaque_tex, p, 0).rgb;
+    // The 4 by 4 blocks around the pixel, from the one up and left of the
+    // nearest middle: a joint bilateral upsample (Kopf et al. 2007), each
+    // block weighted by a smooth (bicubic B-spline) kernel over the
+    // distance from the pixel to the point its value was traced from, by
+    // how near that point lies to the pixel's plane and how alike their
+    // normals and colours are. Every weight is smooth, so where blocks
+    // disagree the light blends over a block or two instead of stepping.
+    vec2 g = (vec2(p) + 0.5) / gs - 0.5;
+    ivec2 b0 = ivec2(floor(g)) - 1;
+    vec3 sum = vec3(0.0), lo = vec3(1e9), hi = vec3(-1e9);
     float weights = 0.0;
-    for (int j = -1; j <= 1; ++j) {
-        for (int i = -1; i <= 1; ++i) {
+    vec3 fallback = vec3(0.0);
+    float fallback_w = 0.0;
+    float pix = dist * 2.0 * g_tan.y / float(pc.size.y);
+    for (int j = 0; j < 4; ++j) {
+        for (int i = 0; i < 4; ++i) {
             ivec2 b = b0 + ivec2(i, j);
             if (any(greaterThanEqual(uvec2(b), hs))) {
                 continue;
@@ -2465,26 +2507,85 @@ void main() {
             if (bn.y <= 0.0) {
                 continue;
             }
-            vec3 Y = uintBitsToFloat(uvec3(e0.zw, e1.x));
-            vec3 m = unpackSnorm4x8(e1.y).xyz;
-            float off_plane = abs(dot(n, Y - X)) / max(dist, 1e-3);
-            // A tent over the blocks' middles (bilinear between the four
-            // nearest), so a coarse grid shows no steps.
-            vec2 off = abs(vec2(p) + 0.5 - (vec2(b) + 0.5) * gs) / gs;
-            float tent = max(1.0 - off.x, 0.0) * max(1.0 - off.y, 0.0) + 0.01;
-            float w = (1.0 - smoothstep(0.004, 0.03, off_plane)) * max(dot(m, n), 0.0) * tent;
-            // The filter's result (see GIFILTER).
             uvec2 f = gi_fa[k];
             vec3 L = vec3(unpackHalf2x16(f.x), unpackHalf2x16(f.y).x);
-            if (w > 0.0 && !any(isnan(L)) && !any(isinf(L))) {
+            if (any(isnan(L)) || any(isinf(L)) || f == uvec2(0u)) {
+                continue;
+            }
+            vec3 Y = uintBitsToFloat(uvec3(e0.zw, e1.x));
+            vec3 m = unpackSnorm4x8(e1.y).xyz;
+            // Where its point is on the screen, in blocks from the pixel.
+            vec3 H = to_view_space(Y);
+            vec2 at = H.z > 1e-3 ? to_pixel(H) : (vec2(b) + 0.5) * gs;
+            vec2 o = abs((at - (vec2(p) + 0.5)) / gs);
+            float r = length(o);
+            float spatial = r < 1.0 ? (4.0 - 6.0 * r * r + 3.0 * r * r * r) / 6.0
+                : r < 2.0 ? (2.0 - r) * (2.0 - r) * (2.0 - r) / 6.0 : 0.0;
+            float off_plane = abs(dot(n, Y - X)) / (gs * pix + 0.002 * dist);
+            float w_plane = exp(-off_plane * off_plane);
+            float w_normal = pow(max(dot(m, n), 0.0), 8.0);
+            vec3 cg = textureLod(opaque_tex, clamp(at, vec2(0.5), vec2(pc.size) - 0.5) / vec2(pc.size), 0.0).rgb;
+            float w_colour = 0.25 + 0.75 * exp(-4.0 * length(cg - guide));
+            float w = spatial * w_plane * w_normal * w_colour;
+            // Something to show where every block is turned away or off
+            // the plane (a thin edge): the nearest by distance alone.
+            float wf = exp(-r * r) * (0.05 + w_normal);
+            fallback += wf * L;
+            fallback_w += wf;
+            if (w > 1e-6) {
                 sum += w * L;
                 weights += w;
+                lo = min(lo, L);
+                hi = max(hi, L);
             }
         }
     }
-    if (weights < 1e-3) {
-        return;
+    if (weights < 1e-4) {
+        if (fallback_w < 1e-6) {
+            return;
+        }
+        sum = fallback;
+        weights = fallback_w;
+        lo = hi = fallback / fallback_w;
     }
+    vec3 now_gi = sum / weights;
+    // Each pixel keeps the upsampled light over frames (the blocks' points
+    // move over their block from frame to frame), found where the pixel's
+    // point was the frame before, held within what the blocks around show
+    // now: block edges average out instead of standing still.
+    uint at_px = uint(p.y) * pc.size.x + uint(p.x);
+    bool room = at_px < uint(gi_px_a.length()) && at_px < uint(gi_px_b.length());
+    if (room) {
+        vec3 rp = X - prev_pos.xyz;
+        vec3 vp = vec3(dot(rp, prev_right.xyz), dot(rp, prev_up.xyz), dot(rp, prev_forward.xyz));
+        float frames_px = 0.0;
+        vec3 hist = vec3(0.0);
+        if (prev_camera.w > 0.0 && vp.z > 0.0) {
+            vec2 q = (vec2(vp.x / (vp.z * prev_camera.x), -vp.y / (vp.z * prev_camera.y)) * 0.5 + 0.5) * vec2(pc.size);
+            if (all(greaterThanEqual(q, vec2(0.0))) && all(lessThan(q, vec2(pc.size)))) {
+                uint pa = uint(q.y) * pc.size.x + uint(q.x);
+                uvec4 e = odd ? gi_px_a[pa] : gi_px_b[pa];
+                vec2 bf = unpackHalf2x16(e.y);
+                float zp = uintBitsToFloat(e.z);
+                if (bf.y > 0.0 && abs(zp - vp.z) < 0.02 * vp.z + 0.05) {
+                    hist = vec3(unpackHalf2x16(e.x), bf.x);
+                    frames_px = bf.y;
+                }
+            }
+        }
+        if (frames_px > 0.0 && !any(isnan(hist)) && !any(isinf(hist))) {
+            vec3 pad = 0.15 * (hi - lo) + 0.02 * hi + vec3(0.002);
+            hist = clamp(hist, lo - pad, hi + pad);
+            frames_px = min(frames_px + 1.0, 16.0);
+            now_gi = mix(hist, now_gi, 1.0 / frames_px);
+        } else {
+            frames_px = 1.0;
+        }
+        uvec4 o = uvec4(packHalf2x16(now_gi.rg), packHalf2x16(vec2(now_gi.b, frames_px)), floatBitsToUint(P.z * g_near), 0u);
+        if (odd) { gi_px_b[at_px] = o; } else { gi_px_a[at_px] = o; }
+    }
+    sum = now_gi;
+    weights = 1.0;
     // Brightening held (GI_MOST, a soft knee).
     vec3 indirect = gi_held(sum / weights, engine_ambient(n));
     uint packed = imageLoad(result_img, p).r;

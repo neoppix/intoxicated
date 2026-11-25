@@ -576,7 +576,9 @@ grass and without water: its shaders pass on no colour, so it is grey until
 the screen has shown it, then in the colour the screen showed it in; terrain
 reflects nothing itself (it is rough), and pixels of things the capture
 leaves out (the decoration grass) get no indirect light, which would change
-every frame. devctl `rt view category` colours what each reflection ray hit
+every frame. The ray from the camera that finds a pixel's triangle only
+looks around the pixel's depth, so what is nearer and not shown (the
+character's own head in first person) does not hide it. devctl `rt view category` colours what each reflection ray hit
 (yellow Neon, green terrain, white a part that stays in place, grey one that
 moves, dark blue nothing), and `rt kind neon|terrain on|off` leaves a kind
 out, for bisecting.
@@ -596,13 +598,21 @@ continues as one traced ray into an open sector: a hit the screen shows takes
 its light from the screen, any other hit is lit as the engine lights it, and
 open sky gives the engine's own ambient from that side (the sky's colour on
 the screen, taken as light, washed open places out). The Neon light is added
-as above. The bounces count `INTOXICATED_RT_GI_GAIN` times over (1.6 unless
-set, 0 to 4; devctl `rt gi-gain <x>`). The result is gathered over up to 32
+as above, at its full engine brightness (`INTOXICATED_RT_NEON_GAIN`, 1 unless
+set, 0 to 4; devctl `rt neon-gain <x>`). The bounces count
+`INTOXICATED_RT_GI_GAIN` times over (1.6 unless set, 0 to 4; devctl `rt
+gi-gain <x>`). The point a block traces from moves over its block from frame
+to frame. The result is gathered over up to 32
 frames at the same point in the world (sooner forgotten when the light there
 changes), smoothed by three a-trous filter passes that stop at edges in depth
 and normal and between light and dark (guided by the noise measured at each
-point, as SVGF does), spread back over the pixels between the blocks'
-middles, and put in place of the engine's own ambient light (what it adds
+point, as SVGF does, but never narrower than a quarter of the light, so a
+long history does not keep small steps between blocks), spread back over
+the pixels by a joint bilateral upsample (a smooth kernel over the 4 by 4
+blocks around each pixel, weighted by how near each block's point lies to
+the pixel's plane and how alike their normals and colours are), kept over up
+to 16 frames per pixel (held within what the blocks around show now), and
+put in place of the engine's own ambient light (what it adds
 rolls off softly towards eight times the ambient; a pixel gets at most 30%
 darker), so corners darken and coloured walls tint what faces them. It is
 computed before the reflections, so they show it. It takes about 160 MB more
@@ -628,7 +638,8 @@ up to about 2.4 million pixels, 3 by 3 up to about 5.4 million, as
 3440x1440, else 4 by 4, held near a step so a resize does not swing them),
 one pixel wider per step, up to two, while the trace takes more than the 4.5
 ms budget leaves after the hierarchy's build for three looks in a row (two
-seconds each at 60 fps), and back after three looks well under it; their
+seconds each at 60 fps), and back after three looks well under it, never
+coarser than 3 by 3 up to 5.4 million pixels (4 by 4 above); their
 history is carried across a change, not cleared (`rt stats`: `blocks`,
 `gi_blocks`, and the trace's parts `lights_ms`, `gi_ms`, `gi_filter_ms`,
 `reflections_ms`, of which `reflection_rays_ms` and `upsample_ms`).

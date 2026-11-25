@@ -136,6 +136,7 @@ layout(std430, set = BUFSET, binding = 6) buffer Globals {
     // moved (`rt/build.comp` INSERT, for `rt stats`).
     uint motion_known;
     uint motion_moving;
+    float neon_gain;
 };
 // This frame's listed triangles that give off light (Neon parts), by index,
 // for the trace's light sampling (ssr.comp `emitter_light`).
