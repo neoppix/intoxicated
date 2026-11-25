@@ -435,9 +435,9 @@ void setSsrOn(SettingsConf &conf, bool on);
 // The same for any effect's switch (TABLE's, or the variable SWITCHENV).
 bool effectOn(const QString &switchEnv, const SettingsConf &conf);
 void setEffectOn(const QString &switchEnv, SettingsConf &conf, bool on);
-// The effects hotkey: with INTOXICATED_EFFECTS_HOTKEY=1 the client's F9
+// The effects hotkey: with INTOXICATED_EFFECTS_HOTKEY=1 the client's F8
 // turns every effect off and back on in game (crate::effects_hotkey), and
-// Roblox no longer gets F9 for its developer console. A key name (F1 to
+// Roblox no longer gets F8. A key name (F1 to
 // F10, F12) takes another key. On reads true only for a value the client
 // takes; on writes 1 unless such a value is there, off removes the line.
 inline const QString kEffectsHotkeySetting = QStringLiteral("INTOXICATED_EFFECTS_HOTKEY");

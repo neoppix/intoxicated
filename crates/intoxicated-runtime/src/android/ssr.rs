@@ -111,7 +111,7 @@
 //!
 //! # All off and back
 //!
-//! The effects hotkey (`crate::effects_hotkey`, F9 with
+//! The effects hotkey (`crate::effects_hotkey`, F8 with
 //! `INTOXICATED_EFFECTS_HOTKEY=1`) and devctl `effects toggle|on|off|get`
 //! turn every effect off at once and back as configured ([`AllOff`]): off
 //! saves each switch and clears it, so the hooks stop watching the frame and

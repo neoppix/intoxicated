@@ -1,6 +1,6 @@
 // Intoxicated Settings: the Shaders page. The effects the client draws into
 // the game before the HUD (screen-space reflections, depth of field, bloom,
-// lens, sharpen): at the top the whole-page modes and the switch for the F9
+// lens, sharpen): at the top the whole-page modes and the switch for the F8
 // hotkey that turns them all off and back on in game, then one group each:
 // the switch, the named looks and a fine-tune row per knob, each written to
 // settings.conf as it changes; and, last, the experimental ray-traced
@@ -237,8 +237,8 @@ ShadersPage::ShadersPage(AppState *state) : m_state(state) {
         v->setSpacing(0);
         m_hotkey = new Switch;
         m_hotkey->setToolTip(kEffectsHotkeySetting);
-        v->addWidget(settingRow(QStringLiteral("F9 turns all effects on and off in game"),
-                                QStringLiteral("While this is on, F9 no longer opens Roblox's developer console. "
+        v->addWidget(settingRow(QStringLiteral("F8 turns all effects on and off in game"),
+                                QStringLiteral("While this is on, Roblox does not see F8. "
                                                "Typing in chat is not affected. Off by default; on writes "
                                                "INTOXICATED_EFFECTS_HOTKEY=1."),
                                 m_hotkey));

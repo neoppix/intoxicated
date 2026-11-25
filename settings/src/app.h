@@ -214,7 +214,7 @@ private:
 // whole-page modes (Off, Competitive, Cinematic, and Custom when the effects
 // were changed by hand), then one group per effect with its switch, its
 // looks and a fine-tune row per knob, and between them the switch for the
-// in-game F9 hotkey that turns them all off and back on. Each control writes
+// in-game F8 hotkey that turns them all off and back on. Each control writes
 // settings.conf as it changes. A client built without the visual effects
 // gets a short page saying how to add them instead.
 class ShadersPage : public QWidget {
